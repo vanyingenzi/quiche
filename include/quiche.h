@@ -657,8 +657,8 @@ int quiche_h3_event_for_each_header(quiche_h3_event *ev,
                                               void *argp),
                                     void *argp);
 
-// Check whether data will follow the headers on the stream.
-bool quiche_h3_event_headers_has_body(quiche_h3_event *ev);
+// Check whether more frames will follow the headers on the stream.
+bool quiche_h3_event_headers_has_more_frames(quiche_h3_event *ev);
 
 // Frees the HTTP/3 event object.
 void quiche_h3_event_free(quiche_h3_event *ev);
@@ -686,6 +686,12 @@ int quiche_h3_send_response_with_priority(quiche_h3_conn *conn,
                             quiche_conn *quic_conn, uint64_t stream_id,
                             quiche_h3_header *headers, size_t headers_len,
                             const char *priority, bool fin);
+
+// Sends additional HTTP/3 headers on the specified stream.
+int quiche_h3_send_additional_headers(quiche_h3_conn *conn,
+                            quiche_conn *quic_conn, uint64_t stream_id,
+                            quiche_h3_header *headers, size_t headers_len,
+                            bool fin);
 
 // Sends an HTTP/3 body chunk on the given stream.
 ssize_t quiche_h3_send_body(quiche_h3_conn *conn, quiche_conn *quic_conn,
