@@ -298,7 +298,6 @@ impl Stream {
                     match (ty, self.remote_initialized) {
                         (frame::HEADERS_FRAME_TYPE_ID, false) => {
                             self.remote_initialized = true;
-                            // self.initial_headers_received = true;
                         },
 
                         (frame::DATA_FRAME_TYPE_ID, false) =>
