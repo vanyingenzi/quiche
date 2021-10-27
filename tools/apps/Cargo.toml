@@ -25,6 +25,10 @@ url = "1"
 log = "0.4"
 ring = "0.16"
 quiche = { path = "../../" }
+libc = "0.2"
+# Needs update once merged to upstream
+# https://github.com/nix-rust/nix/pull/1564
+nix = { git = "https://github.com/ghedo/nix.git", branch = "so_txtime" }
 
 [profile.release]
 debug = true

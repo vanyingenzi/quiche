@@ -29,6 +29,8 @@ extern crate log;
 
 use std::net;
 
+use std::io;
+
 use std::io::prelude::*;
 
 use std::collections::HashMap;
@@ -50,6 +52,7 @@ const MAX_SEND_BURST_LIMIT: usize = MAX_DATAGRAM_SIZE * 10;
 fn main() {
     let mut buf = [0; 65535];
     let mut out = [0; MAX_DATAGRAM_SIZE];
+    let mut pacing = false;
 
     env_logger::builder()
         .default_format_timestamp_nanos(true)
@@ -66,6 +69,16 @@ fn main() {
 
     // Create the UDP listening socket, and register it with the event loop.
     let socket = net::UdpSocket::bind(args.listen).unwrap();
+
+    // Set SO_TXTIME socket option on the listening UDP socket for pacing
+    // outgoing packets.
+    match set_txtime_sockopt(&socket) {
+        Ok(_) => {
+            pacing = true;
+            debug!("successfully set SO_TXTIME socket option");
+        },
+        Err(e) => debug!("setsockopt failed {:?}", e),
+    };
 
     info!("listening on {:}", socket.local_addr().unwrap());
 
@@ -479,7 +492,9 @@ fn main() {
                 };
 
                 // TODO: coalesce packets.
-                if let Err(e) = socket.send_to(&out[..write], &send_info.to) {
+                if let Err(e) =
+                    send_to(&socket, &out[..write], &send_info, pacing)
+                {
                     if e.kind() == std::io::ErrorKind::WouldBlock {
                         trace!("send() would block");
                         break;
@@ -577,4 +592,98 @@ fn validate_token<'a>(
     }
 
     Some(quiche::ConnectionId::from_ref(&token[addr.len()..]))
+}
+
+/// Set SO_TXTIME socket option.
+///
+/// This socket option is set to send to kernel the outgoing UDP
+/// packet transmission time in the sendmsg syscall.
+///
+/// Note that this socket option is set only on linux platforms.
+#[cfg(target_os = "linux")]
+fn set_txtime_sockopt(sock: &net::UdpSocket) -> io::Result<()> {
+    use nix::sys::socket::setsockopt;
+    use nix::sys::socket::sockopt::TxTime;
+    use std::os::unix::io::AsRawFd;
+
+    let config = libc::sock_txtime {
+        clockid: libc::CLOCK_MONOTONIC,
+        flags: 0,
+    };
+
+    setsockopt(sock.as_raw_fd(), TxTime, &config)?;
+
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn set_txtime_sockopt(_: &net::UdpSocket) -> io::Result<()> {
+    use std::io::Error;
+    use std::io::ErrorKind;
+
+    Err(Error::new(
+        ErrorKind::Other,
+        "Not supported on this platform",
+    ))
+}
+
+/// Send outgoing UDP packet to kernel using sendmsg syscall
+///
+/// sendmsg syscall also includes the time the packet needs to be
+/// sent by the kernel in msghdr.
+///
+/// Note that sendmsg syscal is used only on linux platforms.
+#[cfg(target_os = "linux")]
+fn send_to(
+    sock: &mio::net::UdpSocket, send_buf: &[u8], send_info: &quiche::SendInfo,
+    pacing: bool,
+) -> io::Result<usize> {
+    use nix::sys::socket::sendmsg;
+    use nix::sys::socket::ControlMessage;
+    use nix::sys::socket::InetAddr;
+    use nix::sys::socket::MsgFlags;
+    use nix::sys::socket::SockAddr;
+    use nix::sys::uio::IoVec;
+    use std::os::unix::io::AsRawFd;
+
+    if !pacing {
+        return sock.send_to(send_buf, &send_info.to);
+    }
+
+    let nanos_per_sec: u64 = 1_000_000_000;
+    let sockfd = sock.as_raw_fd();
+    let len = send_buf.len();
+    let iov = [IoVec::from_slice(&send_buf[..len])];
+
+    let mut time_spec = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            &send_info.at as *const _ as *const libc::timespec,
+            &mut time_spec,
+            1,
+        )
+    };
+
+    let send_time =
+        time_spec.tv_sec as u64 * nanos_per_sec + time_spec.tv_nsec as u64;
+
+    let cmsg = ControlMessage::TxTime(&send_time);
+    let addr = SockAddr::new_inet(InetAddr::from_std(&send_info.to));
+
+    match sendmsg(sockfd, &iov, &[cmsg], MsgFlags::empty(), Some(&addr)) {
+        Ok(written) => Ok(written),
+        Err(e) => Err(e.into()),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn send_to(
+    sock: &mio::net::UdpSocket, send_buf: &[u8], send_info: &quiche::SendInfo,
+    _: bool,
+) -> io::Result<usize> {
+    sock.send_to(send_buf, &send_info.to)
 }
