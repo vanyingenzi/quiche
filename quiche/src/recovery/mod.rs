@@ -921,6 +921,7 @@ impl Recovery {
         self.app_limited = v;
     }
 
+    #[allow(dead_code)]
     pub fn app_limited(&mut self) -> bool {
         self.app_limited
     }
