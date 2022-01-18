@@ -1,0 +1,1 @@
+initSidebarItems({"constant":[["MAX_DATAGRAM_SIZE",""],["MAX_SEND_BURST_LIMIT",""]],"fn":[["main",""],["mint_token","Generate a stateless retry token."],["validate_token","Validates a stateless retry token."]]});
