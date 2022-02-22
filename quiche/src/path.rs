@@ -92,6 +92,22 @@ pub enum PathEvent {
         (SocketAddr, SocketAddr),
         (SocketAddr, SocketAddr),
     ),
+    /// The connection observed that the peer migrated over the network path
+    /// denoted by the pair of `SocketAddr`, i.e., non-probing packets have been
+    /// received on this network path. This is a server side only event.
+    ///
+    /// Note that this does not imply that this network path has been validated,
+    /// but `quiche` automatically triggers a path validation on this new path
+    /// if needed. The connection has fully migrated if either
+    ///
+    ///  * it later receives a `Validated` event with the same addresses, or
+    ///
+    ///  * the path was already validated before.
+    ///
+    /// If the path validation fails, it receives a `FailedValidation` event
+    /// containing the path addresses and the host migrates back to the
+    /// previously active working path.
+    PeerMigrated(SocketAddr, SocketAddr),
 }
 
 /// A network path on which QUIC packets can be sent.
@@ -255,6 +271,12 @@ impl Path {
     #[inline]
     fn validation_failed(&self) -> bool {
         self.state == PathState::Failed
+    }
+
+    // Returns whether this path is under path validation process.
+    #[inline]
+    pub fn under_validation(&self) -> bool {
+        matches!(self.state, PathState::Validating | PathState::ValidatingMTU)
     }
 
     /// Requests path validation.
@@ -811,14 +833,6 @@ mod tests {
     use crate::Config;
 
     use super::*;
-
-    impl Path {
-        // Returns whether this path is under path validation process.
-        #[inline]
-        fn under_validation(&self) -> bool {
-            matches!(self.state, PathState::Validating | PathState::ValidatingMTU)
-        }
-    }
 
     #[test]
     fn path_validation_limited_mtu() {

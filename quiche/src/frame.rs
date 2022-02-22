@@ -800,6 +800,16 @@ impl Frame {
         )
     }
 
+    pub fn probing(&self) -> bool {
+        matches!(
+            self,
+            Frame::Padding { .. } |
+                Frame::NewConnectionId { .. } |
+                Frame::PathChallenge { .. } |
+                Frame::PathResponse { .. }
+        )
+    }
+
     #[cfg(feature = "qlog")]
     pub fn to_qlog(&self) -> QuicFrame {
         match self {

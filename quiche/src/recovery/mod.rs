@@ -276,6 +276,16 @@ impl Recovery {
         (self.cc_ops.on_init)(self);
     }
 
+    pub fn reset(&mut self) {
+        self.congestion_window = self.max_datagram_size * INITIAL_WINDOW_PACKETS;
+        self.in_flight_count = [0; packet::EPOCH_COUNT];
+        self.congestion_recovery_start_time = None;
+        self.ssthresh = std::usize::MAX;
+        (self.cc_ops.reset)(self);
+        self.hystart.reset();
+        self.prr = prr::PRR::default();
+    }
+
     pub fn on_packet_sent(
         &mut self, mut pkt: Sent, epoch: packet::Epoch,
         handshake_status: HandshakeStatus, now: Instant, trace_id: &str,
@@ -1027,6 +1037,8 @@ impl FromStr for CongestionControlAlgorithm {
 
 pub struct CongestionControlOps {
     pub on_init: fn(r: &mut Recovery),
+
+    pub reset: fn(r: &mut Recovery),
 
     pub on_packet_sent: fn(r: &mut Recovery, sent_bytes: usize, now: Instant),
 

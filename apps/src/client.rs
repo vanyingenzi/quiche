@@ -78,13 +78,23 @@ pub fn connect(
         std::net::SocketAddr::V6(_) => "[::]:0",
     };
 
+    let mut sockets =
+        vec![mio::net::UdpSocket::bind(bind_addr.parse().unwrap()).unwrap()];
     // Create the UDP socket backing the QUIC connection, and register it with
     // the event loop.
-    let mut socket =
-        mio::net::UdpSocket::bind(bind_addr.parse().unwrap()).unwrap();
     poll.registry()
-        .register(&mut socket, mio::Token(0), mio::Interest::READABLE)
+        .register(&mut sockets[0], mio::Token(0), mio::Interest::READABLE)
         .unwrap();
+
+    if args.perform_migration {
+        sockets
+            .push(mio::net::UdpSocket::bind(bind_addr.parse().unwrap()).unwrap());
+        // Create the UDP socket backing the QUIC connection, and register it with
+        // the event loop.
+        poll.registry()
+            .register(&mut sockets[1], mio::Token(1), mio::Interest::READABLE)
+            .unwrap();
+    }
 
     // Create the configuration for the QUIC connection.
     let mut config = quiche::Config::new(args.version).unwrap();
@@ -102,7 +112,9 @@ pub fn connect(
     config.set_initial_max_stream_data_uni(conn_args.max_stream_data);
     config.set_initial_max_streams_bidi(conn_args.max_streams_bidi);
     config.set_initial_max_streams_uni(conn_args.max_streams_uni);
-    config.set_disable_active_migration(true);
+    config.set_disable_active_migration(!conn_args.migrate);
+    config.set_active_connection_id_limit(conn_args.max_active_cids);
+    config.enable_events(true);
 
     config.set_max_connection_window(conn_args.max_window);
     config.set_max_stream_window(conn_args.max_stream_window);
@@ -148,11 +160,12 @@ pub fn connect(
 
     // Generate a random source connection ID for the connection.
     let mut scid = [0; quiche::MAX_CONN_ID_LEN];
-    SystemRandom::new().fill(&mut scid[..]).unwrap();
+    let rng = SystemRandom::new();
+    rng.fill(&mut scid[..]).unwrap();
 
     let scid = quiche::ConnectionId::from_ref(&scid);
 
-    let local_addr = socket.local_addr().unwrap();
+    let local_addr = sockets[0].local_addr().unwrap();
 
     // Create a QUIC connection and initiate handshake.
     let mut conn = quiche::connect(
@@ -194,13 +207,13 @@ pub fn connect(
     info!(
         "connecting to {:} from {:} with scid {:?}",
         peer_addr,
-        socket.local_addr().unwrap(),
+        sockets[0].local_addr().unwrap(),
         scid,
     );
 
     let (write, send_info) = conn.send(&mut out).expect("initial send failed");
 
-    while let Err(e) = socket.send_to(&out[..write], send_info.to) {
+    while let Err(e) = sockets[0].send_to(&out[..write], send_info.to) {
         if e.kind() == std::io::ErrorKind::WouldBlock {
             trace!("send() would block");
             continue;
@@ -214,6 +227,11 @@ pub fn connect(
     let app_data_start = std::time::Instant::now();
 
     let mut pkt_count = 0;
+
+    let mut scid_sent = false;
+    let mut dcid_recv = false;
+    let mut new_path_probed = false;
+    let mut migrated = false;
 
     loop {
         if !conn.is_in_early_data() || app_proto_selected {
@@ -234,53 +252,57 @@ pub fn connect(
                 break 'read;
             }
 
-            let (len, from) = match socket.recv_from(&mut buf) {
-                Ok(v) => v,
+            for event in &events {
+                let token: usize = event.token().into();
+                let socket = &sockets[token];
+                let (len, from) = match socket.recv_from(&mut buf) {
+                    Ok(v) => v,
 
-                Err(e) => {
-                    // There are no more UDP packets to read, so end the read
-                    // loop.
-                    if e.kind() == std::io::ErrorKind::WouldBlock {
-                        trace!("recv() would block");
-                        break 'read;
+                    Err(e) => {
+                        // There are no more UDP packets to read, so end the read
+                        // loop.
+                        if e.kind() == std::io::ErrorKind::WouldBlock {
+                            trace!("recv() would block");
+                            break 'read;
+                        }
+
+                        return Err(ClientError::Other(format!(
+                            "recv() failed: {:?}",
+                            e
+                        )));
+                    },
+                };
+
+                trace!("got {} bytes", len);
+
+                if let Some(target_path) = conn_args.dump_packet_path.as_ref() {
+                    let path = format!("{}/{}.pkt", target_path, pkt_count);
+
+                    if let Ok(f) = std::fs::File::create(&path) {
+                        let mut f = std::io::BufWriter::new(f);
+                        f.write_all(&buf[..len]).ok();
                     }
-
-                    return Err(ClientError::Other(format!(
-                        "recv() failed: {:?}",
-                        e
-                    )));
-                },
-            };
-
-            trace!("got {} bytes", len);
-
-            if let Some(target_path) = conn_args.dump_packet_path.as_ref() {
-                let path = format!("{}/{}.pkt", target_path, pkt_count);
-
-                if let Ok(f) = std::fs::File::create(&path) {
-                    let mut f = std::io::BufWriter::new(f);
-                    f.write_all(&buf[..len]).ok();
                 }
+
+                pkt_count += 1;
+
+                let recv_info = quiche::RecvInfo {
+                    to: socket.local_addr().unwrap(),
+                    from,
+                };
+
+                // Process potentially coalesced packets.
+                let read = match conn.recv(&mut buf[..len], recv_info) {
+                    Ok(v) => v,
+
+                    Err(e) => {
+                        error!("recv failed: {:?}", e);
+                        continue 'read;
+                    },
+                };
+
+                trace!("processed {} bytes", read);
             }
-
-            pkt_count += 1;
-
-            let recv_info = quiche::RecvInfo {
-                to: socket.local_addr().unwrap(),
-                from,
-            };
-
-            // Process potentially coalesced packets.
-            let read = match conn.recv(&mut buf[..len], recv_info) {
-                Ok(v) => v,
-
-                Err(e) => {
-                    error!("recv failed: {:?}", e);
-                    continue 'read;
-                },
-            };
-
-            trace!("processed {} bytes", read);
         }
 
         trace!("done reading");
@@ -319,6 +341,7 @@ pub fn connect(
         // Create a new application protocol session once the QUIC connection is
         // established.
         if (conn.is_established() || conn.is_in_early_data()) &&
+            (!args.perform_migration || migrated) &&
             !app_proto_selected
         {
             // At this stage the ALPN negotiation succeeded and selected a
@@ -388,38 +411,131 @@ pub fn connect(
             si_conn.handle_quack_acks(&mut conn, &mut buf, &app_data_start);
         }
 
+        // Handle QUIC events.
+        while let Ok(qe) = conn.poll() {
+            match qe {
+                quiche::QuicEvent::ConnectionId(
+                    quiche::ConnectionIdEvent::RetiredSource(cid),
+                ) => {
+                    info!("Retiring source CID {:?}", cid);
+                },
+                quiche::QuicEvent::Path(quiche::PathEvent::New(..)) => {
+                    panic!("Should not see new path");
+                },
+                quiche::QuicEvent::Path(quiche::PathEvent::Validated(
+                    local_addr,
+                    peer_addr,
+                )) => {
+                    info!(
+                        "Path ({}, {}) is now validated",
+                        local_addr, peer_addr
+                    );
+                    conn.migrate(local_addr, peer_addr).unwrap();
+                    migrated = true;
+                },
+                quiche::QuicEvent::Path(quiche::PathEvent::FailedValidation(
+                    local_addr,
+                    peer_addr,
+                )) => {
+                    info!(
+                        "Path ({}, {}) failed validation",
+                        local_addr, peer_addr
+                    );
+                },
+                quiche::QuicEvent::Path(quiche::PathEvent::Closed(
+                    local_addr,
+                    peer_addr,
+                )) => {
+                    info!(
+                        "Path ({}, {}) is now closed and unusable",
+                        local_addr, peer_addr
+                    );
+                },
+                quiche::QuicEvent::Path(
+                    quiche::PathEvent::ReusedSourceConnectionId(
+                        cid_seq,
+                        old,
+                        new,
+                    ),
+                ) => {
+                    info!(
+                        "Peer reused cid seq {} (intially {:?}) on {:?}",
+                        cid_seq, old, new
+                    );
+                },
+                quiche::QuicEvent::Path(quiche::PathEvent::PeerMigrated(..)) => {
+                    panic!("Server-side event only");
+                },
+                quiche::QuicEvent::ConnectionId(
+                    quiche::ConnectionIdEvent::NewDestination(seq, ..),
+                ) => {
+                    info!("Received new destination CID with seq {}", seq);
+                    dcid_recv = true;
+                },
+                quiche::QuicEvent::ConnectionId(
+                    quiche::ConnectionIdEvent::RetiredDestination(seq),
+                ) => {
+                    info!("Retired destination CID with seq {}", seq);
+                },
+            }
+        }
+
+        // Provides as many CIDs as possible.
+        while conn.active_source_cids() < conn.max_active_source_cids() {
+            let (scid, reset_token) = generate_cid_and_reset_token(&rng);
+            if conn.new_source_cid(&scid, reset_token, false).is_err() {
+                break;
+            }
+            scid_sent = true;
+        }
+
+        if args.perform_migration && !new_path_probed && scid_sent && dcid_recv {
+            let additional_local_addr = sockets[1].local_addr().unwrap();
+            conn.probe_path(additional_local_addr, peer_addr).unwrap();
+            new_path_probed = true;
+        }
+
         // Generate outgoing QUIC packets and send them on the UDP socket, until
         // quiche reports that there are no more packets to be sent.
-        loop {
-            let (write, send_info) = match conn.send(&mut out) {
-                Ok(v) => v,
+        for socket in &sockets {
+            let local_addr = socket.local_addr().unwrap();
+            for peer_addr in conn.sendable_paths(local_addr) {
+                loop {
+                    let (write, send_info) = match conn.path_send(
+                        &mut out,
+                        Some(local_addr),
+                        Some(peer_addr),
+                    ) {
+                        Ok(v) => v,
 
-                Err(quiche::Error::Done) => {
-                    trace!("done writing");
-                    break;
-                },
+                        Err(quiche::Error::Done) => {
+                            trace!("done writing");
+                            break;
+                        },
 
-                Err(e) => {
-                    error!("send failed: {:?}", e);
+                        Err(e) => {
+                            error!("send failed: {:?}", e);
 
-                    conn.close(false, 0x1, b"fail").ok();
-                    break;
-                },
-            };
+                            conn.close(false, 0x1, b"fail").ok();
+                            break;
+                        },
+                    };
 
-            if let Err(e) = socket.send_to(&out[..write], send_info.to) {
-                if e.kind() == std::io::ErrorKind::WouldBlock {
-                    trace!("send() would block");
-                    break;
+                    if let Err(e) = socket.send_to(&out[..write], send_info.to) {
+                        if e.kind() == std::io::ErrorKind::WouldBlock {
+                            trace!("send() would block");
+                            break;
+                        }
+
+                        return Err(ClientError::Other(format!(
+                            "send() failed: {:?}",
+                            e
+                        )));
+                    }
+
+                    trace!("written {}", write);
                 }
-
-                return Err(ClientError::Other(format!(
-                    "send() failed: {:?}",
-                    e
-                )));
             }
-
-            trace!("written {}", write);
         }
 
         if conn.is_closed() {
@@ -455,4 +571,17 @@ pub fn connect(
     }
 
     Ok(())
+}
+
+/// Generate a new pair of Source Connection ID and reset token.
+fn generate_cid_and_reset_token<T: SecureRandom>(
+    rng: &T,
+) -> (quiche::ConnectionId<'static>, u128) {
+    let mut scid = [0; quiche::MAX_CONN_ID_LEN];
+    rng.fill(&mut scid).unwrap();
+    let scid = scid.to_vec().into();
+    let mut reset_token = [0; 16];
+    rng.fill(&mut reset_token).unwrap();
+    let reset_token = u128::from_be_bytes(reset_token);
+    (scid, reset_token)
 }
