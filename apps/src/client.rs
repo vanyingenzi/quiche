@@ -152,10 +152,17 @@ pub fn connect(
 
     let scid = quiche::ConnectionId::from_ref(&scid);
 
+    let local_addr = socket.local_addr().unwrap();
+
     // Create a QUIC connection and initiate handshake.
-    let mut conn =
-        quiche::connect(connect_url.domain(), &scid, peer_addr, &mut config)
-            .unwrap();
+    let mut conn = quiche::connect(
+        connect_url.domain(),
+        scid.clone().into_owned(),
+        local_addr,
+        peer_addr,
+        &mut config,
+    )
+    .unwrap();
 
     if let Some(keylog) = &mut keylog {
         if let Ok(keylog) = keylog.try_clone() {
@@ -258,7 +265,10 @@ pub fn connect(
 
             pkt_count += 1;
 
-            let recv_info = quiche::RecvInfo { from };
+            let recv_info = quiche::RecvInfo {
+                to: socket.local_addr().unwrap(),
+                from,
+            };
 
             // Process potentially coalesced packets.
             let read = match conn.recv(&mut buf[..len], recv_info) {

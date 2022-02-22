@@ -34,7 +34,6 @@ use std::time::Instant;
 use std::collections::VecDeque;
 
 use crate::Config;
-use crate::Error;
 use crate::Result;
 
 use crate::frame;
@@ -160,8 +159,26 @@ pub struct Recovery {
     send_quantum: usize,
 }
 
+pub struct RecoveryConfig {
+    max_send_udp_payload_size: usize,
+    pub max_ack_delay: Duration,
+    cc_ops: &'static CongestionControlOps,
+    hystart: bool,
+}
+
+impl RecoveryConfig {
+    pub fn from_config(config: &Config) -> Self {
+        Self {
+            max_send_udp_payload_size: config.max_send_udp_payload_size,
+            max_ack_delay: Duration::ZERO,
+            cc_ops: config.cc_algorithm.into(),
+            hystart: config.hystart,
+        }
+    }
+}
+
 impl Recovery {
-    pub fn new(config: &Config) -> Self {
+    pub fn new_with_config(recovery_config: &RecoveryConfig) -> Self {
         Recovery {
             loss_detection_timer: None,
 
@@ -187,7 +204,7 @@ impl Recovery {
 
             rttvar: INITIAL_RTT / 2,
 
-            max_ack_delay: Duration::ZERO,
+            max_ack_delay: recovery_config.max_ack_delay,
 
             loss_time: [None; packet::EPOCH_COUNT],
 
@@ -204,7 +221,7 @@ impl Recovery {
 
             in_flight_count: [0; packet::EPOCH_COUNT],
 
-            congestion_window: config.max_send_udp_payload_size *
+            congestion_window: recovery_config.max_send_udp_payload_size *
                 INITIAL_WINDOW_PACKETS,
 
             pkt_thresh: INITIAL_PACKET_THRESHOLD,
@@ -225,9 +242,9 @@ impl Recovery {
 
             congestion_recovery_start_time: None,
 
-            max_datagram_size: config.max_send_udp_payload_size,
+            max_datagram_size: recovery_config.max_send_udp_payload_size,
 
-            cc_ops: config.cc_algorithm.into(),
+            cc_ops: recovery_config.cc_ops,
 
             delivery_rate: delivery_rate::Rate::default(),
 
@@ -235,7 +252,7 @@ impl Recovery {
 
             app_limited: false,
 
-            hystart: hystart::Hystart::new(config.hystart),
+            hystart: hystart::Hystart::new(recovery_config.hystart),
 
             pacing_rate: 0,
 
@@ -243,12 +260,16 @@ impl Recovery {
 
             prr: prr::PRR::default(),
 
-            send_quantum: config.max_send_udp_payload_size *
+            send_quantum: recovery_config.max_send_udp_payload_size *
                 INITIAL_WINDOW_PACKETS,
 
             #[cfg(feature = "qlog")]
             qlog_metrics: QlogMetrics::default(),
         }
+    }
+
+    pub fn new(config: &Config) -> Self {
+        Self::new_with_config(&RecoveryConfig::from_config(config))
     }
 
     pub fn on_init(&mut self) {
@@ -361,19 +382,15 @@ impl Recovery {
         &mut self, ranges: &ranges::RangeSet, ack_delay: u64,
         epoch: packet::Epoch, handshake_status: HandshakeStatus, now: Instant,
         trace_id: &str,
-    ) -> Result<()> {
+    ) -> Result<(usize, usize)> {
         let largest_acked = ranges.last().unwrap();
 
-        // If the largest packet number acked exceeds any packet number we have
-        // sent, then the ACK is obviously invalid, so there's no need to
-        // continue further.
-        if largest_acked > self.largest_sent_pkt[epoch] {
-            if cfg!(feature = "fuzzing") {
-                return Ok(());
-            }
-
-            return Err(Error::InvalidPacket);
-        }
+        // While quiche used to consider ACK frames acknowledging packet numbers
+        // larger than the largest sent one as invalid, this is not true anymore
+        // if we consider a single packet number space and multiple paths. The
+        // simplest example is the case where the host sends a probing packet on
+        // a validating path, then receives an acknowledgment for that packet on
+        // the active one.
 
         if self.largest_acked_pkt[epoch] == std::u64::MAX {
             self.largest_acked_pkt[epoch] = largest_acked;
@@ -482,7 +499,7 @@ impl Recovery {
         }
 
         if newly_acked.is_empty() {
-            return Ok(());
+            return Ok((0, 0));
         }
 
         if largest_newly_acked_pkt_num == largest_acked && has_ack_eliciting {
@@ -502,7 +519,8 @@ impl Recovery {
 
         // Detect and mark lost packets without removing them from the sent
         // packets list.
-        self.detect_lost_packets(epoch, now, trace_id);
+        let (lost_packets, lost_bytes) =
+            self.detect_lost_packets(epoch, now, trace_id);
 
         self.on_packets_acked(newly_acked, epoch, now);
 
@@ -512,23 +530,24 @@ impl Recovery {
 
         self.drain_packets(epoch, now);
 
-        Ok(())
+        Ok((lost_packets, lost_bytes))
     }
 
     pub fn on_loss_detection_timeout(
         &mut self, handshake_status: HandshakeStatus, now: Instant,
         trace_id: &str,
-    ) {
+    ) -> (usize, usize) {
         let (earliest_loss_time, epoch) = self.loss_time_and_space();
 
         if earliest_loss_time.is_some() {
             // Time threshold loss detection.
-            self.detect_lost_packets(epoch, now, trace_id);
+            let (lost_packets, lost_bytes) =
+                self.detect_lost_packets(epoch, now, trace_id);
 
             self.set_loss_detection_timer(handshake_status, now);
 
             trace!("{} {:?}", trace_id, self);
-            return;
+            return (lost_packets, lost_bytes);
         }
 
         let epoch = if self.bytes_in_flight > 0 {
@@ -576,6 +595,8 @@ impl Recovery {
         self.set_loss_detection_timer(handshake_status, now);
 
         trace!("{} {:?}", trace_id, self);
+
+        (0, 0)
     }
 
     pub fn on_pkt_num_space_discarded(
@@ -775,7 +796,7 @@ impl Recovery {
 
     fn detect_lost_packets(
         &mut self, epoch: packet::Epoch, now: Instant, trace_id: &str,
-    ) {
+    ) -> (usize, usize) {
         let largest_acked = self.largest_acked_pkt[epoch];
 
         self.loss_time[epoch] = None;
@@ -789,6 +810,7 @@ impl Recovery {
         // Packets sent before this time are deemed lost.
         let lost_send_time = now - loss_delay;
 
+        let mut lost_packets = 0;
         let mut lost_bytes = 0;
 
         let mut largest_lost_pkt = None;
@@ -827,6 +849,7 @@ impl Recovery {
                     );
                 }
 
+                lost_packets += 1;
                 self.lost_count += 1;
             } else {
                 let loss_time = match self.loss_time[epoch] {
@@ -847,6 +870,8 @@ impl Recovery {
         }
 
         self.drain_packets(epoch, now);
+
+        (lost_packets, lost_bytes)
     }
 
     fn drain_packets(&mut self, epoch: packet::Epoch, now: Instant) {
@@ -943,7 +968,7 @@ impl Recovery {
         self.app_limited = v;
     }
 
-    pub fn app_limited(&mut self) -> bool {
+    pub fn app_limited(&self) -> bool {
         self.app_limited
     }
 
@@ -1306,7 +1331,7 @@ mod tests {
     fn lookup_cc_algo_bad() {
         assert_eq!(
             CongestionControlAlgorithm::from_str("???"),
-            Err(Error::CongestionControl)
+            Err(crate::Error::CongestionControl)
         );
     }
 
@@ -1454,7 +1479,7 @@ mod tests {
                 now,
                 ""
             ),
-            Ok(())
+            Ok((0, 0))
         );
 
         assert_eq!(r.sent[packet::EPOCH_APPLICATION].len(), 2);
@@ -1539,7 +1564,7 @@ mod tests {
                 now,
                 ""
             ),
-            Ok(())
+            Ok((2, 2000))
         );
 
         assert_eq!(r.sent[packet::EPOCH_APPLICATION].len(), 4);
@@ -1688,7 +1713,7 @@ mod tests {
                 now,
                 ""
             ),
-            Ok(())
+            Ok((0, 0))
         );
 
         assert_eq!(r.sent[packet::EPOCH_APPLICATION].len(), 2);
@@ -1847,7 +1872,7 @@ mod tests {
                 now,
                 ""
             ),
-            Ok(())
+            Ok((1, 1000))
         );
 
         now += Duration::from_millis(10);
@@ -1866,7 +1891,7 @@ mod tests {
                 now,
                 ""
             ),
-            Ok(())
+            Ok((0, 0))
         );
 
         assert_eq!(r.sent[packet::EPOCH_APPLICATION].len(), 4);
@@ -1945,7 +1970,7 @@ mod tests {
                 now,
                 ""
             ),
-            Ok(())
+            Ok((0, 0))
         );
 
         assert_eq!(r.sent[packet::EPOCH_APPLICATION].len(), 0);

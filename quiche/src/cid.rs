@@ -243,7 +243,8 @@ impl ConnectionIdentifiers {
     /// Connection ID is set to the empty one.
     pub fn new(
         mut destination_conn_id_limit: usize, enable_events: bool,
-        initial_scid: ConnectionId, reset_token: Option<u128>,
+        initial_scid: ConnectionId, initial_path_id: usize,
+        reset_token: Option<u128>,
     ) -> ConnectionIdentifiers {
         // It must be at least 2.
         if destination_conn_id_limit < 2 {
@@ -266,7 +267,7 @@ impl ConnectionIdentifiers {
                 cid: initial_scid.into_owned(),
                 seq: 0,
                 reset_token,
-                path_id: Some(0),
+                path_id: Some(initial_path_id),
             },
         );
         let dcids = BoundedNonEmptyConnectionIdVecDeque::new(
@@ -275,7 +276,7 @@ impl ConnectionIdentifiers {
                 cid: ConnectionId::default(),
                 seq: 0,
                 reset_token: None,
-                path_id: Some(0),
+                path_id: Some(initial_path_id),
             },
         );
         // Because we already inserted the initial SCID.
@@ -300,6 +301,13 @@ impl ConnectionIdentifiers {
             // Connection IDs when the host wants to force their renewal.
             self.scids.resize((2 * v - 1) as usize);
         }
+    }
+
+    /// Gets the destination Connection ID associated with the provided sequence
+    /// number.
+    #[inline]
+    pub fn get_dcid(&self, seq_num: u64) -> Result<&ConnectionIdEntry> {
+        self.dcids.get(seq_num).ok_or(Error::InvalidState)
     }
 
     /// Gets the source Connection ID associated with the provided sequence
@@ -574,6 +582,16 @@ impl ConnectionIdentifiers {
         Ok(e.path_id)
     }
 
+    /// Updates the Source Connection ID entry with the provided sequence number
+    /// to indicate that it is now linked to the provided path ID.
+    pub fn link_scid_to_path_id(
+        &mut self, dcid_seq: u64, path_id: usize,
+    ) -> Result<()> {
+        let e = self.scids.get_mut(dcid_seq).ok_or(Error::InvalidState)?;
+        e.path_id = Some(path_id);
+        Ok(())
+    }
+
     /// Updates the Destination Connection ID entry with the provided sequence
     /// number to indicate that it is now linked to the provided path ID.
     pub fn link_dcid_to_path_id(
@@ -615,6 +633,31 @@ impl ConnectionIdentifiers {
                 }
             })
             .min()
+    }
+
+    /// Finds the sequence number of the Source Connection ID having the
+    /// provided value and the identifier of the path using it, if any.
+    #[inline]
+    pub fn find_scid_seq(
+        &self, scid: &ConnectionId,
+    ) -> Option<(u64, Option<usize>)> {
+        self.scids.iter().find_map(|e| {
+            if e.cid == *scid {
+                Some((e.seq, e.path_id))
+            } else {
+                None
+            }
+        })
+    }
+
+    /// Returns the number of Source Connection IDs that have not been
+    /// assigned to a path yet.
+    ///
+    /// Note that this function is only meaningful if the host uses non-zero
+    /// length Source Connection IDs.
+    #[inline]
+    pub fn available_scids(&self) -> usize {
+        self.scids.iter().filter(|e| e.path_id.is_none()).count()
     }
 
     /// Returns the oldest active source Connection ID of this connection.
@@ -744,24 +787,12 @@ mod tests {
     use super::*;
     use crate::testing::create_cid_and_reset_token;
 
-    impl ConnectionIdentifiers {
-        /// Returns the number of Source Connection IDs that have not been
-        /// assigned to a path yet.
-        ///
-        /// Note that this function is only meaningful if the host uses non-zero
-        /// length Source Connection IDs.
-        #[inline]
-        fn available_scids(&self) -> usize {
-            self.scids.iter().filter(|e| e.path_id.is_none()).count()
-        }
-    }
-
     #[test]
     fn ids_new_scids() {
         let (scid, _) = create_cid_and_reset_token(16);
         let (dcid, _) = create_cid_and_reset_token(16);
 
-        let mut ids = ConnectionIdentifiers::new(2, true, scid, None);
+        let mut ids = ConnectionIdentifiers::new(2, true, scid, 0, None);
         ids.set_source_conn_id_limit(3);
         ids.set_initial_dcid(dcid, None, None);
 
@@ -818,7 +849,7 @@ mod tests {
         let (scid, _) = create_cid_and_reset_token(16);
         let (dcid, _) = create_cid_and_reset_token(16);
 
-        let mut ids = ConnectionIdentifiers::new(2, true, scid, None);
+        let mut ids = ConnectionIdentifiers::new(2, true, scid, 0, None);
         ids.set_initial_dcid(dcid, None, None);
 
         assert_eq!(ids.pop_event(), None);

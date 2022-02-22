@@ -103,9 +103,18 @@ fn main() {
 
     let scid = quiche::ConnectionId::from_ref(&scid);
 
+    // Get local address.
+    let local_addr = socket.local_addr().unwrap();
+
     // Create a QUIC connection and initiate handshake.
-    let mut conn =
-        quiche::connect(url.domain(), &scid, peer_addr, &mut config).unwrap();
+    let mut conn = quiche::connect(
+        url.domain(),
+        scid.clone().into_owned(),
+        local_addr,
+        peer_addr,
+        &mut config,
+    )
+    .unwrap();
 
     info!(
         "connecting to {:} from {:} with scid {}",
@@ -186,7 +195,10 @@ fn main() {
 
             debug!("got {} bytes", len);
 
-            let recv_info = quiche::RecvInfo { from };
+            let recv_info = quiche::RecvInfo {
+                to: local_addr,
+                from,
+            };
 
             // Process potentially coalesced packets.
             let read = match conn.recv(&mut buf[..len], recv_info) {

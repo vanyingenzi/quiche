@@ -81,10 +81,10 @@ a new connection, while [`accept()`] is for servers:
 
 ```rust
 // Client connection.
-let conn = quiche::connect(Some(&server_name), &scid, &mut config)?;
+let conn = quiche::connect(Some(&server_name), scid, local_addr, peer_addr, &mut config)?;
 
 // Server connection.
-let conn = quiche::accept(&scid, None, &mut config)?;
+let conn = quiche::accept(scid, None, local_addr, peer_addr, &mut config)?;
 ```
 
 ### Handling incoming packets
@@ -96,7 +96,7 @@ incoming packets that belong to that connection from the network:
 loop {
     let (read, from) = socket.recv_from(&mut buf).unwrap();
 
-    let recv_info = quiche::RecvInfo { from };
+    let recv_info = quiche::RecvInfo { from, to: socket.local_addr().unwrap() };
 
     let read = match conn.recv(&mut buf[..read], recv_info) {
         Ok(v) => v,

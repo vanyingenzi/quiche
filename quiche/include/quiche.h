@@ -248,12 +248,14 @@ typedef struct Connection quiche_conn;
 // Creates a new server-side connection.
 quiche_conn *quiche_accept(const uint8_t *scid, size_t scid_len,
                            const uint8_t *odcid, size_t odcid_len,
+                           const struct sockaddr *local, size_t local_len,
                            const struct sockaddr *from, size_t from_len,
                            quiche_config *config);
 
 // Creates a new client-side connection.
 quiche_conn *quiche_connect(const char *server_name,
                             const uint8_t *scid, size_t scid_len,
+                            const struct sockaddr *from, size_t from_len,
                             const struct sockaddr *to, size_t to_len,
                             quiche_config *config);
 
@@ -274,6 +276,7 @@ bool quiche_version_is_supported(uint32_t version);
 
 quiche_conn *quiche_conn_new_with_tls(const uint8_t *scid, size_t scid_len,
                                       const uint8_t *odcid, size_t odcid_len,
+                                      const struct sockaddr *local, size_t local_len,
                                       const struct sockaddr *peer, size_t peer_len,
                                       quiche_config *config, void *ssl,
                                       bool is_server);
@@ -298,6 +301,8 @@ int quiche_conn_set_session(quiche_conn *conn, const uint8_t *buf, size_t buf_le
 typedef struct {
     struct sockaddr *from;
     socklen_t from_len;
+    struct sockaddr *to;
+    socklen_t to_len;
 } quiche_recv_info;
 
 // Processes QUIC packets received from the peer.
@@ -305,6 +310,9 @@ ssize_t quiche_conn_recv(quiche_conn *conn, uint8_t *buf, size_t buf_len,
                          const quiche_recv_info *info);
 
 typedef struct {
+    // The local address the packet should be sent from.
+    struct sockaddr_storage from;
+    socklen_t from_len;
     // The address the packet should be sent to.
     struct sockaddr_storage to;
     socklen_t to_len;
@@ -319,6 +327,18 @@ ssize_t quiche_conn_send(quiche_conn *conn, uint8_t *out, size_t out_len,
 
 // Returns the size of the send quantum, in bytes.
 size_t quiche_conn_send_quantum(quiche_conn *conn);
+
+// Writes a single QUIC packet to be sent to the peer from the specified
+// local address `local_addr` to the destination address `peer_addr`.
+ssize_t quiche_conn_path_send(quiche_conn *conn, uint8_t *out, size_t out_len,
+                              quiche_send_info *out_info,
+                              const struct sockaddr *local_addr, socklen_t local_addr_len,
+                              const struct sockaddr *peer_addr, socklen_t peer_addr_len);
+
+// Requests the stack to perform path validation of the proposed 4-tuple.
+int64_t quiche_conn_probe_path(quiche_conn *conn,
+                               const struct sockaddr *local_addr, socklen_t local_addr_len,
+                               const struct sockaddr *peer_addr, socklen_t peer_addr_len);
 
 // Provides additional source Connection IDs that the peer can use to reach
 // this host.
@@ -477,6 +497,58 @@ bool quiche_stream_iter_next(quiche_stream_iter *iter, uint64_t *stream_id);
 void quiche_stream_iter_free(quiche_stream_iter *iter);
 
 typedef struct {
+    // The local address used by this path.
+    struct sockaddr_storage local_addr;
+    socklen_t local_addr_len;
+
+    // The peer address seen by this path.
+    struct sockaddr_storage peer_addr;
+    socklen_t peer_addr_len;
+
+    // The validation state of the path.
+    ssize_t validation_state;
+
+    // Whether this path is active.
+    bool active;
+
+    // The number of QUIC packets received on this path.
+    size_t recv;
+
+    // The number of QUIC packets sent on this path.
+    size_t sent;
+
+    // The number of QUIC packets that were lost on this path.
+    size_t lost;
+
+    // The number of sent QUIC packets with retranmitted data on this path.
+    size_t retrans;
+
+    // The estimated round-trip time of the path (in nanoseconds).
+    uint64_t rtt;
+
+    // The size of the path's congestion window in bytes.
+    size_t cwnd;
+
+    // The number of sent bytes on this path.
+    uint64_t sent_bytes;
+
+    // The number of recevied bytes on this path.
+    uint64_t recv_bytes;
+
+    // The number of bytes lost on this path.
+    uint64_t lost_bytes;
+
+    // The number of stream bytes retransmitted on this path.
+    uint64_t stream_retrans_bytes;
+
+    // The current PMTU for the path.
+    size_t pmtu;
+
+    // The most recent data delivery rate estimate in bytes/s.
+    uint64_t delivery_rate;
+} quiche_path_stats;
+
+typedef struct {
     // The number of QUIC packets received on this connection.
     size_t recv;
 
@@ -489,12 +561,6 @@ typedef struct {
     // The number of sent QUIC packets with retranmitted data.
     size_t retrans;
 
-    // The estimated round-trip time of the connection (in nanoseconds).
-    uint64_t rtt;
-
-    // The size of the connection's congestion window in bytes.
-    size_t cwnd;
-
     // The number of sent bytes.
     uint64_t sent_bytes;
 
@@ -506,12 +572,6 @@ typedef struct {
 
     // The number of stream bytes retransmitted.
     uint64_t stream_retrans_bytes;
-
-    // The current PMTU for the connection.
-    size_t pmtu;
-
-    // The most recent data delivery rate estimate in bytes/s.
-    uint64_t delivery_rate;
 
     // The maximum idle timeout.
     uint64_t peer_max_idle_timeout;
@@ -551,6 +611,12 @@ typedef struct {
 
     // DATAGRAM frame extension parameter, if any.
     ssize_t peer_max_datagram_frame_size;
+
+    // The stats of the connection's paths.
+    quiche_path_stats paths[8];
+
+    // The number of stats of the connection's paths.
+    size_t paths_len;
 } quiche_stats;
 
 // Collects and returns statistics about the connection.

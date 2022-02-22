@@ -44,6 +44,7 @@ use quiche_apps::args::*;
 use quiche_apps::common::*;
 
 use quiche::ConnectionIdEvent;
+use quiche::PathEvent;
 use quiche::QuicEvent;
 
 const MAX_BUF_SIZE: usize = 65535;
@@ -145,6 +146,8 @@ fn main() {
     let mut pkt_count = 0;
 
     let mut continue_write = false;
+
+    let local_addr = socket.local_addr().unwrap();
 
     loop {
         // Find the shorter timeout from all the active connections.
@@ -314,9 +317,14 @@ fn main() {
                 debug!("New connection: dcid={:?} scid={:?}", hdr.dcid, scid);
 
                 #[allow(unused_mut)]
-                let mut conn =
-                    quiche::accept(&scid, odcid.as_ref(), from, &mut config)
-                        .unwrap();
+                let mut conn = quiche::accept(
+                    scid.clone(),
+                    odcid.as_ref(),
+                    local_addr,
+                    from,
+                    &mut config,
+                )
+                .unwrap();
 
                 if let Some(keylog) = &mut keylog {
                     if let Ok(keylog) = keylog.try_clone() {
@@ -365,7 +373,10 @@ fn main() {
                 clients.get_mut(cid).unwrap()
             };
 
-            let recv_info = quiche::RecvInfo { from };
+            let recv_info = quiche::RecvInfo {
+                to: local_addr,
+                from,
+            };
 
             // Process potentially coalesced packets.
             let read = match client.conn.recv(pkt_buf, recv_info) {
@@ -470,6 +481,48 @@ fn main() {
                     ) => {
                         info!("Retiring source CID {:?}", cid);
                         clients_ids.remove(&cid);
+                    },
+                    QuicEvent::Path(PathEvent::New(local_addr, peer_addr)) => {
+                        info!("Seen new path ({}, {})", local_addr, peer_addr);
+                        // Directly probe the new path.
+                        client
+                            .conn
+                            .probe_path(local_addr, peer_addr)
+                            .expect("cannot probe");
+                    },
+                    QuicEvent::Path(PathEvent::Validated(
+                        local_addr,
+                        peer_addr,
+                    )) => {
+                        info!(
+                            "Path ({}, {}) is now validated",
+                            local_addr, peer_addr
+                        );
+                    },
+                    QuicEvent::Path(PathEvent::FailedValidation(
+                        local_addr,
+                        peer_addr,
+                    )) => {
+                        info!(
+                            "Path ({}, {}) failed validation",
+                            local_addr, peer_addr
+                        );
+                    },
+                    QuicEvent::Path(PathEvent::Closed(local_addr, peer_addr)) => {
+                        info!(
+                            "Path ({}, {}) is now closed and unusable",
+                            local_addr, peer_addr
+                        );
+                    },
+                    QuicEvent::Path(PathEvent::ReusedSourceConnectionId(
+                        cid_seq,
+                        old,
+                        new,
+                    )) => {
+                        info!(
+                            "Peer reused cid seq {} (intially {:?}) on {:?}",
+                            cid_seq, old, new
+                        );
                     },
                     QuicEvent::ConnectionId(
                         ConnectionIdEvent::NewDestination(seq, ..),
