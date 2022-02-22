@@ -94,7 +94,7 @@ fn main() {
     config.set_initial_max_stream_data_uni(conn_args.max_stream_data);
     config.set_initial_max_streams_bidi(conn_args.max_streams_bidi);
     config.set_initial_max_streams_uni(conn_args.max_streams_uni);
-    config.set_disable_active_migration(true);
+    config.set_disable_active_migration(!conn_args.migrate);
     config.set_active_connection_id_limit(conn_args.max_active_cids);
     config.enable_events(true);
 
@@ -524,6 +524,15 @@ fn main() {
                             cid_seq, old, new
                         );
                     },
+                    QuicEvent::Path(PathEvent::PeerMigrated(
+                        local_addr,
+                        peer_addr,
+                    )) => {
+                        info!(
+                            "Connection migrated to ({}, {})",
+                            local_addr, peer_addr
+                        );
+                    },
                     QuicEvent::ConnectionId(
                         ConnectionIdEvent::NewDestination(seq, ..),
                     ) => {
@@ -542,8 +551,10 @@ fn main() {
                 client.conn.max_active_source_cids()
             {
                 let (scid, reset_token) = generate_cid_and_reset_token(&rng);
-                if let Err(_) =
-                    client.conn.new_source_cid(&scid, reset_token, false)
+                if client
+                    .conn
+                    .new_source_cid(&scid, reset_token, false)
+                    .is_err()
                 {
                     break;
                 }

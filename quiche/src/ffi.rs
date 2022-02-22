@@ -777,6 +777,32 @@ pub extern fn quiche_conn_probe_path(
 }
 
 #[no_mangle]
+pub extern fn quiche_conn_migrate_source(
+    conn: &mut Connection, local_addr: &sockaddr, local_addr_len: socklen_t,
+) -> i64 {
+    let local_addr = std_addr_from_c(local_addr, local_addr_len);
+
+    match conn.migrate_source(local_addr) {
+        Ok(dcid_seq) => dcid_seq as i64,
+        Err(e) => e.to_c() as i64,
+    }
+}
+
+#[no_mangle]
+pub extern fn quiche_conn_migrate(
+    conn: &mut Connection, local_addr: &sockaddr, local_addr_len: socklen_t,
+    peer_addr: &sockaddr, peer_addr_len: socklen_t,
+) -> i64 {
+    let local_addr = std_addr_from_c(local_addr, local_addr_len);
+    let peer_addr = std_addr_from_c(peer_addr, peer_addr_len);
+
+    match conn.migrate(local_addr, peer_addr) {
+        Ok(dcid_seq) => dcid_seq as i64,
+        Err(e) => e.to_c() as i64,
+    }
+}
+
+#[no_mangle]
 pub extern fn quiche_conn_new_source_id(
     conn: &mut Connection, scid: *const u8, scid_len: size_t,
     reset_token: *const u8, retire_if_needed: bool,

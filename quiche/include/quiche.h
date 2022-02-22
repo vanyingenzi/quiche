@@ -340,6 +340,16 @@ int64_t quiche_conn_probe_path(quiche_conn *conn,
                                const struct sockaddr *local_addr, socklen_t local_addr_len,
                                const struct sockaddr *peer_addr, socklen_t peer_addr_len);
 
+// Migrates the connection to a new local address `local_addr`.
+int64_t quiche_conn_migrate_source(quiche_conn *conn,
+                                   const struct sockaddr *local_addr, socklen_t local_addr_len);
+
+// Migrates the connection over the given network path between `local_addr`
+// and `peer_addr`.
+int64_t quiche_conn_migrate(quiche_conn *conn,
+                            const struct sockaddr *local_addr, socklen_t local_addr_len,
+                            const struct sockaddr *peer_addr, socklen_t peer_addr_len);
+
 // Provides additional source Connection IDs that the peer can use to reach
 // this host.
 int64_t quiche_conn_new_source_id(quiche_conn *conn, const uint8_t *scid,

@@ -683,6 +683,8 @@ pub struct Config {
     max_stream_window: u64,
 
     events: bool,
+
+    disable_dcid_reuse: bool,
 }
 
 // See https://quicwg.org/base-drafts/rfc9000.html#section-15
@@ -740,6 +742,8 @@ impl Config {
             max_stream_window: stream::MAX_STREAM_WINDOW,
 
             events: false,
+
+            disable_dcid_reuse: false,
         })
     }
 
@@ -1105,6 +1109,20 @@ impl Config {
     pub fn enable_events(&mut self, v: bool) {
         self.events = v;
     }
+
+    /// Sets whether the QUIC connection should avoid reusing DCIDs over
+    /// different paths.
+    ///
+    /// When set to `true`, it ensures that a destination Connection ID is never
+    /// reused on different paths. Such behaviour may lead to connection stall
+    /// if the peer performs a non-voluntary migration (e.g., NAT rebinding) and
+    /// does not provide additional destination Connection IDs to handle such
+    /// event.
+    ///
+    /// The default value is `false`.
+    pub fn set_disable_dcid_reuse(&mut self, v: bool) {
+        self.disable_dcid_reuse = v;
+    }
 }
 
 /// A QUIC connection.
@@ -1287,6 +1305,10 @@ pub struct Connection {
 
     /// Whether to emit DATAGRAM frames in the next packet.
     emit_dgram: bool,
+
+    /// Whether the connection should prevent from reusing destination
+    /// Connection IDs when the peer migrates.
+    disable_dcid_reuse: bool,
 }
 
 /// Creates a new server-side connection.
@@ -1721,6 +1743,8 @@ impl Connection {
             ),
 
             emit_dgram: true,
+
+            disable_dcid_reuse: config.disable_dcid_reuse,
         });
 
         if let Some(odcid) = odcid {
@@ -2515,6 +2539,11 @@ impl Connection {
         // error and stop further packet processing.
         let mut frame_processing_err = None;
 
+        // To know if the peer migrated the connection, we need to keep track
+        // whether this is a non-probing packet.
+        let mut probing = true;
+
+        // Process packet payload.
         while payload.cap() > 0 {
             let frame = frame::Frame::from_bytes(&mut payload, hdr.ty)?;
 
@@ -2524,6 +2553,10 @@ impl Connection {
 
             if frame.ack_eliciting() {
                 ack_elicited = true;
+            }
+
+            if !frame.probing() {
+                probing = false;
             }
 
             if let Err(e) = self.process_frame(frame, &hdr, recv_pid, epoch, now)
@@ -2704,6 +2737,54 @@ impl Connection {
 
         self.pkt_num_spaces[epoch].largest_rx_pkt_num =
             cmp::max(self.pkt_num_spaces[epoch].largest_rx_pkt_num, pn);
+
+        if !probing {
+            self.pkt_num_spaces[epoch].largest_rx_non_probing_pkt_num = cmp::max(
+                self.pkt_num_spaces[epoch].largest_rx_non_probing_pkt_num,
+                pn,
+            );
+            // Did the peer migrated to another path?
+            let active_path_id = self.path_mgr.get_active_path_id()?;
+            if self.is_server &&
+                recv_pid != active_path_id &&
+                self.pkt_num_spaces[epoch].largest_rx_non_probing_pkt_num == pn
+            {
+                self.path_mgr.set_active_path(recv_pid)?;
+                let recv_path = self.path_mgr.get_mut(recv_pid)?;
+                // Requests path validation if needed.
+                if !recv_path.validated() && !recv_path.under_validation() {
+                    recv_path.request_validation();
+                }
+
+                let local_addr = recv_path.local_addr();
+                let peer_addr = recv_path.peer_addr();
+                let no_spare_dcid = recv_path.active_dcid_seq.is_none();
+
+                // Notify the application.
+                self.path_mgr.notify_event(path::PathEvent::PeerMigrated(
+                    local_addr, peer_addr,
+                ));
+
+                if no_spare_dcid {
+                    if self.disable_dcid_reuse {
+                        warn!(
+                            "Connection migrated on a new path but no spare \
+                               DCID; waiting for a new one"
+                        );
+                    } else {
+                        self.path_mgr.get_mut(recv_pid)?.active_dcid_seq = self
+                            .path_mgr
+                            .get_mut(active_path_id)?
+                            .active_dcid_seq
+                            .take();
+                        warn!(
+                            "Connection migrated on a new path but no spare \
+                               DCID; using the previous active path's one"
+                        );
+                    }
+                }
+            }
+        }
 
         if let Some(idle_timeout) = self.idle_timeout() {
             self.idle_timer = Some(now + idle_timeout);
@@ -5175,6 +5256,91 @@ impl Connection {
         let path = self.path_mgr.get_mut(pid)?;
         path.request_validation();
         let dcid_seq = path.active_dcid_seq.ok_or(Error::InvalidState)?;
+
+        Ok(dcid_seq)
+    }
+
+    /// Migrates the connection to a new local address `local_addr`.
+    ///
+    /// The behavior is similar to [`migrate()`], with the nuance that the
+    /// connection only changes the local address, but not the peer one.
+    ///
+    /// See [`migrate()`] for the full specification of this method.
+    ///
+    /// [`migrate()`]: struct.Connection.html#method.migrate
+    pub fn migrate_source(&mut self, local_addr: SocketAddr) -> Result<u64> {
+        let peer_addr = self.path_mgr.get_active()?.peer_addr();
+        self.migrate(local_addr, peer_addr)
+    }
+
+    /// Migrates the connection over the given network path between `local_addr`
+    /// and `peer_addr`.
+    ///
+    /// Connection migration can only be initiated by the client. Calling this
+    /// method as a server returns [`InvalidState`].
+    ///
+    /// To initiate voluntary migration, there should be enough Connection IDs
+    /// at both sides. If this requirement is not satisfied, this call returns
+    /// [`OutOfIdentifiers`].
+    ///
+    /// Returns the Destination Connection ID associated to that migrated path.
+    ///
+    /// [`OutOfIdentifiers`]: enum.Error.html#OutOfIdentifiers
+    /// [`InvalidState`]: enum.Error.html#InvalidState
+    pub fn migrate(
+        &mut self, local_addr: SocketAddr, peer_addr: SocketAddr,
+    ) -> Result<u64> {
+        if self.is_server {
+            return Err(Error::InvalidState);
+        }
+
+        // If the path already exists, mark it as the active one.
+        let (pid, dcid_seq) = if let Some(pid) =
+            self.path_mgr.path_id_from_addrs(&(local_addr, peer_addr))
+        {
+            let path = self.path_mgr.get_mut(pid)?;
+
+            // If it is already active, do nothing.
+            if path.active() {
+                return path.active_dcid_seq.ok_or(Error::OutOfIdentifiers);
+            }
+
+            // Ensures that a Source Connection ID has been dedicated to this
+            // path, or a free one is available. This is only required if the
+            // host uses non-zero length Source Connection IDs.
+            if !self.ids.zero_length_scid() &&
+                path.active_scid_seq.is_none() &&
+                self.ids.available_scids() == 0
+            {
+                return Err(Error::OutOfIdentifiers);
+            }
+            // Ensures that the migrated path has a Destination Connection ID.
+            let dcid_seq = if let Some(dcid_seq) = path.active_dcid_seq {
+                dcid_seq
+            } else {
+                let dcid_seq = self
+                    .ids
+                    .lowest_available_dcid_seq()
+                    .ok_or(Error::OutOfIdentifiers)?;
+                self.ids.link_dcid_to_path_id(dcid_seq, pid)?;
+                path.active_dcid_seq = Some(dcid_seq);
+                dcid_seq
+            };
+
+            (pid, dcid_seq)
+        } else {
+            let pid = self.create_path_on_client(local_addr, peer_addr)?;
+            let dcid_seq = self
+                .path_mgr
+                .get(pid)?
+                .active_dcid_seq
+                .ok_or(Error::InvalidState)?;
+
+            (pid, dcid_seq)
+        };
+
+        // Change the active path.
+        self.path_mgr.set_active_path(pid)?;
 
         Ok(dcid_seq)
     }
@@ -13792,6 +13958,539 @@ mod tests {
                 .sort(),
             vec![server_addr].sort(),
         );
+    }
+
+    #[test]
+    fn connection_migration() {
+        let mut config = Config::new(crate::PROTOCOL_VERSION).unwrap();
+        config
+            .load_cert_chain_from_pem_file("examples/cert.crt")
+            .unwrap();
+        config
+            .load_priv_key_from_pem_file("examples/cert.key")
+            .unwrap();
+        config
+            .set_application_protos(b"\x06proto1\x06proto2")
+            .unwrap();
+        config.verify_peer(false);
+        config.set_active_connection_id_limit(3);
+        config.set_initial_max_data(30);
+        config.set_initial_max_stream_data_bidi_local(15);
+        config.set_initial_max_stream_data_bidi_remote(15);
+        config.set_initial_max_stream_data_uni(10);
+        config.set_initial_max_streams_bidi(3);
+        config.enable_events(true);
+
+        let mut pipe = pipe_with_exchanged_cids(&mut config, 16, 16, 2);
+
+        let server_addr = testing::Pipe::server_addr();
+        let client_addr_2 = "127.0.0.1:5678".parse().unwrap();
+        let client_addr_3 = "127.0.0.1:9012".parse().unwrap();
+        let client_addr_4 = "127.0.0.1:8908".parse().unwrap();
+
+        // Case 1: the client first probes the new address, the server too, and
+        // then migrates.
+        assert_eq!(pipe.client.probe_path(client_addr_2, server_addr), Ok(1));
+        assert_eq!(pipe.advance(), Ok(()));
+        assert_eq!(
+            pipe.client.poll(),
+            Ok(QuicEvent::Path(PathEvent::Validated(
+                client_addr_2,
+                server_addr
+            )))
+        );
+        assert_eq!(pipe.client.poll(), Err(Error::Done));
+        assert_eq!(
+            pipe.server.poll(),
+            Ok(QuicEvent::Path(PathEvent::New(server_addr, client_addr_2)))
+        );
+        assert_eq!(pipe.server.poll(), Err(Error::Done));
+        assert_eq!(
+            pipe.client.is_path_validated(client_addr_2, server_addr),
+            Ok(true)
+        );
+        assert_eq!(
+            pipe.server.is_path_validated(server_addr, client_addr_2),
+            Ok(false)
+        );
+        assert_eq!(pipe.server.probe_path(server_addr, client_addr_2), Ok(1));
+        assert_eq!(pipe.advance(), Ok(()));
+        assert_eq!(
+            pipe.server.poll(),
+            Ok(QuicEvent::Path(PathEvent::Validated(
+                server_addr,
+                client_addr_2
+            )))
+        );
+        assert_eq!(
+            pipe.server.is_path_validated(server_addr, client_addr_2),
+            Ok(true)
+        );
+        // The server can never initiates the connection migration.
+        assert_eq!(
+            pipe.server.migrate(server_addr, client_addr_2),
+            Err(Error::InvalidState)
+        );
+        assert_eq!(pipe.client.migrate(client_addr_2, server_addr), Ok(1));
+        assert_eq!(pipe.client.stream_send(0, b"data", true), Ok(4));
+        assert_eq!(pipe.advance(), Ok(()));
+        assert_eq!(
+            pipe.client
+                .path_mgr
+                .get_active()
+                .expect("no active")
+                .local_addr(),
+            client_addr_2
+        );
+        assert_eq!(
+            pipe.client
+                .path_mgr
+                .get_active()
+                .expect("no active")
+                .peer_addr(),
+            server_addr
+        );
+        assert_eq!(
+            pipe.server.poll(),
+            Ok(QuicEvent::Path(PathEvent::PeerMigrated(
+                server_addr,
+                client_addr_2
+            )))
+        );
+        assert_eq!(pipe.server.poll(), Err(Error::Done));
+        assert_eq!(
+            pipe.server
+                .path_mgr
+                .get_active()
+                .expect("no active")
+                .local_addr(),
+            server_addr
+        );
+        assert_eq!(
+            pipe.server
+                .path_mgr
+                .get_active()
+                .expect("no active")
+                .peer_addr(),
+            client_addr_2
+        );
+
+        // Case 2: the client migrates on a path that was not previously
+        // validated, and has spare SCIDs/DCIDs to do so.
+        assert_eq!(pipe.client.migrate(client_addr_3, server_addr), Ok(2));
+        assert_eq!(pipe.client.stream_send(4, b"data", true), Ok(4));
+        assert_eq!(pipe.advance(), Ok(()));
+        assert_eq!(
+            pipe.client
+                .path_mgr
+                .get_active()
+                .expect("no active")
+                .local_addr(),
+            client_addr_3
+        );
+        assert_eq!(
+            pipe.client
+                .path_mgr
+                .get_active()
+                .expect("no active")
+                .peer_addr(),
+            server_addr
+        );
+        assert_eq!(
+            pipe.server.poll(),
+            Ok(QuicEvent::Path(PathEvent::New(server_addr, client_addr_3)))
+        );
+        assert_eq!(
+            pipe.server.poll(),
+            Ok(QuicEvent::Path(PathEvent::PeerMigrated(
+                server_addr,
+                client_addr_3
+            )))
+        );
+        assert_eq!(
+            pipe.server.poll(),
+            Ok(QuicEvent::Path(PathEvent::Validated(
+                server_addr,
+                client_addr_3
+            )))
+        );
+        assert_eq!(pipe.server.poll(), Err(Error::Done));
+        assert_eq!(
+            pipe.server
+                .path_mgr
+                .get_active()
+                .expect("no active")
+                .local_addr(),
+            server_addr
+        );
+        assert_eq!(
+            pipe.server
+                .path_mgr
+                .get_active()
+                .expect("no active")
+                .peer_addr(),
+            client_addr_3
+        );
+
+        // Case 3: the client tries to migrate on the current active path.
+        // This is not an error, but it triggers nothing.
+        assert_eq!(pipe.client.migrate(client_addr_3, server_addr), Ok(2));
+        assert_eq!(pipe.client.stream_send(8, b"data", true), Ok(4));
+        assert_eq!(pipe.advance(), Ok(()));
+        assert_eq!(pipe.client.poll(), Err(Error::Done));
+        assert_eq!(
+            pipe.client
+                .path_mgr
+                .get_active()
+                .expect("no active")
+                .local_addr(),
+            client_addr_3
+        );
+        assert_eq!(
+            pipe.client
+                .path_mgr
+                .get_active()
+                .expect("no active")
+                .peer_addr(),
+            server_addr
+        );
+        assert_eq!(pipe.server.poll(), Err(Error::Done));
+        assert_eq!(
+            pipe.server
+                .path_mgr
+                .get_active()
+                .expect("no active")
+                .local_addr(),
+            server_addr
+        );
+        assert_eq!(
+            pipe.server
+                .path_mgr
+                .get_active()
+                .expect("no active")
+                .peer_addr(),
+            client_addr_3
+        );
+
+        // Case 4: the client tries to migrate on a path that was not previously
+        // validated, and has no spare SCIDs/DCIDs. Prevent active migration.
+        assert_eq!(
+            pipe.client.migrate(client_addr_4, server_addr),
+            Err(Error::OutOfIdentifiers)
+        );
+        assert_eq!(
+            pipe.client
+                .path_mgr
+                .get_active()
+                .expect("no active")
+                .local_addr(),
+            client_addr_3
+        );
+        assert_eq!(
+            pipe.client
+                .path_mgr
+                .get_active()
+                .expect("no active")
+                .peer_addr(),
+            server_addr
+        );
+    }
+
+    #[test]
+    fn connection_migration_zero_length_cid() {
+        let mut config = Config::new(crate::PROTOCOL_VERSION).unwrap();
+        config
+            .load_cert_chain_from_pem_file("examples/cert.crt")
+            .unwrap();
+        config
+            .load_priv_key_from_pem_file("examples/cert.key")
+            .unwrap();
+        config
+            .set_application_protos(b"\x06proto1\x06proto2")
+            .unwrap();
+        config.verify_peer(false);
+        config.set_active_connection_id_limit(2);
+        config.set_initial_max_data(30);
+        config.set_initial_max_stream_data_bidi_local(15);
+        config.set_initial_max_stream_data_bidi_remote(15);
+        config.set_initial_max_stream_data_uni(10);
+        config.set_initial_max_streams_bidi(3);
+        config.enable_events(true);
+
+        let mut pipe = pipe_with_exchanged_cids(&mut config, 0, 16, 1);
+
+        let server_addr = testing::Pipe::server_addr();
+        let client_addr_2 = "127.0.0.1:5678".parse().unwrap();
+
+        // The client migrates on a path that was not previously
+        // validated, and has spare SCIDs/DCIDs to do so.
+        assert_eq!(pipe.client.migrate(client_addr_2, server_addr), Ok(1));
+        assert_eq!(pipe.client.stream_send(4, b"data", true), Ok(4));
+        assert_eq!(pipe.advance(), Ok(()));
+        assert_eq!(
+            pipe.client
+                .path_mgr
+                .get_active()
+                .expect("no active")
+                .local_addr(),
+            client_addr_2
+        );
+        assert_eq!(
+            pipe.client
+                .path_mgr
+                .get_active()
+                .expect("no active")
+                .peer_addr(),
+            server_addr
+        );
+        assert_eq!(
+            pipe.server.poll(),
+            Ok(QuicEvent::Path(PathEvent::New(server_addr, client_addr_2)))
+        );
+        assert_eq!(
+            pipe.server.poll(),
+            Ok(QuicEvent::Path(PathEvent::PeerMigrated(
+                server_addr,
+                client_addr_2
+            )))
+        );
+        assert_eq!(
+            pipe.server.poll(),
+            Ok(QuicEvent::Path(PathEvent::Validated(
+                server_addr,
+                client_addr_2
+            )))
+        );
+        assert_eq!(pipe.server.poll(), Err(Error::Done));
+        assert_eq!(
+            pipe.server
+                .path_mgr
+                .get_active()
+                .expect("no active")
+                .local_addr(),
+            server_addr
+        );
+        assert_eq!(
+            pipe.server
+                .path_mgr
+                .get_active()
+                .expect("no active")
+                .peer_addr(),
+            client_addr_2
+        );
+    }
+
+    #[test]
+    fn connection_migration_reordered_non_probing() {
+        let mut config = Config::new(crate::PROTOCOL_VERSION).unwrap();
+        config
+            .load_cert_chain_from_pem_file("examples/cert.crt")
+            .unwrap();
+        config
+            .load_priv_key_from_pem_file("examples/cert.key")
+            .unwrap();
+        config
+            .set_application_protos(b"\x06proto1\x06proto2")
+            .unwrap();
+        config.verify_peer(false);
+        config.set_active_connection_id_limit(2);
+        config.set_initial_max_data(30);
+        config.set_initial_max_stream_data_bidi_local(15);
+        config.set_initial_max_stream_data_bidi_remote(15);
+        config.set_initial_max_stream_data_uni(10);
+        config.set_initial_max_streams_bidi(3);
+        config.enable_events(true);
+
+        let mut pipe = pipe_with_exchanged_cids(&mut config, 16, 16, 1);
+
+        let client_addr = testing::Pipe::client_addr();
+        let server_addr = testing::Pipe::server_addr();
+        let client_addr_2 = "127.0.0.1:5678".parse().unwrap();
+
+        assert_eq!(pipe.client.probe_path(client_addr_2, server_addr), Ok(1));
+        assert_eq!(pipe.advance(), Ok(()));
+        assert_eq!(
+            pipe.client.poll(),
+            Ok(QuicEvent::Path(PathEvent::Validated(
+                client_addr_2,
+                server_addr
+            )))
+        );
+        assert_eq!(pipe.client.poll(), Err(Error::Done));
+        assert_eq!(
+            pipe.server.poll(),
+            Ok(QuicEvent::Path(PathEvent::New(server_addr, client_addr_2)))
+        );
+        assert_eq!(pipe.server.poll(), Err(Error::Done));
+        assert_eq!(pipe.server.probe_path(server_addr, client_addr_2), Ok(1));
+        assert_eq!(pipe.advance(), Ok(()));
+        assert_eq!(
+            pipe.server.poll(),
+            Ok(QuicEvent::Path(PathEvent::Validated(
+                server_addr,
+                client_addr_2
+            )))
+        );
+        assert_eq!(pipe.server.poll(), Err(Error::Done));
+
+        // A first flight sent from secondary address.
+        assert_eq!(pipe.client.stream_send(0, b"data", true), Ok(4));
+        let mut first = testing::emit_flight(&mut pipe.client).unwrap();
+        first.iter_mut().for_each(|(_, si)| si.from = client_addr_2);
+        // A second one, but sent from the original one.
+        assert_eq!(pipe.client.stream_send(4, b"data", true), Ok(4));
+        let second = testing::emit_flight(&mut pipe.client).unwrap();
+        // Second flight is received before first one.
+        assert_eq!(testing::process_flight(&mut pipe.server, second), Ok(()));
+        assert_eq!(testing::process_flight(&mut pipe.server, first), Ok(()));
+
+        // Server does not perform connection migration because of packet
+        // reordering.
+        assert_eq!(pipe.server.poll(), Err(Error::Done));
+        assert_eq!(
+            pipe.server
+                .path_mgr
+                .get_active()
+                .expect("no active")
+                .peer_addr(),
+            client_addr
+        );
+    }
+
+    #[test]
+    fn resilience_against_migration_attack() {
+        let mut config = Config::new(crate::PROTOCOL_VERSION).unwrap();
+        config
+            .load_cert_chain_from_pem_file("examples/cert.crt")
+            .unwrap();
+        config
+            .load_priv_key_from_pem_file("examples/cert.key")
+            .unwrap();
+        config
+            .set_application_protos(b"\x06proto1\x06proto2")
+            .unwrap();
+        config.verify_peer(false);
+        config.set_active_connection_id_limit(3);
+        config.set_initial_max_data(100000);
+        config.set_initial_max_stream_data_bidi_local(100000);
+        config.set_initial_max_stream_data_bidi_remote(100000);
+        config.set_initial_max_streams_bidi(2);
+        config.enable_events(true);
+
+        let mut pipe = pipe_with_exchanged_cids(&mut config, 16, 16, 1);
+
+        let client_addr = testing::Pipe::client_addr();
+        let server_addr = testing::Pipe::server_addr();
+        let spoofed_client_addr = "127.0.0.1:6666".parse().unwrap();
+
+        const DATA_BYTES: usize = 24000;
+        let buf = [42; DATA_BYTES];
+        let mut recv_buf = [0; DATA_BYTES];
+        assert_eq!(pipe.server.stream_send(1, &buf, true), Ok(12000));
+        assert_eq!(
+            testing::process_flight(
+                &mut pipe.client,
+                testing::emit_flight(&mut pipe.server).unwrap()
+            ),
+            Ok(())
+        );
+        let (rcv_data_1, _) = pipe.client.stream_recv(1, &mut recv_buf).unwrap();
+
+        // Fake the source address of client.
+        let mut faked_addr_flight =
+            testing::emit_flight(&mut pipe.client).unwrap();
+        faked_addr_flight
+            .iter_mut()
+            .for_each(|(_, si)| si.from = spoofed_client_addr);
+        assert_eq!(
+            testing::process_flight(&mut pipe.server, faked_addr_flight),
+            Ok(())
+        );
+        assert_eq!(pipe.server.stream_send(1, &buf[12000..], true), Ok(12000));
+        assert_eq!(
+            pipe.server.poll(),
+            Ok(QuicEvent::Path(PathEvent::ReusedSourceConnectionId(
+                0,
+                (server_addr, client_addr),
+                (server_addr, spoofed_client_addr)
+            )))
+        );
+        assert_eq!(
+            pipe.server.poll(),
+            Ok(QuicEvent::Path(PathEvent::New(
+                server_addr,
+                spoofed_client_addr
+            )))
+        );
+        assert_eq!(
+            pipe.server.poll(),
+            Ok(QuicEvent::Path(PathEvent::PeerMigrated(
+                server_addr,
+                spoofed_client_addr
+            )))
+        );
+
+        assert_eq!(
+            pipe.server.is_path_validated(server_addr, client_addr),
+            Ok(true)
+        );
+        assert_eq!(
+            pipe.server
+                .is_path_validated(server_addr, spoofed_client_addr),
+            Ok(false)
+        );
+
+        // The client creates the PATH CHALLENGE, but it is always lost.
+        testing::emit_flight(&mut pipe.server).unwrap();
+
+        // Wait until probing timer expires. Since the RTT is very low,
+        // wait a bit more.
+        let probed_pid = pipe
+            .server
+            .path_mgr
+            .path_id_from_addrs(&(server_addr, spoofed_client_addr))
+            .unwrap();
+        let probe_instant = pipe
+            .server
+            .path_mgr
+            .get(probed_pid)
+            .unwrap()
+            .recovery
+            .loss_detection_timer()
+            .unwrap();
+        let timer = probe_instant.duration_since(time::Instant::now());
+        std::thread::sleep(timer + time::Duration::from_millis(1));
+
+        pipe.server.on_timeout();
+
+        // Because of the small ACK size, the server cannot send more to the
+        // client. Fallback on the previous active path.
+        assert_eq!(
+            pipe.server.poll(),
+            Ok(QuicEvent::Path(PathEvent::FailedValidation(
+                server_addr,
+                spoofed_client_addr
+            )))
+        );
+
+        assert_eq!(
+            pipe.server.is_path_validated(server_addr, client_addr),
+            Ok(true)
+        );
+        assert_eq!(
+            pipe.server
+                .is_path_validated(server_addr, spoofed_client_addr),
+            Ok(false)
+        );
+
+        let server_active_path = pipe.server.path_mgr.get_active().unwrap();
+        assert_eq!(server_active_path.local_addr(), server_addr);
+        assert_eq!(server_active_path.peer_addr(), client_addr);
+        assert_eq!(pipe.advance(), Ok(()));
+        let (rcv_data_2, fin) =
+            pipe.client.stream_recv(1, &mut recv_buf).unwrap();
+        assert_eq!(fin, true);
+        assert_eq!(rcv_data_1 + rcv_data_2, DATA_BYTES);
     }
 }
 
