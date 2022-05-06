@@ -9214,7 +9214,6 @@ mod tests {
             final_size: 5,
         }];
 
-        setup();
         let pkt_type = packet::Type::Short;
         assert_eq!(pipe.send_pkt_to_server(pkt_type, &frames, &mut buf), Ok(39));
 
