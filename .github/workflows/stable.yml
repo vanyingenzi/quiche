@@ -182,7 +182,7 @@ jobs:
         uses: actions-rs/cargo@v1
         with:
           command: test
-          args: --target=${{ matrix.target }} --verbose --all-targets --features=ffi,qlog
+          args: --target=${{ matrix.target }} --verbose --all-targets --features=ffi,qlog -- --nocapture
           use-cross: true
 
   http3_test:

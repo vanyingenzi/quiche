@@ -7814,6 +7814,17 @@ pub mod testing {
 mod tests {
     use super::*;
 
+    use std::sync::Once;
+
+    static INIT: Once = Once::new();
+
+    /// Setup function that is only run once, even if called multiple times.
+    fn setup() {
+        INIT.call_once(|| {
+            let _ = env_logger::builder().filter_level(log::LevelFilter::Trace).is_test(true).try_init();
+        });
+    }
+
     #[test]
     fn transport_params() {
         // Server encodes, client decodes.
@@ -9162,6 +9173,7 @@ mod tests {
     /// Tests that receiving a valid RESET_STREAM frame when all data has
     /// already been read, notifies the application.
     fn reset_stream_data_recvd() {
+        setup();
         let mut b = [0; 15];
         let mut buf = [0; 65535];
 
