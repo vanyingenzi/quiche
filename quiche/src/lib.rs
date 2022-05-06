@@ -9173,7 +9173,6 @@ mod tests {
     /// Tests that receiving a valid RESET_STREAM frame when all data has
     /// already been read, notifies the application.
     fn reset_stream_data_recvd() {
-        setup();
         let mut b = [0; 15];
         let mut buf = [0; 65535];
 
@@ -9212,6 +9211,7 @@ mod tests {
             final_size: 5,
         }];
 
+        setup();
         let pkt_type = packet::Type::Short;
         assert_eq!(pipe.send_pkt_to_server(pkt_type, &frames, &mut buf), Ok(39));
 
