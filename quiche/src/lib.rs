@@ -7821,7 +7821,10 @@ mod tests {
     /// Setup function that is only run once, even if called multiple times.
     fn setup() {
         INIT.call_once(|| {
-            let _ = env_logger::builder().filter_level(log::LevelFilter::Trace).is_test(true).try_init();
+            let _ = env_logger::builder()
+                .filter_level(log::LevelFilter::Trace)
+                .is_test(true)
+                .try_init();
         });
     }
 
