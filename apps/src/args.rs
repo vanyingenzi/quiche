@@ -53,6 +53,8 @@ pub struct CommonArgs {
     pub max_field_section_size: Option<u64>,
     pub qpack_max_table_capacity: Option<u64>,
     pub qpack_blocked_streams: Option<u64>,
+    pub enable_ecn: bool,
+    pub use_ect1: bool,
 }
 
 /// Creates a new `CommonArgs` structure using the provided [`Docopt`].
@@ -78,6 +80,8 @@ pub struct CommonArgs {
 /// --max-field-section-size BYTES  Max size of uncompressed field section.
 /// --qpack-max-table-capacity BYTES  Max capacity of dynamic QPACK decoding.
 /// --qpack-blocked-streams STREAMS  Limit of blocked streams while decoding.
+/// --enable-ecn                Enable ECN support.
+/// --use-ect1                  Use ECT(1) instead of ECT(0).
 ///
 /// [`Docopt`]: https://docs.rs/docopt/1.1.0/docopt/
 impl Args for CommonArgs {
@@ -187,6 +191,9 @@ impl Args for CommonArgs {
                 None
             };
 
+        let enable_ecn = args.get_bool("--enable-ecn");
+        let use_ect1 = args.get_bool("--use-ect1");
+
         CommonArgs {
             alpns,
             max_data,
@@ -209,6 +216,8 @@ impl Args for CommonArgs {
             max_field_section_size,
             qpack_max_table_capacity,
             qpack_blocked_streams,
+            enable_ecn,
+            use_ect1,
         }
     }
 }
@@ -237,6 +246,8 @@ impl Default for CommonArgs {
             max_field_section_size: None,
             qpack_max_table_capacity: None,
             qpack_blocked_streams: None,
+            enable_ecn: false,
+            use_ect1: false,
         }
     }
 }
@@ -281,6 +292,8 @@ Options:
   --qpack-blocked-streams STREAMS   Limit of blocked streams while decoding. Any value other that 0 is currently unsupported.
   --session-file PATH      File used to cache a TLS session for resumption.
   --source-port PORT       Source port to use when connecting to the server [default: 0].
+  --enable-ecn             Enable ECN support.
+  --use-ect1               Use ECT(1) instead of ECT(0).
   -h --help                Show this screen.
 ";
 
@@ -444,6 +457,8 @@ Options:
   --qpack-max-table-capacity BYTES  Max capacity of QPACK dynamic table decoding. Any value other that 0 is currently unsupported.
   --qpack-blocked-streams STREAMS   Limit of streams that can be blocked while decoding. Any value other that 0 is currently unsupported.
   --disable-gso               Disable GSO (linux only).
+  --enable-ecn                Enable ECN support.
+  --use-ect1                  Use ECT(1) instead of ECT(0).
   -h --help                   Show this screen.
 ";
 
