@@ -36,6 +36,7 @@ use std::collections::VecDeque;
 use crate::Config;
 use crate::Result;
 
+use crate::ecn;
 use crate::frame;
 use crate::minmax;
 use crate::packet;
@@ -142,7 +143,7 @@ pub struct Recovery {
 
     max_datagram_size: usize,
 
-    ecn_ce_counts: [u64; packet::EPOCH_COUNT],
+    pub ecn: ecn::Ecn,
 
     cubic_state: cubic::State,
 
@@ -175,6 +176,8 @@ pub struct RecoveryConfig {
     cc_ops: &'static CongestionControlOps,
     hystart: bool,
     pacing: bool,
+    pub ecn_enabled: bool,
+    pub ecn_use_ect1: bool,
 }
 
 impl RecoveryConfig {
@@ -185,6 +188,8 @@ impl RecoveryConfig {
             cc_ops: config.cc_algorithm.into(),
             hystart: config.hystart,
             pacing: config.pacing,
+            ecn_enabled: config.ecn_enabled,
+            ecn_use_ect1: config.ecn_use_ect1,
         }
     }
 }
@@ -258,7 +263,11 @@ impl Recovery {
 
             max_datagram_size: recovery_config.max_send_udp_payload_size,
 
-            ecn_ce_counts: [0, 0, 0],
+            ecn: ecn::Ecn::new(
+                recovery_config.ecn_enabled,
+                recovery_config.ecn_use_ect1,
+                [packet::EcnCounts::default(); packet::EPOCH_COUNT],
+            ),
 
             cc_ops: recovery_config.cc_ops,
 
@@ -445,6 +454,7 @@ impl Recovery {
         let mut largest_newly_acked_sent_time = now;
 
         let mut newly_acked = Vec::new();
+        let mut newly_ecn_marked_acked = 0;
 
         let mut undo_cwnd = false;
 
@@ -512,6 +522,10 @@ impl Recovery {
                         self.in_flight_count[epoch].saturating_sub(1);
                 }
 
+                if unacked.ecn_marked {
+                    newly_ecn_marked_acked += 1;
+                }
+
                 newly_acked.push(Acked {
                     pkt_num: unacked.pkt_num,
 
@@ -561,15 +575,14 @@ impl Recovery {
             }
         }
 
-        if let Some(ecn_counts) = ecn_counts {
-            self.process_ecn(
-                ecn_counts,
-                largest_newly_acked_size,
-                largest_newly_acked_sent_time,
-                epoch,
-                now,
-            );
-        }
+        self.process_ecn(
+            newly_ecn_marked_acked,
+            ecn_counts,
+            largest_newly_acked_size,
+            largest_newly_acked_sent_time,
+            epoch,
+            now,
+        );
 
         // Detect and mark lost packets without removing them from the sent
         // packets list.
@@ -873,6 +886,7 @@ impl Recovery {
 
         let mut lost_packets = 0;
         let mut lost_bytes = 0;
+        let mut lost_ecn_marked_ack_eliciting_packets = 0;
 
         let mut largest_lost_pkt = None;
 
@@ -910,6 +924,10 @@ impl Recovery {
                     );
                 }
 
+                if unacked.ack_eliciting && unacked.ecn_marked {
+                    lost_ecn_marked_ack_eliciting_packets += 1;
+                }
+
                 lost_packets += 1;
                 self.lost_count += 1;
             } else {
@@ -929,6 +947,9 @@ impl Recovery {
         if let Some(pkt) = largest_lost_pkt {
             self.on_packets_lost(lost_bytes, &pkt, epoch, now);
         }
+
+        self.ecn
+            .on_packets_lost(lost_ecn_marked_ack_eliciting_packets);
 
         self.drain_packets(epoch, now);
 
@@ -1011,12 +1032,15 @@ impl Recovery {
     }
 
     fn process_ecn(
-        &mut self, ecn_counts: packet::EcnCounts, largest_acked_size: usize,
+        &mut self, newly_ecn_marked_acked: u64,
+        ecn_counts: Option<packet::EcnCounts>, largest_acked_size: usize,
         largest_acked_sent_time: Instant, epoch: packet::Epoch, now: Instant,
     ) {
-        if ecn_counts.ecn_ce_count > self.ecn_ce_counts[epoch] {
-            self.ecn_ce_counts[epoch] = ecn_counts.ecn_ce_count;
-
+        if self
+            .ecn
+            .on_ack_received(epoch, newly_ecn_marked_acked, ecn_counts) >
+            0
+        {
             self.congestion_event(
                 largest_acked_size,
                 largest_acked_sent_time,
@@ -1224,6 +1248,8 @@ pub struct Sent {
     pub is_app_limited: bool,
 
     pub has_data: bool,
+
+    pub ecn_marked: bool,
 }
 
 impl std::fmt::Debug for Sent {
@@ -1451,6 +1477,7 @@ mod tests {
             first_sent_time: now,
             is_app_limited: false,
             has_data: false,
+            ecn_marked: false,
         };
 
         r.on_packet_sent(
@@ -1477,6 +1504,7 @@ mod tests {
             first_sent_time: now,
             is_app_limited: false,
             has_data: false,
+            ecn_marked: false,
         };
 
         r.on_packet_sent(
@@ -1503,6 +1531,7 @@ mod tests {
             first_sent_time: now,
             is_app_limited: false,
             has_data: false,
+            ecn_marked: false,
         };
 
         r.on_packet_sent(
@@ -1529,6 +1558,7 @@ mod tests {
             first_sent_time: now,
             is_app_limited: false,
             has_data: false,
+            ecn_marked: false,
         };
 
         r.on_packet_sent(
@@ -1588,6 +1618,7 @@ mod tests {
             first_sent_time: now,
             is_app_limited: false,
             has_data: false,
+            ecn_marked: false,
         };
 
         r.on_packet_sent(
@@ -1614,6 +1645,7 @@ mod tests {
             first_sent_time: now,
             is_app_limited: false,
             has_data: false,
+            ecn_marked: false,
         };
 
         r.on_packet_sent(
@@ -1686,6 +1718,7 @@ mod tests {
             first_sent_time: now,
             is_app_limited: false,
             has_data: false,
+            ecn_marked: false,
         };
 
         r.on_packet_sent(
@@ -1712,6 +1745,7 @@ mod tests {
             first_sent_time: now,
             is_app_limited: false,
             has_data: false,
+            ecn_marked: false,
         };
 
         r.on_packet_sent(
@@ -1738,6 +1772,7 @@ mod tests {
             first_sent_time: now,
             is_app_limited: false,
             has_data: false,
+            ecn_marked: false,
         };
 
         r.on_packet_sent(
@@ -1764,6 +1799,7 @@ mod tests {
             first_sent_time: now,
             is_app_limited: false,
             has_data: false,
+            ecn_marked: false,
         };
 
         r.on_packet_sent(
@@ -1847,6 +1883,7 @@ mod tests {
             first_sent_time: now,
             is_app_limited: false,
             has_data: false,
+            ecn_marked: false,
         };
 
         r.on_packet_sent(
@@ -1873,6 +1910,7 @@ mod tests {
             first_sent_time: now,
             is_app_limited: false,
             has_data: false,
+            ecn_marked: false,
         };
 
         r.on_packet_sent(
@@ -1899,6 +1937,7 @@ mod tests {
             first_sent_time: now,
             is_app_limited: false,
             has_data: false,
+            ecn_marked: false,
         };
 
         r.on_packet_sent(
@@ -1925,6 +1964,7 @@ mod tests {
             first_sent_time: now,
             is_app_limited: false,
             has_data: false,
+            ecn_marked: false,
         };
 
         r.on_packet_sent(
@@ -2021,6 +2061,7 @@ mod tests {
             first_sent_time: now,
             is_app_limited: false,
             has_data: false,
+            ecn_marked: false,
         };
 
         r.on_packet_sent(
@@ -2079,6 +2120,7 @@ mod tests {
             first_sent_time: now,
             is_app_limited: false,
             has_data: false,
+            ecn_marked: false,
         };
 
         r.on_packet_sent(
@@ -2110,6 +2152,7 @@ mod tests {
             first_sent_time: now,
             is_app_limited: false,
             has_data: false,
+            ecn_marked: false,
         };
 
         r.on_packet_sent(
@@ -2138,6 +2181,7 @@ mod tests {
             first_sent_time: now,
             is_app_limited: false,
             has_data: false,
+            ecn_marked: false,
         };
 
         r.on_packet_sent(

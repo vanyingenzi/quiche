@@ -422,6 +422,7 @@ mod tests {
                 first_sent_time: now,
                 is_app_limited: false,
                 has_data: false,
+                ecn_marked: false,
             };
 
             r.on_packet_sent(
@@ -444,6 +445,7 @@ mod tests {
             r.on_ack_received(
                 &acked,
                 25,
+                None,
                 packet::EPOCH_APPLICATION,
                 HandshakeStatus::default(),
                 now,
@@ -489,6 +491,7 @@ mod tests {
                 first_sent_time: now,
                 is_app_limited: false,
                 has_data: false,
+                ecn_marked: false,
             };
 
             r.on_packet_sent(
@@ -512,6 +515,7 @@ mod tests {
             r.on_ack_received(
                 &acked,
                 25,
+                None,
                 packet::EPOCH_APPLICATION,
                 HandshakeStatus::default(),
                 now,
@@ -555,6 +559,7 @@ mod tests {
                 first_sent_time: now,
                 is_app_limited: false,
                 has_data: false,
+                ecn_marked: false,
             };
 
             r.on_packet_sent(
@@ -578,6 +583,7 @@ mod tests {
                 r.on_ack_received(
                     &acked,
                     25,
+                    None,
                     packet::EPOCH_APPLICATION,
                     HandshakeStatus::default(),
                     now,
@@ -603,6 +609,7 @@ mod tests {
                 first_sent_time: now,
                 is_app_limited: false,
                 has_data: false,
+                ecn_marked: false,
             };
 
             r.on_packet_sent(
@@ -629,6 +636,7 @@ mod tests {
             r.on_ack_received(
                 &acked,
                 25,
+                None,
                 packet::EPOCH_APPLICATION,
                 HandshakeStatus::default(),
                 now,
@@ -674,6 +682,7 @@ mod tests {
                 first_sent_time: now,
                 is_app_limited: false,
                 has_data: false,
+                ecn_marked: false,
             };
 
             r.on_packet_sent(
@@ -696,6 +705,7 @@ mod tests {
                 r.on_ack_received(
                     &acked,
                     25,
+                    None,
                     packet::EPOCH_APPLICATION,
                     HandshakeStatus::default(),
                     now,
@@ -744,6 +754,7 @@ mod tests {
                 first_sent_time: now,
                 is_app_limited: false,
                 has_data: false,
+                ecn_marked: false,
             };
 
             r.on_packet_sent(
@@ -766,6 +777,7 @@ mod tests {
                 r.on_ack_received(
                     &acked,
                     25,
+                    None,
                     packet::EPOCH_APPLICATION,
                     HandshakeStatus::default(),
                     now,
@@ -795,6 +807,7 @@ mod tests {
             first_sent_time: now,
             is_app_limited: false,
             has_data: false,
+            ecn_marked: false,
         };
 
         r.on_packet_sent(
@@ -819,6 +832,7 @@ mod tests {
             r.on_ack_received(
                 &acked,
                 25,
+                None,
                 packet::EPOCH_APPLICATION,
                 HandshakeStatus::default(),
                 now,

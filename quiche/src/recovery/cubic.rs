@@ -483,6 +483,7 @@ mod tests {
             first_sent_time: now,
             is_app_limited: false,
             has_data: false,
+            ecn_marked: false,
         };
 
         // Send initcwnd full MSS packets to become no longer app limited
@@ -531,6 +532,7 @@ mod tests {
             first_sent_time: now,
             is_app_limited: false,
             has_data: false,
+            ecn_marked: false,
         };
 
         // Send initcwnd full MSS packets to become no longer app limited
@@ -729,6 +731,7 @@ mod tests {
             first_sent_time: now,
             is_app_limited: false,
             has_data: false,
+            ecn_marked: false,
         };
 
         // 1st round.
@@ -877,6 +880,7 @@ mod tests {
             first_sent_time: now,
             is_app_limited: false,
             has_data: false,
+            ecn_marked: false,
         };
 
         // 1st round.
