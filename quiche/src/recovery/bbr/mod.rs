@@ -422,6 +422,7 @@ mod tests {
                 first_sent_time: now,
                 is_app_limited: false,
                 has_data: false,
+                ecn_marked: false,
             };
 
             r.on_packet_sent(
@@ -490,6 +491,7 @@ mod tests {
                 first_sent_time: now,
                 is_app_limited: false,
                 has_data: false,
+                ecn_marked: false,
             };
 
             r.on_packet_sent(
@@ -557,6 +559,7 @@ mod tests {
                 first_sent_time: now,
                 is_app_limited: false,
                 has_data: false,
+                ecn_marked: false,
             };
 
             r.on_packet_sent(
@@ -606,6 +609,7 @@ mod tests {
                 first_sent_time: now,
                 is_app_limited: false,
                 has_data: false,
+                ecn_marked: false,
             };
 
             r.on_packet_sent(
@@ -678,6 +682,7 @@ mod tests {
                 first_sent_time: now,
                 is_app_limited: false,
                 has_data: false,
+                ecn_marked: false,
             };
 
             r.on_packet_sent(
@@ -749,6 +754,7 @@ mod tests {
                 first_sent_time: now,
                 is_app_limited: false,
                 has_data: false,
+                ecn_marked: false,
             };
 
             r.on_packet_sent(
@@ -801,6 +807,7 @@ mod tests {
             first_sent_time: now,
             is_app_limited: false,
             has_data: false,
+            ecn_marked: false,
         };
 
         r.on_packet_sent(
