@@ -1628,6 +1628,7 @@ macro_rules! push_frame_to_pkt {
 
             true
         } else {
+            trace!("[TOREMOVE] push_frame_to_pkt the frame len ({}) is larger than left size ({})", $frame.wire_len(), $left);
             false
         }
     }};
@@ -3279,6 +3280,7 @@ impl Connection {
         }
 
         if self.is_closed() || self.is_draining() {
+            trace!("[TOREMOVE] send_on_path is closed or draining");
             return Err(Error::Done);
         }
 
@@ -3299,6 +3301,7 @@ impl Connection {
         // There's no point in trying to send a packet if the Initial secrets
         // have not been derived yet, so return early.
         if !self.derived_initial_secrets {
+            trace!("[TOREMOVE] send_on_path initial secrets not derived");
             return Err(Error::Done);
         }
 
@@ -3309,6 +3312,7 @@ impl Connection {
         // Limit output packet size to respect the sender and receiver's
         // maximum UDP payload size limit.
         let mut left = cmp::min(out.len(), self.max_send_udp_payload_size());
+        trace!("[TOREMOVE] send_on_path left is {}", left);
 
         let send_pid = match (from, to) {
             (Some(f), Some(t)) => self
@@ -3319,7 +3323,7 @@ impl Connection {
             _ => self.get_send_path_id(from, to)?,
         };
 
-        let send_path = self.paths.get_mut(send_pid)?;
+        let send_path: &mut path::Path = self.paths.get_mut(send_pid)?;
 
         // Limit data sent by the server based on the amount of data received
         // from the client before its address is validated.
@@ -3336,9 +3340,14 @@ impl Connection {
                 now,
             ) {
                 Ok(v) => v,
-
-                Err(Error::BufferTooShort) | Err(Error::Done) => break,
-
+                Err(Error::BufferTooShort) => {
+                    trace!("[TOREMOVE] send_single buffer too short");
+                    break;
+                },
+                Err(Error::Done) => {
+                    trace!("[TOREMOVE] send_single is done");
+                    break;
+                },
                 Err(e) => return Err(e),
             };
 
@@ -3372,7 +3381,7 @@ impl Connection {
 
         if done == 0 {
             self.last_tx_data = self.tx_data;
-
+            trace!("[TOREMOVE] send_on_path done == 0");
             return Err(Error::Done);
         }
 
@@ -3409,6 +3418,7 @@ impl Connection {
         }
 
         if self.is_draining() {
+            trace!("[TOREMOVE] send_single is draining");
             return Err(Error::Done);
         }
 
@@ -3653,6 +3663,7 @@ impl Connection {
                 // failed because cwnd is almost full. In such case app_limited
                 // is set to false here to make cwnd grow when ACK is received.
                 path.recovery.update_app_limited(false);
+                trace!("[TOREMOVE] send_single not enough space for pkt overhead");
                 return Err(Error::Done);
             },
         }
@@ -3660,6 +3671,7 @@ impl Connection {
         // Make sure there is enough space for the minimum payload length.
         if left < PAYLOAD_MIN_LEN {
             path.recovery.update_app_limited(false);
+            trace!("[TOREMOVE] send_single not enough space for the minimum payload length");
             return Err(Error::Done);
         }
 
@@ -4486,6 +4498,7 @@ impl Connection {
             // When we reach this point we are not able to write more, so set
             // app_limited to false.
             path.recovery.update_app_limited(false);
+            trace!("[TOREMOVE] send_single not enough space for frames");
             return Err(Error::Done);
         }
 
@@ -5936,6 +5949,7 @@ impl Connection {
             if let Some(timer) = p.recovery.loss_detection_timer() {
                 if timer <= now {
                     trace!("{} loss detection timeout expired", self.trace_id);
+                    trace!("[TOREMOVE] timeout timer: {:?} now: {:?}, path stats {:?}", timer, now, p.stats());
 
                     let (lost_packets, lost_bytes) = p.on_loss_detection_timeout(
                         handshake_status,
@@ -5962,15 +5976,20 @@ impl Connection {
 
         // If the active path failed, try to find a new candidate.
         if self.paths.get_active_path_id().is_err() {
+            trace!("[TOREMOVE] get_active_path failed {}", self.trace_id);
             match self.paths.find_candidate_path() {
                 Some(pid) =>
                     if self.set_active_path(pid, now).is_err() {
                         // The connection cannot continue.
+                        trace!("[TOREMOVE] Connection cannot continue");
                         self.closed = true;
                     },
 
                 // The connection cannot continue.
-                None => self.closed = true,
+                None => {
+                    trace!("[TOREMOVE] Connection cannot continue");
+                    self.closed = true;
+                },
             }
         }
     }

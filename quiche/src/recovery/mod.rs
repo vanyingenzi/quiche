@@ -637,6 +637,7 @@ impl Recovery {
 
         if earliest_loss_time.is_some() {
             // Time threshold loss detection.
+            trace!("[TOREMOVE] time threshold loss detection");
             let (lost_packets, lost_bytes) =
                 self.detect_lost_packets(epoch, now, trace_id);
 

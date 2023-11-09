@@ -53,6 +53,36 @@ const MAX_BUF_SIZE: usize = 65507;
 
 const MAX_DATAGRAM_SIZE: usize = 1350;
 
+struct Scheduler {
+    paths: Vec<(std::net::SocketAddr, std::net::SocketAddr)>,
+    current_index: usize, // Keeps track of the currently selected path.
+}
+
+impl Scheduler {
+    fn new(init_paths: Vec<(std::net::SocketAddr, std::net::SocketAddr)>) -> Self {
+        Self {
+            paths: init_paths,
+            current_index: 0,
+        }
+    }
+
+    fn add_path(&mut self, path: (std::net::SocketAddr, std::net::SocketAddr)) {
+        self.paths.push(path);
+    }
+
+    fn next_path(&mut self) -> Option<(std::net::SocketAddr, std::net::SocketAddr)> {
+        if self.paths.is_empty() {
+            return None; // No paths to select from
+        }
+
+        // Get the next path in a round-robin fashion
+        let next_index = self.current_index % self.paths.len();
+        self.current_index += 1;
+
+        Some(self.paths[next_index])
+    }
+}
+
 fn main() {
     let mut buf = [0; MAX_BUF_SIZE];
     let mut out = [0; MAX_BUF_SIZE];
@@ -172,6 +202,7 @@ fn main() {
     let mut next_client_id = 0;
     let mut clients_ids = ClientIdMap::new();
     let mut clients = ClientMap::new();
+    let mut schedulers: HashMap<u64, Scheduler> = HashMap::new();
 
     let mut pkt_count = 0;
 
@@ -392,6 +423,7 @@ fn main() {
                 };
 
                 clients.insert(client_id, client);
+                schedulers.insert(client_id, Scheduler::new(vec![(local_addr, from)]));
                 clients_ids.insert(scid.clone(), client_id);
 
                 next_client_id += 1;
@@ -504,7 +536,7 @@ fn main() {
                 }
             }
 
-            handle_path_events(client);
+            handle_path_events(client, schedulers.get_mut(&client.client_id).unwrap());
 
             // See whether source Connection IDs have been retired.
             while let Some(retired_scid) = client.conn.retired_scid_next() {
@@ -531,7 +563,7 @@ fn main() {
         // them on the UDP socket, until quiche reports that there are no more
         // packets to be sent.
         continue_write = false;
-        for client in clients.values_mut() {
+        for (k, client) in clients.iter_mut() {
             // Reduce max_send_burst by 25% if loss is increasing more than 0.1%.
             let loss_rate =
                 client.conn.stats().lost as f64 / client.conn.stats().sent as f64;
@@ -549,16 +581,19 @@ fn main() {
                     client.max_datagram_size;
             let mut total_write = 0;
             let mut dst_info: Option<quiche::SendInfo> = None;
+            let path_scheduled = schedulers.get_mut(k).unwrap().next_path();
 
             while total_write < max_send_burst {
-                let res = match dst_info {
-                    Some(info) => client.conn.send_on_path(
-                        &mut out[total_write..max_send_burst],
-                        Some(info.from),
-                        Some(info.to),
-                    ),
-                    None =>
-                        client.conn.send(&mut out[total_write..max_send_burst]),
+
+                let res = if let Some(info) = dst_info {
+                    trace!("[TOREMOVE] send_on_path {:?}", info);
+                    client.conn.send_on_path(&mut out[total_write..max_send_burst], Some(info.from), Some(info.to))
+                } else if let Some((local, peer)) = path_scheduled {
+                    trace!("[TOREMOVE] send on scheduled path {} <-> {}", local, peer);
+                    client.conn.send_on_path(&mut out[total_write..max_send_burst], Some(local), Some(peer))
+                } else {
+                    trace!("[TOREMOVE] [else] conn send");
+                    client.conn.send(&mut out[total_write..max_send_burst])
                 };
 
                 let (write, send_info) = match res {
@@ -572,7 +607,6 @@ fn main() {
 
                     Err(e) => {
                         error!("{} send failed: {:?}", client.conn.trace_id(), e);
-
                         client.conn.close(false, 0x1, b"fail").ok();
                         break;
                     },
@@ -590,6 +624,9 @@ fn main() {
             }
 
             if total_write == 0 || dst_info.is_none() {
+                if dst_info.is_none(){
+                    trace!("[TOREMOVE] dst_info is none, total_write = {}", total_write);
+                }
                 break;
             }
 
@@ -610,20 +647,23 @@ fn main() {
             }
 
             trace!("{} written {} bytes", client.conn.trace_id(), total_write);
+            trace!("[TOREMOVE] written {} bytes to {}", total_write, dst_info.unwrap().to);
 
             if continue_write {
                 trace!(
                     "{} pause writing and consider another path",
                     client.conn.trace_id()
                 );
+                trace!("[TOREMOVE] total_write >= max_send_burst ? {}", total_write >= max_send_burst);
                 break;
             }
 
             if total_write >= max_send_burst {
                 trace!("{} pause writing", client.conn.trace_id(),);
+                trace!("[TOREMOVE] total_write >= max_send_burst ! pause writing");
                 continue_write = true;
                 break;
-            }
+            }   
         }
 
         // Garbage collect closed connections.
@@ -646,6 +686,7 @@ fn main() {
 
             !c.conn.is_closed()
         });
+        schedulers.retain(|k, _| clients.contains_key(k));
     }
 }
 
@@ -705,7 +746,7 @@ fn validate_token<'a>(
     Some(quiche::ConnectionId::from_ref(&token[addr.len()..]))
 }
 
-fn handle_path_events(client: &mut Client) {
+fn handle_path_events(client: &mut Client, scheduler: &mut Scheduler) {
     while let Some(qe) = client.conn.path_event_next() {
         match qe {
             quiche::PathEvent::New(local_addr, peer_addr) => {
@@ -732,11 +773,15 @@ fn handle_path_events(client: &mut Client) {
                     peer_addr
                 );
                 if client.conn.is_multipath_enabled() {
-                    client
+                    match client
                         .conn
                         .set_active(local_addr, peer_addr, true)
                         .map_err(|e| error!("cannot set path active: {}", e))
-                        .ok();
+                        .ok()
+                    {
+                        Some(()) => scheduler.add_path((local_addr, peer_addr)),
+                        None => (),
+                    }
                 }
             },
 
