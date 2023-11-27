@@ -24,10 +24,16 @@
 // NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
 // SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
+
+// ! This module implements utulities in order to support multicore on top of QUICHE
+// ! Author: Vany Ingenzi
+
 use crate::args::*;
 use crate::common::*;
+use crate::client::*;
 
-use std::collections::HashMap;
+use static_assertions;
+use std::net::SocketAddr;
 use std::net::ToSocketAddrs;
 
 use std::io::prelude::*;
@@ -35,33 +41,247 @@ use std::io::prelude::*;
 use std::rc::Rc;
 
 use std::cell::RefCell;
+use std::sync::Mutex;
+use std::thread;
 
-use ring::rand::*;
-
+use mio::net::UdpSocket;
+use quiche::Connection;
+use quiche::ConnectionId;
 use slab::Slab;
+use std::sync::Arc;
+use ring::rand::*;
 
 const MAX_DATAGRAM_SIZE: usize = 1350;
 
-#[derive(Debug)]
-pub enum ClientError {
-    HandshakeFail,
-    HttpFail,
-    Other(String),
+/// Reads the packets on the socket and feeds them to quiche.
+pub fn read_packets_on_socket(
+    socket: &UdpSocket, 
+    conn: &mut Connection,
+    pkt_count: &mut u64,
+    dump_packet_path: &Option<String>,
+    buf: &mut [u8],
+) -> Result<(), ClientError>{
+    let local_addr = socket.local_addr().unwrap();
+    'read: loop {
+        let (len, from) = match socket.recv_from(buf) {
+            Ok(v) => v,
+
+            Err(e) => {
+                // There are no more UDP packets to read on this socket.
+                // Process subsequent events.
+                if e.kind() == std::io::ErrorKind::WouldBlock {
+                    trace!("{}: recv() would block", local_addr);
+                    break 'read;
+                }
+
+                return Err(ClientError::Other(format!(
+                    "{local_addr}: recv() failed: {e:?}"
+                )));
+            },
+        };
+
+        trace!("{}: got {} bytes", local_addr, len);
+
+        if let Some(target_path) = dump_packet_path.as_ref() {
+            let path = format!("{target_path}/{pkt_count}.pkt");
+
+            if let Ok(f) = std::fs::File::create(path) {
+                let mut f = std::io::BufWriter::new(f);
+                f.write_all(&buf[..len]).ok();
+            }
+        }
+
+        *pkt_count += 1;
+
+        let recv_info = quiche::RecvInfo {
+            to: local_addr,
+            from,
+        };
+
+        // Process potentially coalesced packets.
+        let read = match conn.recv(&mut buf[..len], recv_info) {
+            Ok(v) => v,
+
+            Err(e) => {
+                error!("{}: recv failed: {:?}", local_addr, e);
+                continue 'read;
+            },
+        };
+        trace!("{}: processed {} bytes", local_addr, read);
+    };
+
+
+    Ok(())
 }
 
-pub fn connect(
-    args: ClientArgs, conn_args: CommonArgs,
-    output_sink: impl FnMut(String) + 'static,
+pub fn write_packets_on_path(
+    local_addr: &SocketAddr,
+    peer_addr: &SocketAddr,
+    socket: &UdpSocket, 
+    conn: &mut Connection,
+    out: &mut [u8],
+) -> Result<(), ClientError> {
+    loop {
+        let (write, send_info) = match conn.send_on_path(
+            out,
+            Some(*local_addr),
+            Some(*peer_addr),
+        ) {
+            Ok(v) => v,
+
+            Err(quiche::Error::Done) => {
+                trace!("{} -> {}: done writing", local_addr, peer_addr);
+                break;
+            },
+
+            Err(e) => {
+                error!(
+                    "{} -> {}: send failed: {:?}",
+                    local_addr, peer_addr, e
+                );
+
+                conn.close(false, 0x1, b"fail").ok();
+                break;
+            },
+        };
+
+        if let Err(e) = socket.send_to(&out[..write], send_info.to) {
+            if e.kind() == std::io::ErrorKind::WouldBlock {
+                trace!(
+                    "{} -> {}: send() would block",
+                    local_addr,
+                    send_info.to
+                );
+                break;
+            }
+
+            return Err(ClientError::Other(format!(
+                "{} -> {}: send() failed: {:?}",
+                local_addr, send_info.to, e
+            )));
+        }
+
+        trace!("{} -> {}: written {}", local_addr, send_info.to, write);
+    };
+    Ok(())
+}
+
+fn multicore_create_socket(
+    addrs: (&SocketAddr, &SocketAddr), 
+    poll: &mut mio::Poll
+) -> UdpSocket {
+    let mut sockets = Slab::with_capacity(1);
+    let (local_addr, _) = addrs;
+    let socket = mio::net::UdpSocket::bind(*local_addr).unwrap();
+    let token = sockets.insert(socket);
+    poll.registry().register(&mut sockets[0], mio::Token(token), mio::Interest::READABLE).unwrap();
+    sockets.remove(token)
+}
+
+fn multicore_initiate_connection(
+    peer_addr: &std::net::SocketAddr, 
+    local_addr: &std::net::SocketAddr,  
+    out: &mut [u8], 
+    scid: &ConnectionId, 
+    conn: &mut Connection,
+    socket: & mut mio::net::UdpSocket
+) -> Result<(), ClientError>  {
+    info!(
+        "connecting to {:} from {:} with scid {:?}",
+        peer_addr, local_addr, scid,
+    );
+
+    let (write, send_info) = conn.send(out).expect("initial send failed");
+
+    while let Err(e) = socket.send_to(&out[..write], send_info.to) {
+        if e.kind() == std::io::ErrorKind::WouldBlock {
+            trace!(
+                "{} -> {}: send() would block",
+                socket.local_addr().unwrap(),
+                send_info.to
+            );
+            continue;
+        }
+
+        return Err(ClientError::Other(format!("send() failed: {e:?}")));
+    }
+
+    trace!("written {}", write);
+    Ok(())
+}
+
+fn client_thread(
+    quiche_conn: Arc<Mutex<Connection>>,
+    dump_packet_path: Option<String>,
+    addrs: (SocketAddr, SocketAddr),
+    initiate_connection: bool,
+    scid: Arc<ConnectionId>
 ) -> Result<(), ClientError> {
     let mut buf = [0; 65535];
     let mut out = [0; MAX_DATAGRAM_SIZE];
+    let mut pkt_count: u64 = 0;
+    let mut poll = mio::Poll::new().unwrap();
+    let mut events = mio::Events::with_capacity(1024);
+    let (local_addr, peer_addr) = addrs;
+    let mut socket = multicore_create_socket( (&local_addr, &peer_addr), &mut poll);
+    
+    trace!("Thread {:?}, checking if has to initiate connection ? : {}", thread::current().id(), initiate_connection);
+    if initiate_connection {
+        trace!("Thread {:?}, Trying to obtain conn", thread::current().id());
+        let conn = &mut quiche_conn.lock().unwrap();
+        multicore_initiate_connection(&peer_addr, &local_addr, &mut out, &scid, conn, &mut socket)?;
+    }
+
+    let mut conn_is_in_early_data ;
+    let mut timeout ;
+
+    loop {
+        let conn = quiche_conn.lock().unwrap();
+        conn_is_in_early_data = conn.is_in_early_data();
+        timeout = conn.timeout();
+        drop(conn);
+
+        if !conn_is_in_early_data {
+            poll.poll(&mut events, timeout).unwrap();
+        }
+
+        if !events.is_empty(){
+            // Reading from socket critical section 
+            let mut conn = quiche_conn.lock().unwrap();
+            read_packets_on_socket(&socket, &mut conn, &mut pkt_count, &dump_packet_path, &mut buf)?;
+            if conn.is_closed() {
+                break; // The mutex will be drooped automatically
+            }
+        }
+
+        { // Writing to socket critical section 
+            let mut conn = quiche_conn.lock().unwrap();
+            write_packets_on_path(&local_addr, &peer_addr, &socket, &mut conn, &mut out)?;
+        }
+    }
+
+    Ok(())
+}
+
+
+pub fn multicore_connect(
+    args: ClientArgs, conn_args: CommonArgs,
+    output_sink: impl FnMut(String) + 'static,
+) -> Result<(), ClientError> {
+
+    static_assertions::assert_impl_all!(Connection: Send);
+
+    // ** [Connection thread]
+
+    //let mut buf = [0; 65535];
+    //let mut out = [0; MAX_DATAGRAM_SIZE];
 
     let output_sink =
         Rc::new(RefCell::new(output_sink)) as Rc<RefCell<dyn FnMut(_)>>;
 
     // Setup the event loop.
-    let mut poll = mio::Poll::new().unwrap();
-    let mut events = mio::Events::with_capacity(1024);
+    // let mut poll = mio::Poll::new().unwrap();
+    // let mut events = mio::Events::with_capacity(1024);
 
     // We'll only connect to the first server provided in URL list.
     let connect_url = &args.urls[0];
@@ -73,19 +293,18 @@ pub fn connect(
         connect_url.to_socket_addrs().unwrap().next().unwrap()
     };
 
-    let (sockets, src_addr_to_token, local_addr) =
-        create_sockets(&mut poll, &peer_addr, &args);
-    let mut addrs = Vec::with_capacity(sockets.len());
-    addrs.push(local_addr);
+    let (sockets, local_addr) = prepare_address(&peer_addr, &args);
+    //let mut addrs = Vec::with_capacity(sockets.len());
+    /*addrs.push(local_addr);
     for src in src_addr_to_token.keys() {
         if *src != local_addr {
             addrs.push(*src);
         }
-    }
+    }*/
 
     // Warn the user if there are more usable addresses than the advertised
     // `active_connection_id_limit`.
-    if addrs.len() as u64 > conn_args.max_active_cids {
+    /*if addrs.len() as u64 > conn_args.max_active_cids {
         warn!(
             "{} addresses provided, but configuration restricts to at most {} \
                active CIDs; increase the --max-active-cids parameter to use all \
@@ -93,10 +312,10 @@ pub fn connect(
             addrs.len(),
             conn_args.max_active_cids
         );
-    }
+    }*/
 
-    let mut rm_addrs = args.rm_addrs.clone();
-    let mut status = args.status.clone();
+    //let mut rm_addrs = args.rm_addrs.clone();
+    //let mut status = args.status.clone();
 
     // Create the configuration for the QUIC connection.
     let mut config = quiche::Config::new(args.version).unwrap();
@@ -166,7 +385,7 @@ pub fn connect(
         config.enable_dgram(true, 1000, 1000);
     }
 
-    let mut http_conn: Option<Box<dyn HttpConn>> = None;
+    let http_conn: Option<Box<dyn HttpConn>> = None;
 
     let mut app_proto_selected = false;
 
@@ -176,9 +395,9 @@ pub fn connect(
     rng.fill(&mut scid[..]).unwrap();
 
     let scid = quiche::ConnectionId::from_ref(&scid);
-
+    let scid = Arc::new(scid.into_owned());
     // Create a QUIC connection and initiate handshake.
-    let mut conn = quiche::connect(
+    let conn = quiche::connect(
         connect_url.domain(),
         &scid,
         local_addr,
@@ -187,6 +406,32 @@ pub fn connect(
     )
     .unwrap();
 
+    let conn_guard: Arc<Mutex<Connection>> = Arc::new(Mutex::new(conn));
+    let http_conn_guard = Arc::new(Mutex::new(http_conn));
+    let scheduler_guard = Arc::new(Mutex::new(Scheduler::new(vec![(local_addr, peer_addr)])));
+
+    // ! Enters critical section
+    let mut conn = conn_guard.lock().unwrap();  
+
+    for (local, peer) in sockets {
+        let conn_cloned = conn_guard.clone();
+        let _ = scheduler_guard.clone();
+        let _ = http_conn_guard.clone();
+        let dump_packet_path = conn_args.dump_packet_path.clone();
+        let clone_scid = scid.clone();
+        thread::spawn(move || {
+            trace!("[Thread {:?}] spawned with path {:?} <-> {:?}", thread::current().id(), local, peer);
+            client_thread(
+                conn_cloned,
+                dump_packet_path,
+                (local, peer), 
+                local == local_addr, 
+                clone_scid
+            ).unwrap();
+        });
+    }
+
+  
     if let Some(keylog) = &mut keylog {
         if let Ok(keylog) = keylog.try_clone() {
             conn.set_keylog(Box::new(keylog));
@@ -213,7 +458,12 @@ pub fn connect(
             conn.set_session(&session).ok();
         }
     }
+    drop(conn); // ! Exits critical section
 
+    let app_data_start = std::time::Instant::now();
+
+    // [Initial Thread Work]
+    /* 
     info!(
         "connecting to {:} from {:} with scid {:?}",
         peer_addr, local_addr, scid,
@@ -242,11 +492,16 @@ pub fn connect(
     let mut probed_paths = 0;
     let mut pkt_count = 0;
 
-    let mut scid_sent = false;
     let mut new_path_probed = false;
+    
+    drop(conn);  */
+
+    let mut scid_sent = false;
     let mut migrated = false;
 
     loop {
+
+        /* 
         if !conn.is_in_early_data() || app_proto_selected {
             poll.poll(&mut events, conn.timeout()).unwrap();
         }
@@ -256,12 +511,15 @@ pub fn connect(
         // will then proceed with the send loop.
         if events.is_empty() {
             trace!("timed out");
-
             conn.on_timeout();
-        }
+        } */
 
+
+        // ** [Per path thread]
+        /*
         // Read incoming UDP packets from the socket and feed them to quiche,
         // until there are no more packets to read.
+        
         for event in &events {
             let token = event.token().into();
             let socket = &sockets[token];
@@ -314,9 +572,13 @@ pub fn connect(
 
                 trace!("{}: processed {} bytes", local_addr, read);
             }
-        }
+        } */
 
-        trace!("done reading");
+        // ** [Connection thread]
+        
+        // ! Enter critical section
+        let mut conn = conn_guard.lock().unwrap();  
+
 
         if conn.is_closed() {
             info!(
@@ -325,6 +587,7 @@ pub fn connect(
                 conn.path_stats().collect::<Vec<quiche::PathStats>>()
             );
 
+            /*
             if !conn.is_established() {
                 error!(
                     "connection timed out after {:?}",
@@ -333,6 +596,7 @@ pub fn connect(
 
                 return Err(ClientError::HandshakeFail);
             }
+            */
 
             if let Some(session_file) = &args.session_file {
                 if let Some(session) = conn.session() {
@@ -340,14 +604,18 @@ pub fn connect(
                 }
             }
 
-            if let Some(h_conn) = http_conn {
+            // TODO Fix me
+            /*if let Some(h_conn) = http_conn {
                 if h_conn.report_incomplete(&app_data_start) {
                     return Err(ClientError::HttpFail);
                 }
-            }
+            }*/
 
             break;
         }
+
+        let mut http_conn =  http_conn_guard.lock().unwrap();  
+
 
         // Create a new application protocol session once the QUIC connection is
         // established.
@@ -366,7 +634,7 @@ pub fn connect(
             let app_proto = conn.application_proto();
 
             if alpns::HTTP_09.contains(&app_proto) {
-                http_conn = Some(Http09Conn::with_urls(
+                *http_conn = Some(Http09Conn::with_urls(
                     &args.urls,
                     args.reqs_cardinal,
                     Rc::clone(&output_sink),
@@ -384,7 +652,7 @@ pub fn connect(
                     None
                 };
 
-                http_conn = Some(Http3Conn::with_urls(
+                *http_conn = Some(Http3Conn::with_urls(
                     &mut conn,
                     &args.urls,
                     args.reqs_cardinal,
@@ -404,28 +672,47 @@ pub fn connect(
             }
         }
 
+        drop(http_conn);
+        drop(conn); // ! Exits critical section
+
+        // ** [Per path thread] | The thread that received data from the socket
+        /*
         // If we have an HTTP connection, first issue the requests then
         // process received data.
         if let Some(h_conn) = http_conn.as_mut() {
             h_conn.send_requests(&mut conn, &args.dump_response_path);
             h_conn.handle_responses(&mut conn, &mut buf, &app_data_start);
         }
+        */
 
         // Handle path events.
+        let mut conn = conn_guard.lock().unwrap();  
+        let mut conn_scheduler = scheduler_guard.lock().unwrap();
         while let Some(qe) = conn.path_event_next() {
             match qe {
-                quiche::PathEvent::New(..) => unreachable!(),
+                quiche::PathEvent::New(local_addr, peer_addr) => {
+                    info!(
+                        "[Connection Thread] Path ({}, {}) is now validated",
+                        local_addr, peer_addr
+                    );
+                },
 
                 quiche::PathEvent::Validated(local_addr, peer_addr) => {
                     info!(
-                        "Path ({}, {}) is now validated",
+                        "[Connection Thread] Path ({}, {}) is now validated",
                         local_addr, peer_addr
                     );
                     if conn.is_multipath_enabled() {
-                        conn.set_active(local_addr, peer_addr, true).ok();
+                        match conn.set_active(local_addr, peer_addr, true).ok() {
+                            Some(()) => {
+                                conn_scheduler.add_path((local_addr, peer_addr));
+                            }, 
+                            None => (),
+                        }
                     } else if args.perform_migration {
                         conn.migrate(local_addr, peer_addr).unwrap();
                         migrated = true;
+                        conn_scheduler.add_path((local_addr, peer_addr));
                     }
                 },
 
@@ -476,10 +763,12 @@ pub fn connect(
             scid_sent = true;
         }
 
+        // Handle Multipath Issue
+        /* 
         if conn_args.multipath &&
             probed_paths < addrs.len() &&
             conn.available_dcids() > 0 &&
-            conn.probe_path(addrs[probed_paths], peer_addr).is_ok()
+            conn.probe_path(aeddrs[probed_paths], peer_addr).is_ok()
         {
             probed_paths += 1;
         }
@@ -522,14 +811,17 @@ pub fn connect(
                     true
                 }
             });
-        }
-
-        // Determine in which order we are going to iterate over paths.
-        let scheduled_tuples = lowest_latency_scheduler(&conn);
-
+        } */
+        drop(conn_scheduler);
+        drop(conn);
+        
+        // ** [Per path thread]
+        /*
         // Generate outgoing QUIC packets and send them on the UDP socket, until
         // quiche reports that there are no more packets to be sent.
-        for (local_addr, peer_addr) in scheduled_tuples {
+        let mut left_paths = rr_sheduler.len();
+        while left_paths > 0 {
+            let (local_addr, peer_addr) = rr_sheduler.next_path().unwrap();
             let token = src_addr_to_token[&local_addr];
             let socket = &sockets[token];
             loop {
@@ -574,7 +866,12 @@ pub fn connect(
 
                 trace!("{} -> {}: written {}", local_addr, send_info.to, write);
             }
-        }
+            left_paths -= 1;
+        }*/
+
+        // ** [Connection thread]
+        let conn = conn_guard.lock().unwrap();
+        let mut http_conn =  http_conn_guard.lock().unwrap();  
 
         if conn.is_closed() {
             info!(
@@ -598,7 +895,7 @@ pub fn connect(
                 }
             }
 
-            if let Some(h_conn) = http_conn {
+            if let Some(h_conn) = &mut *http_conn {
                 if h_conn.report_incomplete(&app_data_start) {
                     return Err(ClientError::HttpFail);
                 }
@@ -606,20 +903,20 @@ pub fn connect(
 
             break;
         }
+        drop(http_conn);
+        drop(conn);
     }
+
+
 
     Ok(())
 }
 
-pub fn create_sockets(
-    poll: &mut mio::Poll, peer_addr: &std::net::SocketAddr, args: &ClientArgs,
-) -> (
-    Slab<mio::net::UdpSocket>,
-    HashMap<std::net::SocketAddr, usize>,
-    std::net::SocketAddr,
-) {
-    let mut sockets = Slab::with_capacity(std::cmp::max(args.addrs.len(), 1));
-    let mut src_addrs = HashMap::new();
+pub fn prepare_address(
+    peer_addr: &std::net::SocketAddr,
+    args: &ClientArgs,
+) -> (Vec<(std::net::SocketAddr, std::net::SocketAddr)>, std::net::SocketAddr)  {
+    let mut tuples = vec![];
     let mut first_local_addr = None;
 
     // Create UDP sockets backing the QUIC connection, and register them with
@@ -629,20 +926,7 @@ pub fn create_sockets(
         (sa.is_ipv4() && peer_addr.is_ipv4()) ||
             (sa.is_ipv6() && peer_addr.is_ipv6())
     }) {
-        let socket = mio::net::UdpSocket::bind(*src_addr).unwrap();
-        let local_addr = socket.local_addr().unwrap();
-        let token = sockets.insert(socket);
-        src_addrs.insert(local_addr, token);
-        poll.registry()
-            .register(
-                &mut sockets[token],
-                mio::Token(token),
-                mio::Interest::READABLE,
-            )
-            .unwrap();
-        if first_local_addr.is_none() {
-            first_local_addr = Some(local_addr);
-        }
+        tuples.push((src_addr.clone(), peer_addr.clone()));
     }
 
     // If there is no such address, rely on the default INADDR_IN or IN6ADDR_ANY
@@ -655,31 +939,11 @@ pub fn create_sockets(
             std::net::SocketAddr::V6(_) => "[::]:0",
         };
         let bind_addr = bind_addr.parse().unwrap();
-        let socket = mio::net::UdpSocket::bind(bind_addr).unwrap();
+        let socket = mio::net::UdpSocket::bind(bind_addr).unwrap(); // TODO maybe delete this line 
         let local_addr = socket.local_addr().unwrap();
-        let token = sockets.insert(socket);
-        src_addrs.insert(local_addr, token);
-        poll.registry()
-            .register(
-                &mut sockets[token],
-                mio::Token(token),
-                mio::Interest::READABLE,
-            )
-            .unwrap();
+        tuples.push((local_addr.clone(), peer_addr.clone()));
         first_local_addr = Some(local_addr)
     }
 
-    (sockets, src_addrs, first_local_addr.unwrap())
-}
-
-/// Generate a ordered list of 4-tuples on which the host should send packets,
-/// following a lowest-latency scheduling.
-fn lowest_latency_scheduler(
-    conn: &quiche::Connection,
-) -> impl Iterator<Item = (std::net::SocketAddr, std::net::SocketAddr)> {
-    use itertools::Itertools;
-    conn.path_stats()
-        .filter(|p| !matches!(p.state, quiche::PathState::Closed(_, _)))
-        .sorted_by_key(|p| p.rtt)
-        .map(|p| (p.local_addr, p.peer_addr))
+    (tuples, first_local_addr.unwrap())
 }

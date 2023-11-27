@@ -1640,3 +1640,44 @@ impl HttpConn for Http3Conn {
         }
     }
 }
+
+
+
+// The code below has been added by: Vany Ingenzi
+pub struct Scheduler {
+    paths: Vec<(std::net::SocketAddr, std::net::SocketAddr)>,
+    current_index: usize, // Keeps track of the currently selected path.
+}
+
+impl Scheduler {
+    pub fn new(init_paths: Vec<(std::net::SocketAddr, std::net::SocketAddr)>) -> Self {
+        Self {
+            paths: init_paths,
+            current_index: 0,
+        }
+    }
+
+    pub fn add_path(&mut self, path: (std::net::SocketAddr, std::net::SocketAddr)) {
+        self.paths.push(path);
+    }
+
+    pub fn remove_path(&mut self, to_remove: (std::net::SocketAddr, std::net::SocketAddr)) {
+        self.paths.retain(|&path| path != to_remove);
+    }
+
+    pub fn next_path(&mut self) -> Option<(std::net::SocketAddr, std::net::SocketAddr)> {
+        if self.paths.is_empty() {
+            return None; // No paths to select from
+        }
+
+        // Get the next path in a round-robin fashion
+        let next_index = self.current_index % self.paths.len();
+        self.current_index += 1;
+
+        Some(self.paths[next_index])
+    }
+
+    pub fn len(&mut self) -> usize{
+        self.paths.len()
+    }
+}

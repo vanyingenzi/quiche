@@ -53,36 +53,6 @@ const MAX_BUF_SIZE: usize = 65507;
 
 const MAX_DATAGRAM_SIZE: usize = 1350;
 
-struct Scheduler {
-    paths: Vec<(std::net::SocketAddr, std::net::SocketAddr)>,
-    current_index: usize, // Keeps track of the currently selected path.
-}
-
-impl Scheduler {
-    fn new(init_paths: Vec<(std::net::SocketAddr, std::net::SocketAddr)>) -> Self {
-        Self {
-            paths: init_paths,
-            current_index: 0,
-        }
-    }
-
-    fn add_path(&mut self, path: (std::net::SocketAddr, std::net::SocketAddr)) {
-        self.paths.push(path);
-    }
-
-    fn next_path(&mut self) -> Option<(std::net::SocketAddr, std::net::SocketAddr)> {
-        if self.paths.is_empty() {
-            return None; // No paths to select from
-        }
-
-        // Get the next path in a round-robin fashion
-        let next_index = self.current_index % self.paths.len();
-        self.current_index += 1;
-
-        Some(self.paths[next_index])
-    }
-}
-
 fn main() {
     let mut buf = [0; MAX_BUF_SIZE];
     let mut out = [0; MAX_BUF_SIZE];
@@ -803,6 +773,7 @@ fn handle_path_events(client: &mut Client, scheduler: &mut Scheduler) {
                     err,
                     reason,
                 );
+                scheduler.remove_path((local_addr, peer_addr))
             },
 
             quiche::PathEvent::ReusedSourceConnectionId(cid_seq, old, new) => {
@@ -822,6 +793,7 @@ fn handle_path_events(client: &mut Client, scheduler: &mut Scheduler) {
                     local_addr,
                     peer_addr
                 );
+                scheduler.add_path((local_addr, peer_addr)) // TODO check if valid
             },
 
             quiche::PathEvent::PeerPathStatus(addr, path_status) => {
