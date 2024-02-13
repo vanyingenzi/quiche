@@ -356,6 +356,7 @@ pub trait HttpConn {
         &mut self, conn: &mut quiche::Connection,
         partial_responses: &mut HashMap<u64, PartialResponse>, stream_id: u64,
     );
+    
 }
 
 /// Represents an HTTP/0.9 formatted request.
@@ -1646,35 +1647,68 @@ impl HttpConn for Http3Conn {
 // The code below has been added by: Vany Ingenzi
 pub struct Scheduler {
     paths: Vec<(std::net::SocketAddr, std::net::SocketAddr)>,
-    current_index: usize, // Keeps track of the currently selected path.
+    temporal_paths: Vec<(std::net::SocketAddr, std::net::SocketAddr)>,
+    validate_current_index: usize, // Keeps track of the currently selected path.
 }
 
 impl Scheduler {
     pub fn new(init_paths: Vec<(std::net::SocketAddr, std::net::SocketAddr)>) -> Self {
         Self {
             paths: init_paths,
-            current_index: 0,
+            validate_current_index: 0,
+            temporal_paths: vec![],
         }
     }
 
     pub fn add_path(&mut self, path: (std::net::SocketAddr, std::net::SocketAddr)) {
+        if self.temporal_paths.contains(&path){
+            // This path has been validated, so we can remove it from the temporal paths
+            self.temporal_paths.retain(|&x| x != path);
+        }
         self.paths.push(path);
+    }
+
+    pub fn add_temporal_path(&mut self, path: (std::net::SocketAddr, std::net::SocketAddr)) {
+        // This is to be used in when we want to add a new path tha hasn't been Validated. This allows
+        // the path to be scheduled in order to receive probing packets dedicated to the path
+
+        // The path will be scheduled a maximum number of times 10. 
+        self.temporal_paths.push(path);
     }
 
     pub fn remove_path(&mut self, to_remove: (std::net::SocketAddr, std::net::SocketAddr)) {
         self.paths.retain(|&path| path != to_remove);
     }
 
-    pub fn next_path(&mut self) -> Option<(std::net::SocketAddr, std::net::SocketAddr)> {
+    fn inner_next_path(&mut self, peeking: bool) -> Option<(std::net::SocketAddr, std::net::SocketAddr)> {
         if self.paths.is_empty() {
             return None; // No paths to select from
         }
-
+    
+        if !self.temporal_paths.is_empty(){ // In order for the new path to wait for atleast one round of every other node
+            if self.validate_current_index % self.paths.len() == 0{
+                if peeking {
+                    return Some(self.temporal_paths[0])
+                } else {
+                    return Some(self.temporal_paths.remove(0))
+                }
+            }
+        }
+        
         // Get the next path in a round-robin fashion
-        let next_index = self.current_index % self.paths.len();
-        self.current_index += 1;
-
+        let next_index = self.validate_current_index % self.paths.len();
+        if !peeking {
+            self.validate_current_index += 1;
+        }    
         Some(self.paths[next_index])
+    }
+
+    pub fn next_path(&mut self) -> Option<(std::net::SocketAddr, std::net::SocketAddr)> {
+        self.inner_next_path(false)
+    }
+
+    pub fn peek_next_path(&mut self) -> Option<(std::net::SocketAddr, std::net::SocketAddr)> {
+        self.inner_next_path(true)
     }
 
     pub fn len(&mut self) -> usize{

@@ -54,7 +54,7 @@ fn main() {
             Ok(_) => (),
         }
      
-    }else {
+    } else {
         // This is the deafult call that was made by the original quiche-client
         match connect(args, conn_args, stdout_sink) {
             Err(ClientError::HandshakeFail) => std::process::exit(-1),

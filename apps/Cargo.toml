@@ -34,6 +34,7 @@ nix = { version = "0.27", features = ["net", "socket", "uio"] }
 slab = "0.4"
 itertools = "0.10"
 static_assertions = "1.1.0"
+core_affinity = "0.8.1"
 
 [lib]
 crate-type = ["lib"]

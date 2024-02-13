@@ -1,0 +1,17 @@
+# Multicore Impl
+
+```bash
+cargo build -release
+mkdir -p /tmp/www
+fallocate -l 1G /tmp/www/testfile
+```
+
+server
+```bash
+RUST_LOG=info ../target/release/quiche-server --root /tmp/www --multicore
+```
+
+client 
+```bash
+RUST_LOG=info ../target/release/quiche-client https:127.0.0.1:4433/testfile --no-verify -A 127.0.0.1:6788 -A 127.0.0.1:6789 --multipath --multicore 1>/dev/null
+```

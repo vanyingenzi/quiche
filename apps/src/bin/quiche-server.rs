@@ -556,13 +556,10 @@ fn main() {
             while total_write < max_send_burst {
 
                 let res = if let Some(info) = dst_info {
-                    trace!("[TOREMOVE] send_on_path {:?}", info);
                     client.conn.send_on_path(&mut out[total_write..max_send_burst], Some(info.from), Some(info.to))
                 } else if let Some((local, peer)) = path_scheduled {
-                    trace!("[TOREMOVE] send on scheduled path {} <-> {}", local, peer);
                     client.conn.send_on_path(&mut out[total_write..max_send_burst], Some(local), Some(peer))
                 } else {
-                    trace!("[TOREMOVE] [else] conn send");
                     client.conn.send(&mut out[total_write..max_send_burst])
                 };
 
@@ -594,9 +591,6 @@ fn main() {
             }
 
             if total_write == 0 || dst_info.is_none() {
-                if dst_info.is_none(){
-                    trace!("[TOREMOVE] dst_info is none, total_write = {}", total_write);
-                }
                 break;
             }
 
@@ -617,20 +611,17 @@ fn main() {
             }
 
             trace!("{} written {} bytes", client.conn.trace_id(), total_write);
-            trace!("[TOREMOVE] written {} bytes to {}", total_write, dst_info.unwrap().to);
 
             if continue_write {
                 trace!(
                     "{} pause writing and consider another path",
                     client.conn.trace_id()
                 );
-                trace!("[TOREMOVE] total_write >= max_send_burst ? {}", total_write >= max_send_burst);
                 break;
             }
 
             if total_write >= max_send_burst {
                 trace!("{} pause writing", client.conn.trace_id(),);
-                trace!("[TOREMOVE] total_write >= max_send_burst ! pause writing");
                 continue_write = true;
                 break;
             }   
@@ -726,6 +717,8 @@ fn handle_path_events(client: &mut Client, scheduler: &mut Scheduler) {
                     local_addr,
                     peer_addr
                 );
+
+                scheduler.add_path((local_addr, peer_addr));
 
                 // Directly probe the new path.
                 client
