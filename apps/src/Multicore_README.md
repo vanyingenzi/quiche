@@ -1,14 +1,13 @@
 # Multicore Impl
 
 ```bash
-cargo build -release
-mkdir -p /tmp/www
-fallocate -l 1G /tmp/www/testfile
+cargo build --release
+mkdir -p /tmp/www; fallocate -l 4G /tmp/www/testfile
 ```
 
 server
 ```bash
-RUST_LOG=info ../target/release/quiche-server --root /tmp/www --multicore
+RUST_LOG=info ../target/release/quiche-server --root /tmp/www --multipath --multicore
 ```
 
 client 

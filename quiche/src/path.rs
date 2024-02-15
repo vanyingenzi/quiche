@@ -566,7 +566,6 @@ impl Path {
         // If we lost probing packets, check if the path failed
         // validation.
         if let Some(lost_probe_time) = lost_probe_time {
-            trace!("[TOREMOVE] lost probe packets on path {:?}", self.stats());
             self.last_probe_lost_time = match self.last_probe_lost_time {
                 Some(last) => {
                     // Count a loss if at least 1-RTT happened.
@@ -588,10 +587,8 @@ impl Path {
             if self.probing_lost >= crate::MAX_PROBING_TIMEOUTS ||
                 (is_server && self.max_send_bytes < crate::MIN_PROBING_SIZE)
             {
-                trace!("[TOREMOVE] amplification attack");
                 self.on_failed_validation();
             } else {
-                trace!("[TOREMOVE] Requesting validation");
                 self.request_validation();
             }
         }

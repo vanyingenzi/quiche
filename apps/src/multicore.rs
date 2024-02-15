@@ -25,8 +25,8 @@
 // SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 
-// ! This module implements utulities in order to support multicore on top of QUICHE
-// ! Author: Vany Ingenzi
+//! This module implements utulities in order to support multicore on top of QUICHE
+//! Author: Vany Ingenzi
 
 use crate::args::*;
 use crate::common::*;
@@ -36,7 +36,9 @@ extern crate core_affinity;
 
 use mio::Events;
 use static_assertions;
-use std::net::SocketAddr;
+use std::net::Ipv4Addr;
+use std::net::Ipv6Addr;
+use std::net::{SocketAddr, IpAddr};
 use std::net::ToSocketAddrs;
 
 use std::io::prelude::*;
@@ -44,15 +46,13 @@ use std::io::prelude::*;
 use std::rc::Rc;
 
 use std::cell::RefCell;
-use std::sync::Mutex;
+use std::str::FromStr;
 use std::thread;
-use std::time::Duration;
 
 use mio::net::UdpSocket;
 use quiche::Connection;
 use quiche::ConnectionId;
-use slab::Slab;
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex};
 use ring::rand::*;
 
 const MAX_DATAGRAM_SIZE: usize = 1350;
@@ -181,12 +181,10 @@ fn multicore_create_socket(
     addrs: (&SocketAddr, &SocketAddr), 
     poll: &mut mio::Poll
 ) -> UdpSocket {
-    let mut sockets = Slab::with_capacity(1);
     let (local_addr, _) = addrs;
-    let socket = mio::net::UdpSocket::bind(*local_addr).unwrap();
-    let token = sockets.insert(socket);
-    poll.registry().register(&mut sockets[0], mio::Token(token), mio::Interest::READABLE).unwrap();
-    sockets.remove(token)
+    let mut socket = mio::net::UdpSocket::bind(*local_addr).unwrap();
+    poll.registry().register(&mut socket, mio::Token(0), mio::Interest::READABLE).unwrap();
+    socket
 }
 
 fn multicore_initiate_connection(
@@ -197,6 +195,7 @@ fn multicore_initiate_connection(
     conn: &mut Connection,
     socket: & mut mio::net::UdpSocket
 ) -> Result<(), ClientError>  {
+
     info!(
         "connecting to {:} from {:} with scid {:?}",
         peer_addr, local_addr, scid,
@@ -223,11 +222,13 @@ fn multicore_initiate_connection(
 
 fn client_thread(
     quiche_conn: Arc<Mutex<Connection>>,
+    app_proto_selected_guard: Arc<Mutex<bool>>,
     dump_packet_path: Option<String>,
     addrs: (SocketAddr, SocketAddr),
     initiate_connection: bool,
     scid: Arc<ConnectionId>, 
-    scheduler_guard: Arc<Mutex<Scheduler>>
+    scheduler_guard: Arc<Mutex<Scheduler>>, 
+    sent_conn_init_pkt: Arc<(Mutex<bool>, Condvar)>
 ) -> Result<(), ClientError> {
     let mut out = [0; MAX_DATAGRAM_SIZE];
     let mut pkt_count: u64 = 0;
@@ -240,57 +241,77 @@ fn client_thread(
     if initiate_connection {
         let conn = &mut quiche_conn.lock().unwrap();
         multicore_initiate_connection(&peer_addr, &local_addr, &mut out, &scid, conn, &mut socket)?;
+        let (lock, cvar) =  &*sent_conn_init_pkt;
+        let mut sent = lock.lock().unwrap();
+        *sent = true;
+        cvar.notify_all();
+    } else {
+        let (lock, cvar) = &*sent_conn_init_pkt;
+        let mut sent = lock.lock().unwrap();
+        while !*sent {
+            sent = cvar.wait(sent).unwrap();
+        }
     }
 
     let mut conn_is_in_early_data ;
     let mut timeout ;
 
-    info!("[Path Thread]: Thread {:?}, started with path {} <-> {}", thread::current().id(), local_addr, peer_addr);
+    debug!("[Path Thread]: Thread {:?}, started with path {} <-> {}", thread::current().id(), local_addr, peer_addr);
+    let mut app_proto_selected;
 
     loop {
-        let conn = quiche_conn.lock().unwrap();
-        conn_is_in_early_data = conn.is_in_early_data(); // Check stage of the connection
-        match conn.timeout() {
-            Some(duration) => {
-                info!("Timeout {:?}", duration);
-                timeout = [Duration::from_nanos(10), duration].iter().min().cloned();
-            },
-            None => {
-                timeout = Some(Duration::ZERO);
-                info!("Received None"); 
-            }
+        {
+            debug!("[Path Thread]: Thread {:?}, Asking for conn and app_proto_selected for timeouts", thread::current().id());
+            let conn = &mut quiche_conn.lock().unwrap();
+            app_proto_selected = *app_proto_selected_guard.lock().unwrap();
+            debug!("[Path Thread]: Thread {:?}, Granted conn and app_proto_selected for timeouts", thread::current().id());
+            conn_is_in_early_data = conn.is_in_early_data(); // Check stage of the connection
+            timeout = conn.timeout();
         }
-        drop(conn);
-        
-        if !conn_is_in_early_data {
-            poll.poll(&mut events, timeout).unwrap();
-            if events.is_empty(){
-                let conn = &mut quiche_conn.lock().unwrap();
-                trace!("timed out");
-                conn.on_timeout();
-            }
-        }
-        
-        let mut conn = quiche_conn.lock().unwrap();
-        let mut scheduler = scheduler_guard.lock().unwrap();
 
-        if !events.is_empty(){
-            read_packets_on_socket(&socket, &events, &mut conn, &mut pkt_count, &dump_packet_path, &mut buf)?;
+        {
+            if !conn_is_in_early_data || app_proto_selected {
+                debug!("[Path Thread]: Thread {:?}, Asking for conn", thread::current().id());
+                debug!("Timeout = {:?}, conn_is_in_early_data = {}, app_proto_selected = {}", timeout, conn_is_in_early_data, app_proto_selected);
+                poll.poll(&mut events, timeout).unwrap();
+                if events.is_empty(){
+                    let conn = &mut quiche_conn.lock().unwrap();
+                    debug!("[Path Thread]: Timeout! path {} <-> {}", local_addr, peer_addr);
+                    conn.on_timeout();
+                }
+            }
         }
-        // Writing to socket critical section
-        let (next_sender_local_addr, _) = scheduler.peek_next_path().unwrap();
-        if local_addr == next_sender_local_addr{
-            scheduler.next_path().unwrap(); // In order to reflect the change in the scheduler
-            write_packets_on_path(&local_addr, &peer_addr, &socket, &mut conn, &mut out)?;
+        
+
+        {
+            // Reading from socket critical section
+            debug!("[Path Thread]: Thread {:?}, Asking for conn to read", thread::current().id());
+            let mut conn = quiche_conn.lock().unwrap();
+            debug!("[Path Thread]: Thread {:?}, Granted conn to read", thread::current().id());
+            if !events.is_empty(){
+                read_packets_on_socket(&socket, &events, &mut conn, &mut pkt_count, &dump_packet_path, &mut buf)?;
+            }
         }
-        if conn.is_closed() {
-            break; // The mutex will be drooped automatically
-        }       
-        drop(scheduler);
-        drop(conn);
+
+        {
+            // Writing to socket critical section
+            debug!("[Path Thread]: Thread {:?}, Asking scheduler and conn", thread::current().id());
+            let mut conn = quiche_conn.lock().unwrap();
+            let mut scheduler = scheduler_guard.lock().unwrap();
+            debug!("[Path Thread]: Thread {:?}, Granted scheduler and conn", thread::current().id());
+
+            let (next_sender_local_addr, _) = scheduler.peek_next_path().unwrap();
+            if local_addr == next_sender_local_addr{
+                scheduler.next_path().unwrap(); // In order to reflect the change in the scheduler
+                write_packets_on_path(&local_addr, &peer_addr, &socket, &mut conn, &mut out)?;
+            }
+
+            if conn.is_closed() {
+                break;
+            }
+        }
     }
-    info!("[Path Thread]: Thread {:?}, Done", thread::current().id());
-
+    debug!("[Path Thread]: Thread {:?}, Done", thread::current().id());
     Ok(())
 }
 
@@ -307,10 +328,6 @@ pub fn multicore_connect(
     let mut buf = [0; 65535];
 
     let output_sink = Rc::new(RefCell::new(output_sink)) as Rc<RefCell<dyn FnMut(_)>>;
-
-    // Setup the event loop.
-    // let mut poll = mio::Poll::new().unwrap();
-    // let mut events = mio::Events::with_capacity(1024);
 
     // We'll only connect to the first server provided in URL list.
     let connect_url = &args.urls[0];
@@ -417,8 +434,6 @@ pub fn multicore_connect(
 
     let mut http_conn: Option<Box<dyn HttpConn>> = None;
 
-    let mut app_proto_selected = false;
-
     // Generate a random source connection ID for the connection.
     let mut scid = [0; quiche::MAX_CONN_ID_LEN];
     let rng = SystemRandom::new();
@@ -427,49 +442,14 @@ pub fn multicore_connect(
     let scid = quiche::ConnectionId::from_ref(&scid);
     let scid = Arc::new(scid.into_owned());
     // Create a QUIC connection and initiate handshake.
-    let conn = quiche::connect(
+    let mut conn = quiche::connect(
         connect_url.domain(),
         &scid,
         local_addr,
         peer_addr,
         &mut config,
-    )
-    .unwrap();
+    ).unwrap();
 
-    let conn_guard: Arc<Mutex<Connection>> = Arc::new(Mutex::new(conn));
-    let scheduler_guard = Arc::new(Mutex::new(Scheduler::new(vec![(local_addr, peer_addr)])));
-
-    // ! Enters critical section
-    let mut conn = conn_guard.lock().unwrap();
-    let core_ids = core_affinity::get_core_ids().unwrap();
-    let mut current_path_thread_idx = 0;
-
-    for (local, peer) in sockets_addrs.clone()   {
-        let conn_cloned = conn_guard.clone();
-        let scheduler_cloned = scheduler_guard.clone();
-        // HTTPConn doesn't implement Send therefore can't be used in a Mutex
-        let dump_packet_path = conn_args.dump_packet_path.clone();
-        let clone_scid = scid.clone();
-        let core_id = core_ids[current_path_thread_idx];
-        thread::spawn(move || {
-            if core_affinity::set_for_current(core_id) {
-                info!("Set core affinity for {:?}", thread::current().id());
-            }
-
-            trace!("[Thread {:?}] spawned with path {:?} <-> {:?}", thread::current().id(), local, peer);
-            client_thread(
-                conn_cloned,
-                dump_packet_path,
-                (local, peer), 
-                local == local_addr, 
-                clone_scid, 
-                scheduler_cloned
-            ).unwrap();
-        });
-        current_path_thread_idx += 1;
-    }
-
-  
     if let Some(keylog) = &mut keylog {
         if let Ok(keylog) = keylog.try_clone() {
             conn.set_keylog(Box::new(keylog));
@@ -495,37 +475,48 @@ pub fn multicore_connect(
             conn.set_session(&session).ok();
         }
     }
-    drop(conn); // ! Exits critical section
 
-    
-    // [Initial Thread Work]
-    /* 
-    info!(
-        "connecting to {:} from {:} with scid {:?}",
-        peer_addr, local_addr, scid,
-    );
+    let conn_guard = Arc::new(Mutex::new(conn));
+    let scheduler_guard = Arc::new(Mutex::new(Scheduler::new(vec![(local_addr, peer_addr)])));
+    let app_proto_selected_guard = Arc::new(Mutex::new(false));
+    let sent_connection_initial_packet = Arc::new((Mutex::new(false), Condvar::new()));
 
-    let (write, send_info) = conn.send(&mut out).expect("initial send failed");
-    let token = src_addr_to_token[&send_info.from];
+    // let core_ids = core_affinity::get_core_ids().unwrap();
+    // let mut current_path_thread_idx = 0;
 
-    while let Err(e) = sockets[token].send_to(&out[..write], send_info.to) {
-        if e.kind() == std::io::ErrorKind::WouldBlock {
-            trace!(
-                "{} -> {}: send() would block",
-                sockets[token].local_addr().unwrap(),
-                send_info.to
-            );
-            continue;
-        }
-
-        return Err(ClientError::Other(format!("send() failed: {e:?}")));
+    for (local, peer) in sockets_addrs.clone()   {
+        let conn_cloned = conn_guard.clone();
+        let app_proto_selected = app_proto_selected_guard.clone();
+        let scheduler_cloned = scheduler_guard.clone();
+        // HTTPConn doesn't implement Send therefore can't be used in a Mutex
+        let dump_packet_path = conn_args.dump_packet_path.clone();
+        let clone_scid = scid.clone();
+        let clone_sent_conn_init_packet = sent_connection_initial_packet.clone();
+        // let core_id = core_ids[current_path_thread_idx];
+        thread::spawn(move || {
+            /*if core_affinity::set_for_current(core_id) {
+                info!("Set core affinity for {:?}", thread::current().id());
+            }*/
+            trace!("[Thread {:?}] spawned with path {:?} <-> {:?}", thread::current().id(), local, peer);
+            client_thread(
+                conn_cloned,
+                app_proto_selected,
+                dump_packet_path,
+                (local, peer), 
+                local == local_addr, 
+                clone_scid, 
+                scheduler_cloned, 
+                clone_sent_conn_init_packet
+            ).unwrap();
+        });
+        //current_path_thread_idx += 1;
     }
 
-    trace!("written {}", write);
-    
-    let mut pkt_count = 0;
-    
-    drop(conn);  */
+    let (lock, cvar) = &*sent_connection_initial_packet;
+    let mut sent = lock.lock().unwrap();
+    while !*sent {
+        sent = cvar.wait(sent).unwrap();
+    }
 
     let mut new_path_probed = false;
     let mut probed_paths = 0;
@@ -535,414 +526,269 @@ pub fn multicore_connect(
     let mut scid_sent = false;
     let mut migrated = false;
 
-    loop {
+    loop {        
 
-        // ** [Per path thread]
-        /* 
-        if !conn.is_in_early_data() || app_proto_selected {
-            poll.poll(&mut events, conn.timeout()).unwrap();
-        }
+        {
+            let mut conn = conn_guard.lock().unwrap();
+            if conn.is_closed() {
+                    info!(
+                    "connection closed, {:?} {:?}",
+                    conn.stats(),
+                    conn.path_stats().collect::<Vec<quiche::PathStats>>()
+                );
 
-        // If the event loop reported no events, it means that the timeout
-        // has expired, so handle it without attempting to read packets. We
-        // will then proceed with the send loop.
-        if events.is_empty() {
-            trace!("timed out");
-            conn.on_timeout();
-        } */
+                if !conn.is_established() {
+                    error!(
+                        "connection timed out after {:?}",
+                        app_data_start.elapsed(),
+                    );
 
+                    return Err(ClientError::HandshakeFail);
+                }
 
-        // ** [Per path thread]
-        /*
-        // Read incoming UDP packets from the socket and feed them to quiche,
-        // until there are no more packets to read.
-        
-        for event in &events {
-            let token = event.token().into();
-            let socket = &sockets[token];
-            let local_addr = socket.local_addr().unwrap();
-            'read: loop {
-                let (len, from) = match socket.recv_from(&mut buf) {
-                    Ok(v) => v,
-
-                    Err(e) => {
-                        // There are no more UDP packets to read on this socket.
-                        // Process subsequent events.
-                        if e.kind() == std::io::ErrorKind::WouldBlock {
-                            trace!("{}: recv() would block", local_addr);
-                            break 'read;
-                        }
-
-                        return Err(ClientError::Other(format!(
-                            "{local_addr}: recv() failed: {e:?}"
-                        )));
-                    },
-                };
-
-                trace!("{}: got {} bytes", local_addr, len);
-
-                if let Some(target_path) = conn_args.dump_packet_path.as_ref() {
-                    let path = format!("{target_path}/{pkt_count}.pkt");
-
-                    if let Ok(f) = std::fs::File::create(path) {
-                        let mut f = std::io::BufWriter::new(f);
-                        f.write_all(&buf[..len]).ok();
+                if let Some(session_file) = &args.session_file {
+                    if let Some(session) = conn.session() {
+                        std::fs::write(session_file, session).ok();
                     }
                 }
 
-                pkt_count += 1;
+                if let Some(h_conn) = http_conn {
+                    if h_conn.report_incomplete(&app_data_start) {
+                        return Err(ClientError::HttpFail);
+                    }
+                }
 
-                let recv_info = quiche::RecvInfo {
-                    to: local_addr,
-                    from,
-                };
-
-                // Process potentially coalesced packets.
-                let read = match conn.recv(&mut buf[..len], recv_info) {
-                    Ok(v) => v,
-
-                    Err(e) => {
-                        error!("{}: recv failed: {:?}", local_addr, e);
-                        continue 'read;
-                    },
-                };
-
-                trace!("{}: processed {} bytes", local_addr, read);
+                break;
             }
-        } */
 
-        // ** [Connection thread]
+            let mut app_proto_selected = app_proto_selected_guard.lock().unwrap();
+            // Create a new application protocol session once the QUIC connection is
+            // established.
+            if (conn.is_established() || conn.is_in_early_data()) &&
+                (!args.perform_migration || migrated) &&
+                !*app_proto_selected
+            {
+                // At this stage the ALPN negotiation succeeded and selected a
+                // single application protocol name. We'll use this to construct
+                // the correct type of HttpConn but `application_proto()`
+                // returns a slice, so we have to convert it to a str in order
+                // to compare to our lists of protocols. We `unwrap()` because
+                // we need the value and if something fails at this stage, there
+                // is not much anyone can do to recover.
+
+                let app_proto = conn.application_proto();
+
+                if alpns::HTTP_09.contains(&app_proto) {
+                    http_conn = Some(Http09Conn::with_urls(
+                        &args.urls,
+                        args.reqs_cardinal,
+                        Rc::clone(&output_sink),
+                    ));
+
+                    *app_proto_selected = true;
+                } else if alpns::HTTP_3.contains(&app_proto) {
+                    let dgram_sender = if conn_args.dgrams_enabled {
+                        Some(Http3DgramSender::new(
+                            conn_args.dgram_count,
+                            conn_args.dgram_data.clone(),
+                            0,
+                        ))
+                    } else {
+                        None
+                    };
+                    
+                    http_conn = Some(Http3Conn::with_urls(
+                        &mut conn,
+                        &args.urls,
+                        args.reqs_cardinal,
+                        &args.req_headers,
+                        &args.body,
+                        &args.method,
+                        args.send_priority_update,
+                        conn_args.max_field_section_size,
+                        conn_args.qpack_max_table_capacity,
+                        conn_args.qpack_blocked_streams,
+                        args.dump_json,
+                        dgram_sender,
+                        Rc::clone(&output_sink),
+                    ));
+
+                    *app_proto_selected = true;
+                }
+            }
+        }
         
-        // ! Enter critical section
-        let mut conn = conn_guard.lock().unwrap();  
-
-        if conn.is_closed() {
-            info!(
-                "connection closed, {:?} {:?}",
-                conn.stats(),
-                conn.path_stats().collect::<Vec<quiche::PathStats>>()
-            );
-
-            if !conn.is_established() {
-                error!(
-                    "connection timed out after {:?}",
-                    app_data_start.elapsed(),
-                );
-
-                return Err(ClientError::HandshakeFail);
-            }
-
-            if let Some(session_file) = &args.session_file {
-                if let Some(session) = conn.session() {
-                    std::fs::write(session_file, session).ok();
-                }
-            }
-
-            if let Some(h_conn) = http_conn {
-                if h_conn.report_incomplete(&app_data_start) {
-                    return Err(ClientError::HttpFail);
-                }
-            }
-
-            break;
-        }
-
-
-
-        // Create a new application protocol session once the QUIC connection is
-        // established.
-        if (conn.is_established() || conn.is_in_early_data()) &&
-            (!args.perform_migration || migrated) &&
-            !app_proto_selected
-        {
-            // At this stage the ALPN negotiation succeeded and selected a
-            // single application protocol name. We'll use this to construct
-            // the correct type of HttpConn but `application_proto()`
-            // returns a slice, so we have to convert it to a str in order
-            // to compare to our lists of protocols. We `unwrap()` because
-            // we need the value and if something fails at this stage, there
-            // is not much anyone can do to recover.
-
-            let app_proto = conn.application_proto();
-
-            if alpns::HTTP_09.contains(&app_proto) {
-                http_conn = Some(Http09Conn::with_urls(
-                    &args.urls,
-                    args.reqs_cardinal,
-                    Rc::clone(&output_sink),
-                ));
-
-                app_proto_selected = true;
-            } else if alpns::HTTP_3.contains(&app_proto) {
-                let dgram_sender = if conn_args.dgrams_enabled {
-                    Some(Http3DgramSender::new(
-                        conn_args.dgram_count,
-                        conn_args.dgram_data.clone(),
-                        0,
-                    ))
-                } else {
-                    None
-                };
-
-                http_conn = Some(Http3Conn::with_urls(
-                    &mut conn,
-                    &args.urls,
-                    args.reqs_cardinal,
-                    &args.req_headers,
-                    &args.body,
-                    &args.method,
-                    args.send_priority_update,
-                    conn_args.max_field_section_size,
-                    conn_args.qpack_max_table_capacity,
-                    conn_args.qpack_blocked_streams,
-                    args.dump_json,
-                    dgram_sender,
-                    Rc::clone(&output_sink),
-                ));
-
-                app_proto_selected = true;
-            }
-        }
-
-        drop(conn); // ! Exits critical section
-
         // ** [Connection thread]
         // If we have an HTTP connection, first issue the requests then
         // process received data.
 
-        // ! Enter critical section
-        let mut conn = conn_guard.lock().unwrap();  
-
+        
         if let Some(h_conn) = http_conn.as_mut() {
+            let mut conn = conn_guard.lock().unwrap();  
             h_conn.send_requests(&mut conn, &args.dump_response_path);
             h_conn.handle_responses(&mut conn, &mut buf, &app_data_start); // TODO reassure that the content of buf doesn't matter
         }
 
+        {
+            // Handle path events.
+            let mut conn = conn_guard.lock().unwrap();  
+            let mut conn_scheduler = scheduler_guard.lock().unwrap();
+            while let Some(qe) = conn.path_event_next() {
+                match qe {
+                    quiche::PathEvent::New(..) => unreachable!(),
 
-        drop(conn); // ! Exits critical section
-
-        // Handle path events.
-        let mut conn = conn_guard.lock().unwrap();  
-        let mut conn_scheduler = scheduler_guard.lock().unwrap();
-        while let Some(qe) = conn.path_event_next() {
-            match qe {
-                quiche::PathEvent::New(local_addr, peer_addr) => {
-                    info!(
-                        "[Connection Thread] Path ({}, {}) is now validated",
-                        local_addr, peer_addr
-                    );
-                },
-
-                quiche::PathEvent::Validated(local_addr, peer_addr) => {
-                    info!(
-                        "[Connection Thread] Path ({}, {}) is now validated",
-                        local_addr, peer_addr
-                    );
-                    if conn.is_multipath_enabled() {
-                        match conn.set_active(local_addr, peer_addr, true).ok() {
-                            Some(()) => {
-                                conn_scheduler.add_path((local_addr, peer_addr));
-                            }, 
-                            None => (),
+                    quiche::PathEvent::Validated(local_addr, peer_addr) => {
+                        info!(
+                            "[Connection Thread] Path ({}, {}) is now validated",
+                            local_addr, peer_addr
+                        );
+                        if conn.is_multipath_enabled() {
+                            match conn.set_active(local_addr, peer_addr, true).ok() {
+                                Some(()) => {
+                                    conn_scheduler.add_path((local_addr, peer_addr));
+                                }, 
+                                None => (),
+                            }
+                        } else if args.perform_migration {
+                            conn.migrate(local_addr, peer_addr).unwrap();
+                            migrated = true;
+                            conn_scheduler.add_path((local_addr, peer_addr));
                         }
-                    } else if args.perform_migration {
-                        conn.migrate(local_addr, peer_addr).unwrap();
-                        migrated = true;
-                        conn_scheduler.add_path((local_addr, peer_addr));
-                    }
-                },
+                    },
 
-                quiche::PathEvent::FailedValidation(local_addr, peer_addr) => {
-                    info!(
-                        "Path ({}, {}) failed validation",
-                        local_addr, peer_addr
-                    );
-                },
+                    quiche::PathEvent::FailedValidation(local_addr, peer_addr) => {
+                        info!(
+                            "[Connection Thread] Path ({}, {}) failed validation",
+                            local_addr, peer_addr
+                        );
+                    },
 
-                quiche::PathEvent::Closed(local_addr, peer_addr, e, reason) => {
-                    info!(
-                        "Path ({}, {}) is now closed and unusable; err = {}, reason = {:?}",
-                        local_addr, peer_addr, e, reason
-                    );
-                },
+                    quiche::PathEvent::Closed(local_addr, peer_addr, e, reason) => {
+                        info!(
+                            "[Connection Thread] Path ({}, {}) is now closed and unusable; err = {}, reason = {:?}",
+                            local_addr, peer_addr, e, reason
+                        );
+                    },
 
-                quiche::PathEvent::ReusedSourceConnectionId(
-                    cid_seq,
-                    old,
-                    new,
-                ) => {
-                    info!(
-                        "Peer reused cid seq {} (initially {:?}) on {:?}",
-                        cid_seq, old, new
-                    );
-                },
+                    quiche::PathEvent::ReusedSourceConnectionId(
+                        cid_seq,
+                        old,
+                        new,
+                    ) => {
+                        info!(
+                            "[Connection Thread] Peer reused cid seq {} (initially {:?}) on {:?}",
+                            cid_seq, old, new
+                        );
+                    },
 
-                quiche::PathEvent::PeerMigrated(..) => unreachable!(),
+                    quiche::PathEvent::PeerMigrated(..) => unreachable!(),
 
-                quiche::PathEvent::PeerPathStatus(..) => {},
-            }
-        }
-
-        // See whether source Connection IDs have been retired.
-        while let Some(retired_scid) = conn.retired_scid_next() {
-            info!("Retiring source CID {:?}", retired_scid);
-        }
-
-        // Provides as many CIDs as possible.
-        while conn.source_cids_left() > 0 {
-            let (scid, reset_token) = generate_cid_and_reset_token(&rng);
-
-            if conn.new_source_cid(&scid, reset_token, false).is_err() {
-                break;
-            }
-
-            scid_sent = true;
-        }
-
-        // Handle Multipath Issue
-        
-        if conn_args.multipath &&
-            probed_paths < addrs.len() &&
-            conn.available_dcids() > 0 &&
-            conn.probe_path(addrs[probed_paths], peer_addr).is_ok()
-        {
-            info!("Probed path {:?}", (addrs[probed_paths], peer_addr));
-            conn_scheduler.add_temporal_path((addrs[probed_paths], peer_addr));
-            probed_paths += 1;
-        }
-
-        if !conn_args.multipath &&
-            args.perform_migration &&
-            !new_path_probed &&
-            scid_sent &&
-            conn.available_dcids() > 0
-        {
-            let additional_local_addr = sockets_addrs[1].0;
-            conn.probe_path(additional_local_addr, peer_addr).unwrap();
-
-            new_path_probed = true;
-        }
-
-        if conn.is_multipath_enabled() {
-            rm_addrs.retain(|(d, addr)| {
-                if app_data_start.elapsed() >= *d {
-                    info!("Abandoning path {:?}", addr);
-                    conn.abandon_path(
-                        *addr,
-                        peer_addr,
-                        0,
-                        "do not use me anymore".to_string().into_bytes(),
-                    )
-                    .is_err()
-                } else {
-                    true
+                    quiche::PathEvent::PeerPathStatus(..) => {},
                 }
-            });
+            }
 
-            // TODO propagate these changes to path threads
+            // See whether source Connection IDs have been retired.
+            while let Some(retired_scid) = conn.retired_scid_next() {
+                info!("Retiring source CID {:?}", retired_scid);
+            }
 
-            status.retain(|(d, addr, available)| {
-                if app_data_start.elapsed() >= *d {
-                    let status = (*available).into();
-                    info!("Advertising path status {status:?} to {addr:?}");
-                    conn.set_path_status(*addr, peer_addr, status, true)
+            // Provides as many CIDs as possible.
+            while conn.source_cids_left() > 0 {
+                let (scid, reset_token) = generate_cid_and_reset_token(&rng);
+
+                if conn.new_source_cid(&scid, reset_token, false).is_err() {
+                    break;
+                }
+
+                scid_sent = true;
+            }
+
+            // Handle Multipath Issue
+            
+            if conn_args.multipath &&
+                probed_paths < addrs.len() &&
+                conn.available_dcids() > 0 &&
+                conn.probe_path(addrs[probed_paths], peer_addr).is_ok()
+            {
+                conn_scheduler.add_temporal_path((addrs[probed_paths], peer_addr));
+                probed_paths += 1;
+            }
+
+            if !conn_args.multipath &&
+                args.perform_migration &&
+                !new_path_probed &&
+                scid_sent &&
+                conn.available_dcids() > 0
+            {
+                let additional_local_addr = sockets_addrs[1].0;
+                conn.probe_path(additional_local_addr, peer_addr).unwrap();
+
+                new_path_probed = true;
+            }
+
+            if conn.is_multipath_enabled() {
+                rm_addrs.retain(|(d, addr)| {
+                    if app_data_start.elapsed() >= *d {
+                        info!("Abandoning path {:?}", addr);
+                        conn.abandon_path(
+                            *addr,
+                            peer_addr,
+                            0,
+                            "do not use me anymore".to_string().into_bytes(),
+                        )
                         .is_err()
-                } else {
-                    true
-                }
-            });
-        }
-        drop(conn_scheduler);
-        drop(conn);
-        
-        // ** [Per path thread]
-        /*
-        // Generate outgoing QUIC packets and send them on the UDP socket, until
-        // quiche reports that there are no more packets to be sent.
-        let mut left_paths = rr_sheduler.len();
-        while left_paths > 0 {
-            let (local_addr, peer_addr) = rr_sheduler.next_path().unwrap();
-            let token = src_addr_to_token[&local_addr];
-            let socket = &sockets[token];
-            loop {
-                let (write, send_info) = match conn.send_on_path(
-                    &mut out,
-                    Some(local_addr),
-                    Some(peer_addr),
-                ) {
-                    Ok(v) => v,
-
-                    Err(quiche::Error::Done) => {
-                        trace!("{} -> {}: done writing", local_addr, peer_addr);
-                        break;
-                    },
-
-                    Err(e) => {
-                        error!(
-                            "{} -> {}: send failed: {:?}",
-                            local_addr, peer_addr, e
-                        );
-
-                        conn.close(false, 0x1, b"fail").ok();
-                        break;
-                    },
-                };
-
-                if let Err(e) = socket.send_to(&out[..write], send_info.to) {
-                    if e.kind() == std::io::ErrorKind::WouldBlock {
-                        trace!(
-                            "{} -> {}: send() would block",
-                            local_addr,
-                            send_info.to
-                        );
-                        break;
+                    } else {
+                        true
                     }
+                });
 
-                    return Err(ClientError::Other(format!(
-                        "{} -> {}: send() failed: {:?}",
-                        local_addr, send_info.to, e
-                    )));
-                }
+                // TODO propagate these changes to path threads
 
-                trace!("{} -> {}: written {}", local_addr, send_info.to, write);
-            }
-            left_paths -= 1;
-        }*/
+                status.retain(|(d, addr, available)| {
+                    if app_data_start.elapsed() >= *d {
+                        let status = (*available).into();
+                        info!("Advertising path status {status:?} to {addr:?}");
+                        conn.set_path_status(*addr, peer_addr, status, true)
+                            .is_err()
+                    } else {
+                        true
+                    }
+                });
+            }   
+        }
 
-        // ** [Connection thread]
-        let conn = conn_guard.lock().unwrap();
-
-        if conn.is_closed() {
-            info!("[Connection Thread] I saw it was over");
-            info!(
-                "connection closed, {:?} {:?}",
-                conn.stats(),
-                conn.path_stats().collect::<Vec<quiche::PathStats>>()
-            );
-
-            if !conn.is_established() {
-                error!(
-                    "connection timed out after {:?}",
-                    app_data_start.elapsed(),
+        {
+            let conn = conn_guard.lock().unwrap();
+            if conn.is_closed() {
+                info!(
+                    "connection closed, {:?} {:?}",
+                    conn.stats(),
+                    conn.path_stats().collect::<Vec<quiche::PathStats>>()
                 );
 
-                return Err(ClientError::HandshakeFail);
-            }
+                if !conn.is_established() {
+                    error!(
+                        "connection timed out after {:?}",
+                        app_data_start.elapsed(),
+                    );
 
-            if let Some(session_file) = &args.session_file {
-                if let Some(session) = conn.session() {
-                    std::fs::write(session_file, session).ok();
+                    return Err(ClientError::HandshakeFail);
                 }
-            }
 
-            if let Some(h_conn) = http_conn {
-                if h_conn.report_incomplete(&app_data_start) {
-                    return Err(ClientError::HttpFail);
+                if let Some(session_file) = &args.session_file {
+                    if let Some(session) = conn.session() {
+                        std::fs::write(session_file, session).ok();
+                    }
                 }
+
+                if let Some(h_conn) = http_conn {
+                    if h_conn.report_incomplete(&app_data_start) {
+                        return Err(ClientError::HttpFail);
+                    }
+                }
+                break;
             }
-            break;
         }
-        drop(conn);
     }
 
     info!("[Connection thread] Done");
@@ -955,20 +801,15 @@ pub fn multicore_prepare_addresses(
     args: &ClientArgs,
 ) -> (Vec<(std::net::SocketAddr, std::net::SocketAddr)>, std::net::SocketAddr)  {
     let mut tuples = vec![];
-    let mut first_local_addr = None;
+    let mut first_local_addr: Option<SocketAddr> = None;
 
-    // Create UDP sockets backing the QUIC connection, and register them with
-    // the event loop. Check first user-provided addresses and keep the ones
-    // compatible with the address family of the peer.
     for src_addr in args.addrs.iter().filter(|sa| {
         (sa.is_ipv4() && peer_addr.is_ipv4()) ||
             (sa.is_ipv6() && peer_addr.is_ipv6())
     }) {
-        let socket = mio::net::UdpSocket::bind(*src_addr).unwrap();
-        let local_addr = socket.local_addr().unwrap();
         tuples.push((src_addr.clone(), peer_addr.clone()));
         if first_local_addr.is_none(){
-            first_local_addr = Some(local_addr);
+            first_local_addr = Some(*src_addr);
         }
     }
 
@@ -977,15 +818,11 @@ pub fn multicore_prepare_addresses(
     // and BSD variants that don't support binding to IN6ADDR_ANY for both v4
     // and v6.
     if first_local_addr.is_none() {
-        let bind_addr = match peer_addr {
-            std::net::SocketAddr::V4(_) => "0.0.0.0:0",
-            std::net::SocketAddr::V6(_) => "[::]:0",
+        let sock_addr = match peer_addr {
+            std::net::SocketAddr::V4(_) => SocketAddr::new(IpAddr::V4(Ipv4Addr::from_str("0.0.0.0").ok().unwrap()), 0),
+            std::net::SocketAddr::V6(_) => SocketAddr::new(IpAddr::V6(Ipv6Addr::from_str("[::]").ok().unwrap()), 0),
         };
-        let bind_addr = bind_addr.parse().unwrap();
-        let socket = mio::net::UdpSocket::bind(bind_addr).unwrap(); // TODO maybe delete this line 
-        let local_addr = socket.local_addr().unwrap();
-        tuples.push((local_addr.clone(), peer_addr.clone()));
-        first_local_addr = Some(local_addr)
+        first_local_addr = Some(sock_addr);
     }
 
     (tuples, first_local_addr.unwrap())

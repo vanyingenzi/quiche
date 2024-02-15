@@ -481,6 +481,7 @@ pub fn connect(
             conn.available_dcids() > 0 &&
             conn.probe_path(addrs[probed_paths], peer_addr).is_ok()
         {
+            info!("Probed path {:?}", (addrs[probed_paths], peer_addr));
             probed_paths += 1;
         }
 
