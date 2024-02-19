@@ -53,7 +53,7 @@ use mio::net::UdpSocket;
 use quiche::Connection;
 use quiche::ConnectionId;
 use ring::rand::*;
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Mutex};
 
 const MAX_DATAGRAM_SIZE: usize = 1350;
 
@@ -204,11 +204,25 @@ fn multicore_initiate_connection(
     Ok(())
 }
 
+fn timeout(conn: &mut Connection, local_addr: SocketAddr, peer_addr: SocketAddr) -> Option<Duration> {
+    // RFC section : https://www.ietf.org/archive/id/draft-ietf-quic-multipath-06.html#section-4.3.4
+    if conn.path_stats().filter(|s| s.active).count() > 1 {
+        conn.path_timeout(local_addr, peer_addr) 
+    } else {
+        conn.timeout()
+    }
+}
+
+#[inline]
+fn can_send_on_path(conn: &mut Connection, local_addr: SocketAddr, peer_addr: SocketAddr) -> bool {
+    conn.path_stats().any(|p| p.local_addr == local_addr && p.peer_addr == peer_addr)
+}
+
 fn client_thread(
     quiche_conn: Arc<Mutex<Connection>>,
     app_proto_selected_guard: Arc<Mutex<bool>>, dump_packet_path: Option<String>,
     addrs: (SocketAddr, SocketAddr), initiate_connection: bool,
-    scid: Arc<ConnectionId>, sent_conn_init_pkt: Arc<(Mutex<bool>, Condvar)>,
+    scid: Arc<ConnectionId>, sent_conn_init_pkt: Arc<Mutex<bool>>,
 ) -> Result<(), ClientError> {
     let mut out = [0; MAX_DATAGRAM_SIZE];
     let mut pkt_count: u64 = 0;
@@ -216,43 +230,27 @@ fn client_thread(
     let mut poll = mio::Poll::new().unwrap();
     let mut events = mio::Events::with_capacity(1024);
     let (local_addr, peer_addr) = addrs;
-    let mut socket =
-        multicore_create_socket((&local_addr, &peer_addr), &mut poll);
-
+    let mut socket = multicore_create_socket((&local_addr, &peer_addr), &mut poll);
     if initiate_connection {
         let conn = &mut quiche_conn.lock().unwrap();
-        multicore_initiate_connection(
-            &peer_addr,
-            &local_addr,
-            &mut out,
-            &scid,
-            conn,
-            &mut socket,
-        )?;
-        let (lock, cvar) = &*sent_conn_init_pkt;
-        let mut sent = lock.lock().unwrap();
-        *sent = true;
-        cvar.notify_all();
+        multicore_initiate_connection(&peer_addr, &local_addr, &mut out,&scid, conn, &mut socket)?;
+        *sent_conn_init_pkt.lock().unwrap() = true;
     } else {
-        let (ref lock, ref cvar) = &*sent_conn_init_pkt;
-        let mut sent = lock.lock().unwrap();
-        while !*sent {
-            sent = cvar.wait(sent).unwrap();
-        }
+        while !*sent_conn_init_pkt.lock().unwrap() {}
     }
 
     let mut conn_is_in_early_data;
 
-    debug!(
+    info!(
         "[Path Thread]: Thread {:?}, started with path {} <-> {}",
         thread::current().id(),
         local_addr,
         peer_addr
     );
     let mut app_proto_selected;
-    let mut timeout_left:Option<Duration> = Some(Duration::ZERO);
+    let mut timeout_left = Duration::ZERO;
     let mut reset_timeout = true;
-    let mut last_looptime = Instant::now();
+    let mut last_timeout = Instant::now();
 
     loop {
         {
@@ -263,18 +261,23 @@ fn client_thread(
 
         if reset_timeout {
             let conn= &mut quiche_conn.lock().unwrap();
-            timeout_left = conn.timeout();
+            match timeout(conn, local_addr, peer_addr){
+                Some(timeout) => timeout_left = timeout, 
+                None => {
+                    break
+                },
+            };
             reset_timeout = false;
-            last_looptime = Instant::now();
+            last_timeout = Instant::now();
         }
 
         {
             if !conn_is_in_early_data || app_proto_selected {
                 poll.poll(&mut events, Some(Duration::ZERO)).unwrap();
-                if last_looptime.elapsed().as_nanos() >= timeout_left.unwrap().as_nanos() {
+                if last_timeout.elapsed().as_nanos() >= timeout_left.as_nanos() {
                     let conn = &mut quiche_conn.lock().unwrap();
                     conn.on_timeout();
-                } 
+                }
             }
         }
 
@@ -283,24 +286,24 @@ fn client_thread(
             let mut conn = quiche_conn.lock().unwrap();
             if !events.is_empty() {
                 reset_timeout = true;
-                read_packets_on_socket(&socket, &events, &mut conn, &mut pkt_count, &dump_packet_path, &mut buf,)?;
+                read_packets_on_socket(&socket, &events, &mut conn, &mut pkt_count, &dump_packet_path, &mut buf)?;
             }
         }
 
         {
             // Writing to socket critical section
             let mut conn = quiche_conn.lock().unwrap();
-            if write_packets_on_path(&local_addr, &peer_addr, &socket, &mut conn, &mut out)? > 0 {
-                reset_timeout = true;
+            if can_send_on_path(&mut conn, local_addr, peer_addr) {
+                if write_packets_on_path(&local_addr, &peer_addr, &socket, &mut conn, &mut out)? > 0 {
+                    reset_timeout = true;
+                }
             }
-
             if conn.is_closed() {
                 break;
             }
-
         }
     }
-    debug!("[Path Thread]: Thread {:?}, Done", thread::current().id());
+    info!("[Path Thread]: Thread {:?}, Done", thread::current().id());
     Ok(())
 }
 
@@ -468,8 +471,7 @@ pub fn multicore_connect(
 
     let conn_guard = Arc::new(Mutex::new(conn));
     let app_proto_selected_guard = Arc::new(Mutex::new(false));
-    let sent_connection_initial_packet =
-        Arc::new((Mutex::new(false), Condvar::new()));
+    let sent_connection_initial_packet = Arc::new(Mutex::new(false));
 
     let core_ids = core_affinity::get_core_ids().unwrap();
     let mut current_path_thread_idx = 0;
@@ -506,10 +508,7 @@ pub fn multicore_connect(
         current_path_thread_idx += 1;
     }
 
-    let (lock, cvar) = &*sent_connection_initial_packet;
-    let mut sent = lock.lock().unwrap();
-    while !*sent {
-        sent = cvar.wait(sent).unwrap();
+    while !*sent_connection_initial_packet.lock().unwrap() {
     }
 
     let mut new_path_probed = false;
