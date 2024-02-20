@@ -55,9 +55,96 @@ use quiche::ConnectionId;
 use ring::rand::*;
 use std::sync::{Arc, Mutex};
 
+const MAX_BUF_SIZE: usize = 65507;
 const MAX_DATAGRAM_SIZE: usize = 1350;
 
+#[derive(Debug)]
+struct MulticoreReadPacket {
+    rcv_info: quiche::RecvInfo, 
+    packet_offset: usize, 
+    packet_len: usize
+}
+
 /// Reads the packets on the socket and feeds them to quiche.
+pub fn read_packets_on_socket_v2(
+    socket: &UdpSocket, events: &Events, conn_guard: &Arc<Mutex<Connection>>,
+    pkt_count: &mut u64, dump_packet_path: &Option<String>, buf: &mut [u8],
+) -> Result<(), ClientError> {
+    let local_addr = socket.local_addr().unwrap();
+    let mut read_packets_info = Vec::new();
+    let mut offset: usize = 0;
+    'event: for event in events {
+        match event.token() {
+            _ => {
+                // As there's only one socket listen per thread
+                if event.is_readable() {
+                    'read: loop {
+                        let (len, from) = match socket.recv_from(&mut buf[offset..]) {
+                            Ok(v) => v,
+
+                            Err(e) => {
+                                // There are no more UDP packets to read on this socket.
+                                // Process subsequent events.
+                                if e.kind() == std::io::ErrorKind::WouldBlock {
+                                    trace!("{}: recv() would block", local_addr);
+                                    break 'read;
+                                }
+
+                                return Err(ClientError::Other(format!(
+                                    "{local_addr}: recv() failed: {e:?}"
+                                )));
+                            },
+                        };
+
+                        trace!("{}: got {} bytes", local_addr, len);
+
+                        if let Some(target_path) = dump_packet_path.as_ref() {
+                            let path = format!("{target_path}/{pkt_count}.pkt");
+
+                            if let Ok(f) = std::fs::File::create(path) {
+                                let mut f = std::io::BufWriter::new(f);
+                                f.write_all(&buf[..len]).ok();
+                            }
+                        }
+
+                        *pkt_count += 1;
+
+                        let recv_info = quiche::RecvInfo {
+                            to: local_addr,
+                            from,
+                        };
+
+                        read_packets_info.push(MulticoreReadPacket{
+                            rcv_info: recv_info, 
+                            packet_offset: offset, 
+                            packet_len: len
+                        });
+
+                        offset += len;
+
+                        if MAX_BUF_SIZE - offset < MAX_DATAGRAM_SIZE {
+                            break 'event;
+                        }
+                    }
+                }
+            },
+        }
+    }
+    let mut conn = conn_guard.lock().unwrap();
+    for packet_info in read_packets_info{
+        let read = match conn.recv(&mut buf[packet_info.packet_offset..packet_info.packet_offset+packet_info.packet_len], packet_info.rcv_info) {
+            Ok(v) => v,
+    
+            Err(e) => {
+                error!("{}: recv failed: {:?}", local_addr, e);
+                0
+            },
+        };
+        trace!("{}: processed {} bytes", local_addr, read);
+    }
+    Ok(())
+}
+
 pub fn read_packets_on_socket(
     socket: &UdpSocket, events: &Events, conn: &mut Connection,
     pkt_count: &mut u64, dump_packet_path: &Option<String>, buf: &mut [u8],
@@ -113,7 +200,8 @@ pub fn read_packets_on_socket(
                                 continue 'read;
                             },
                         };
-                        debug!("{}: processed {} bytes", local_addr, read);
+
+                        trace!("{}: processed {} bytes", local_addr, read);
                     }
                 }
             },
@@ -226,7 +314,7 @@ fn client_thread(
 ) -> Result<(), ClientError> {
     let mut out = [0; MAX_DATAGRAM_SIZE];
     let mut pkt_count: u64 = 0;
-    let mut buf = [0; 65535];
+    let mut buf = [0; MAX_BUF_SIZE];
     let mut poll = mio::Poll::new().unwrap();
     let mut events = mio::Events::with_capacity(1024);
     let (local_addr, peer_addr) = addrs;
@@ -281,13 +369,12 @@ fn client_thread(
             }
         }
 
-        {
-            // Reading from socket critical section
+
+        // Reading from socket critical section
+        if !events.is_empty() {
+            reset_timeout = true;
             let mut conn = quiche_conn.lock().unwrap();
-            if !events.is_empty() {
-                reset_timeout = true;
-                read_packets_on_socket(&socket, &events, &mut conn, &mut pkt_count, &dump_packet_path, &mut buf)?;
-            }
+            read_packets_on_socket(&socket, &events, &mut conn, &mut pkt_count, &dump_packet_path, &mut buf)?;
         }
 
         {
@@ -485,9 +572,9 @@ pub fn multicore_connect(
         let clone_sent_conn_init_packet = sent_connection_initial_packet.clone();
         let core_id = core_ids[current_path_thread_idx];
         thread::spawn(move || {
-            if core_affinity::set_for_current(core_id) {
+            /*if core_affinity::set_for_current(core_id) {
                 info!("Set core affinity for {:?}", thread::current().id());
-            }
+            }*/
             trace!(
                 "[Thread {:?}] spawned with path {:?} <-> {:?}",
                 thread::current().id(),
