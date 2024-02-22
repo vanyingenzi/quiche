@@ -25,11 +25,8 @@
 // SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 use quiche_apps::args::*;
-
 use quiche_apps::common::*;
-
 use quiche_apps::client::*;
-
 use quiche_apps::multicore::*;
 
 fn main() {
@@ -53,7 +50,6 @@ fn main() {
 
             Ok(_) => (),
         }
-     
     } else {
         // This is the deafult call that was made by the original quiche-client
         match connect(args, conn_args, stdout_sink) {

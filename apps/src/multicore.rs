@@ -47,7 +47,6 @@ use std::cell::RefCell;
 use std::str::FromStr;
 use std::thread;
 use std::time::Duration;
-use std::time::Instant;
 
 use mio::net::UdpSocket;
 use quiche::Connection;
@@ -213,8 +212,7 @@ pub fn read_packets_on_socket(
 pub fn write_packets_on_path(
     local_addr: &SocketAddr, peer_addr: &SocketAddr, socket: &UdpSocket,
     conn: &mut Connection, out: &mut [u8],
-) -> Result<usize, ClientError> {
-    let mut written = 0;
+) -> Result<(), ClientError> {
     loop {
         let (write, send_info) =
             match conn.send_on_path(out, Some(*local_addr), Some(*peer_addr)) {
@@ -235,7 +233,6 @@ pub fn write_packets_on_path(
                     break;
                 },
             };
-        written += write;
         if let Err(e) = socket.send_to(&out[..write], send_info.to) {
             if e.kind() == std::io::ErrorKind::WouldBlock {
                 trace!("{} -> {}: send() would block", local_addr, send_info.to);
@@ -250,7 +247,7 @@ pub fn write_packets_on_path(
 
         trace!("{} -> {}: written {}", local_addr, send_info.to, write);
     }
-    Ok(written)
+    Ok(())
 }
 
 fn multicore_create_socket(
@@ -292,15 +289,6 @@ fn multicore_initiate_connection(
     Ok(())
 }
 
-fn timeout(conn: &mut Connection, local_addr: SocketAddr, peer_addr: SocketAddr) -> Option<Duration> {
-    // RFC section : https://www.ietf.org/archive/id/draft-ietf-quic-multipath-06.html#section-4.3.4
-    if conn.path_stats().filter(|s| s.active).count() > 1 {
-        conn.path_timeout(local_addr, peer_addr) 
-    } else {
-        conn.timeout()
-    }
-}
-
 #[inline]
 fn can_send_on_path(conn: &mut Connection, local_addr: SocketAddr, peer_addr: SocketAddr) -> bool {
     conn.path_stats().any(|p| p.local_addr == local_addr && p.peer_addr == peer_addr)
@@ -308,9 +296,12 @@ fn can_send_on_path(conn: &mut Connection, local_addr: SocketAddr, peer_addr: So
 
 fn client_thread(
     quiche_conn: Arc<Mutex<Connection>>,
-    app_proto_selected_guard: Arc<Mutex<bool>>, dump_packet_path: Option<String>,
-    addrs: (SocketAddr, SocketAddr), initiate_connection: bool,
-    scid: Arc<ConnectionId>, sent_conn_init_pkt: Arc<Mutex<bool>>,
+    app_proto_selected_guard: Arc<Mutex<bool>>,
+    dump_packet_path: Option<String>,
+    addrs: (SocketAddr, SocketAddr), 
+    initiate_connection: bool,
+    scid: Arc<ConnectionId>, 
+    sent_conn_init_pkt: Arc<Mutex<bool>>
 ) -> Result<(), ClientError> {
     let mut out = [0; MAX_DATAGRAM_SIZE];
     let mut pkt_count: u64 = 0;
@@ -328,6 +319,7 @@ fn client_thread(
     }
 
     let mut conn_is_in_early_data;
+    let mut app_proto_selected;
 
     info!(
         "[Path Thread]: Thread {:?}, started with path {} <-> {}",
@@ -335,44 +327,20 @@ fn client_thread(
         local_addr,
         peer_addr
     );
-    let mut app_proto_selected;
-    let mut timeout_left = Duration::ZERO;
-    let mut reset_timeout = true;
-    let mut last_timeout = Instant::now();
 
     loop {
-        {
+        poll.poll(&mut events, Some(Duration::ZERO)).unwrap();
+        if events.is_empty() {
             let conn = &mut quiche_conn.lock().unwrap();
             app_proto_selected = *app_proto_selected_guard.lock().unwrap();
             conn_is_in_early_data = conn.is_in_early_data(); // Check stage of the connection
-        }
-
-        if reset_timeout {
-            let conn= &mut quiche_conn.lock().unwrap();
-            match timeout(conn, local_addr, peer_addr){
-                Some(timeout) => timeout_left = timeout, 
-                None => {
-                    break
-                },
-            };
-            reset_timeout = false;
-            last_timeout = Instant::now();
-        }
-
-        {
             if !conn_is_in_early_data || app_proto_selected {
-                poll.poll(&mut events, Some(Duration::ZERO)).unwrap();
-                if last_timeout.elapsed().as_nanos() >= timeout_left.as_nanos() {
-                    let conn = &mut quiche_conn.lock().unwrap();
-                    conn.on_timeout();
-                }
+                conn.on_timeout();
             }
         }
 
-
         // Reading from socket critical section
         if !events.is_empty() {
-            reset_timeout = true;
             let mut conn = quiche_conn.lock().unwrap();
             read_packets_on_socket(&socket, &events, &mut conn, &mut pkt_count, &dump_packet_path, &mut buf)?;
         }
@@ -381,9 +349,7 @@ fn client_thread(
             // Writing to socket critical section
             let mut conn = quiche_conn.lock().unwrap();
             if can_send_on_path(&mut conn, local_addr, peer_addr) {
-                if write_packets_on_path(&local_addr, &peer_addr, &socket, &mut conn, &mut out)? > 0 {
-                    reset_timeout = true;
-                }
+                write_packets_on_path(&local_addr, &peer_addr, &socket, &mut conn, &mut out).ok();
             }
             if conn.is_closed() {
                 break;
@@ -404,8 +370,7 @@ pub fn multicore_connect(
 
     let mut buf = [0; 65535];
 
-    let output_sink =
-        Rc::new(RefCell::new(output_sink)) as Rc<RefCell<dyn FnMut(_)>>;
+    let output_sink = Rc::new(RefCell::new(output_sink)) as Rc<RefCell<dyn FnMut(_)>>;
 
     // We'll only connect to the first server provided in URL list.
     let connect_url = &args.urls[0];
@@ -572,9 +537,9 @@ pub fn multicore_connect(
         let clone_sent_conn_init_packet = sent_connection_initial_packet.clone();
         let core_id = core_ids[current_path_thread_idx];
         thread::spawn(move || {
-            /*if core_affinity::set_for_current(core_id) {
+            if core_affinity::set_for_current(core_id) {
                 info!("Set core affinity for {:?}", thread::current().id());
-            }*/
+            }
             trace!(
                 "[Thread {:?}] spawned with path {:?} <-> {:?}",
                 thread::current().id(),
@@ -813,7 +778,6 @@ pub fn multicore_connect(
                 });
 
                 // TODO propagate these changes to path threads
-
                 status.retain(|(d, addr, available)| {
                     if app_data_start.elapsed() >= *d {
                         let status = (*available).into();
