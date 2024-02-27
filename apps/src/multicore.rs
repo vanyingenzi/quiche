@@ -321,7 +321,7 @@ fn client_thread(
     let mut conn_is_in_early_data;
     let mut app_proto_selected;
 
-    info!(
+    debug!(
         "[Path Thread]: Thread {:?}, started with path {} <-> {}",
         thread::current().id(),
         local_addr,
@@ -356,7 +356,7 @@ fn client_thread(
             }
         }
     }
-    info!("[Path Thread]: Thread {:?}, Done", thread::current().id());
+    debug!("[Path Thread]: Thread {:?}, Done", thread::current().id());
     Ok(())
 }
 
@@ -538,7 +538,7 @@ pub fn multicore_connect(
         let core_id = core_ids[current_path_thread_idx];
         thread::spawn(move || {
             if core_affinity::set_for_current(core_id) {
-                info!("Set core affinity for {:?}", thread::current().id());
+                debug!("Set core affinity for {:?}", thread::current().id());
             }
             trace!(
                 "[Thread {:?}] spawned with path {:?} <-> {:?}",

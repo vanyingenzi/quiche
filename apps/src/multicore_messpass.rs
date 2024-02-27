@@ -90,7 +90,7 @@ fn client_thread(
     let (local_addr, peer_addr) = addrs;
     let socket = multicore_create_socket((&local_addr, &peer_addr), &mut poll);
 
-    info!(
+    debug!(
         "[Path Thread]: Thread {:?}, started with path {} <-> {}",
         thread::current().id(),
         local_addr,
@@ -320,7 +320,7 @@ pub fn multicore_connect(
         let core_id = core_ids[current_path_thread_idx];
         thread::spawn(move || {
             if core_affinity::set_for_current(core_id) {
-                info!("Set core affinity for {:?}", thread::current().id());
+                debug!("Set core affinity for {:?}", thread::current().id());
             }
             trace!(
                 "[Thread {:?}] spawned with path {:?} <-> {:?}",
@@ -573,7 +573,7 @@ pub fn multicore_connect(
             conn.available_dcids() > 0 &&
             conn.probe_path(addrs[probed_paths], peer_addr).is_ok()
         {
-            info!("Probed path {:?}", (addrs[probed_paths], peer_addr));
+            debug!("Probed path {:?}", (addrs[probed_paths], peer_addr));
             probed_paths += 1;
         }
 

@@ -3114,8 +3114,7 @@ impl Connection {
         // successfully processed, so we can drop the initial state and consider
         // the client's address to be verified.
         if self.is_server && hdr.ty == packet::Type::Handshake {
-            self.drop_epoch_state(packet::Epoch::Initial, now);
-
+            self.drop_epoch_state(&mut paths, packet::Epoch::Initial, now);
             paths.get_mut(recv_pid)?.verified_peer_address = true;
         }
 
@@ -3185,8 +3184,8 @@ impl Connection {
     /// }
     /// # Ok::<(), quiche::Error>(())
     /// ```
-    pub fn send(&mut self, out: &mut [u8]) -> Result<(usize, SendInfo)> {
-        self.send_on_path(out, None, None)
+    pub fn send(&mut self, paths: &mut path::PathMap, out: &mut [u8]) -> Result<(usize, SendInfo)> {
+        self.send_on_path(paths, out, None, None)
     }
 
     /// Writes a single QUIC packet to be sent to the peer from the specified
@@ -3287,7 +3286,7 @@ impl Connection {
         let now = time::Instant::now();
 
         if self.local_error.is_none() {
-            self.do_handshake(now)?;
+            self.do_handshake(paths, now)?;
         }
 
         // Forwarding the error value here could confuse
@@ -3296,7 +3295,7 @@ impl Connection {
         //
         // We simply fall-through to sending packets, which should
         // take care of terminating the connection as needed.
-        let _ = self.process_undecrypted_0rtt_packets();
+        let _ = self.process_undecrypted_0rtt_packets(& mut paths);
 
         // There's no point in trying to send a packet if the Initial secrets
         // have not been derived yet, so return early.
@@ -3310,14 +3309,14 @@ impl Connection {
 
         // Limit output packet size to respect the sender and receiver's
         // maximum UDP payload size limit.
-        let mut left = cmp::min(out.len(), self.max_send_udp_payload_size());
+        let mut left = cmp::min(out.len(), self.max_send_udp_payload_size(paths));
 
         let send_pid = match (from, to) {
             (Some(f), Some(t)) => paths
                 .path_id_from_addrs(&(f, t))
                 .ok_or(Error::InvalidState)?,
 
-            _ => self.get_send_path_id(from, to)?,
+            _ => self.get_send_path_id(&mut paths, from, to)?,
         };
 
         let send_path: &mut path::Path = paths.get_mut(send_pid)?;
@@ -3331,6 +3330,7 @@ impl Connection {
         // Generate coalesced packets.
         while left > 0 {
             let (ty, written) = match self.send_single(
+                &mut paths,
                 &mut out[done..done + left],
                 send_pid,
                 has_initial,
@@ -3368,7 +3368,7 @@ impl Connection {
 
             // Don't coalesce packets that must go on different paths.
             if !(from.is_some() && to.is_some()) &&
-                self.get_send_path_id(from, to)? != send_pid
+                self.get_send_path_id(&mut paths, from, to)? != send_pid
             {
                 break;
             }
@@ -3419,10 +3419,10 @@ impl Connection {
 
         let mut b = octets::OctetsMut::with_slice(out);
 
-        let pkt_type = self.write_pkt_type(send_pid)?;
+        let pkt_type = self.write_pkt_type(&mut paths, send_pid)?;
 
         let max_dgram_len = if !self.dgram_send_queue.is_empty() {
-            self.dgram_max_writable_len()
+            self.dgram_max_writable_len(paths)
         } else {
             None
         };
@@ -3430,7 +3430,7 @@ impl Connection {
         let epoch = pkt_type.to_epoch()?;
 
         let multiple_application_data_pkt_num_spaces =
-            self.use_path_pkt_num_space(epoch);
+            self.use_path_pkt_num_space(paths, epoch);
         // Process lost frames. There might be several paths having lost frames.
         for (_, p) in paths.iter_mut() {
             for lost in p.recovery.lost[epoch].drain(..) {
@@ -3550,7 +3550,7 @@ impl Connection {
         }
 
         let consider_standby_paths = paths.consider_standby_paths();
-        let is_app_limited = self.delivery_rate_check_if_app_limited(send_pid);
+        let is_app_limited = self.delivery_rate_check_if_app_limited(&mut paths, send_pid);
         let n_paths = paths.len();
         let flow_control = &mut self.flow_control;
         let crypto_space = self.pkt_num_spaces.crypto.get_mut(epoch);
@@ -4687,13 +4687,13 @@ impl Connection {
 
         // On the client, drop initial state after sending an Handshake packet.
         if !self.is_server && hdr_ty == packet::Type::Handshake {
-            self.drop_epoch_state(packet::Epoch::Initial, now);
+            self.drop_epoch_state(&mut paths, packet::Epoch::Initial, now);
         }
 
         // (Re)start the idle timer if we are sending the first ack-eliciting
         // packet since last receiving a packet.
         if ack_eliciting && !self.ack_eliciting_sent {
-            if let Some(idle_timeout) = self.idle_timeout() {
+            if let Some(idle_timeout) = self.idle_timeout(&mut paths) {
                 self.idle_timer = Some(now + idle_timeout);
             }
         }
@@ -4735,7 +4735,7 @@ impl Connection {
     pub fn send_quantum_on_path(
         &self, paths: &mut path::PathMap, local_addr: SocketAddr, peer_addr: SocketAddr,
     ) -> usize {
-        self.paths
+        paths
             .path_id_from_addrs(&(local_addr, peer_addr))
             .and_then(|pid| paths.get(pid).ok())
             .map(|path| path.recovery.send_quantum())
@@ -5118,7 +5118,7 @@ impl Connection {
     /// [`stream_send()`]: struct.Connection.html#method.stream_send
     /// [`InvalidStreamState`]: enum.Error.html#variant.InvalidStreamState
     pub fn stream_shutdown(
-        &mut self, stream_id: u64, direction: Shutdown, err: u64,
+        &mut self, paths: &mut path::PathMap, stream_id: u64, direction: Shutdown, err: u64,
     ) -> Result<()> {
         // Don't try to stop a local unidirectional stream.
         if direction == Shutdown::Read &&
@@ -5164,7 +5164,7 @@ impl Connection {
                     self.tx_buffered.saturating_sub(unsent as usize);
 
                 // Update send capacity.
-                self.update_tx_cap();
+                self.update_tx_cap(&mut paths);
 
                 self.streams.insert_reset(stream_id, err, final_size);
 
@@ -5477,9 +5477,8 @@ impl Connection {
     /// [`set_max_send_udp_payload_size()`]:
     ///     struct.Config.html#method.set_max_send_udp_payload_size
     /// [`send()`]: struct.Connection.html#method.send
-    pub fn max_send_udp_payload_size(&self) -> usize {
-        let max_datagram_size = self
-            .paths
+    pub fn max_send_udp_payload_size(&self, paths: &mut path::PathMap) -> usize {
+        let max_datagram_size = paths
             .get_active()
             .ok()
             .map(|p| p.recovery.max_datagram_size());
@@ -5529,8 +5528,7 @@ impl Connection {
         if self.is_closed() || self.is_draining() {
             return Ok(());
         }
-        let path_id = self
-            .paths
+        let path_id = paths
             .path_id_from_addrs(&(local, peer))
             .ok_or(Error::InvalidState)?;
         paths.get_mut(path_id)?.needs_ack_eliciting = true;
@@ -5689,7 +5687,7 @@ impl Connection {
     /// # Ok::<(), quiche::Error>(())
     /// ```
     pub fn dgram_send(&mut self, paths: &mut path::PathMap, buf: &[u8]) -> Result<()> {
-        let max_payload_len = match self.dgram_max_writable_len() {
+        let max_payload_len = match self.dgram_max_writable_len(paths) {
             Some(v) => v,
 
             None => return Err(Error::InvalidState),
@@ -5719,7 +5717,7 @@ impl Connection {
     ///
     /// [`dgram_send()`]: struct.Connection.html#method.dgram_send
     pub fn dgram_send_vec(&mut self, paths: &mut path::PathMap, buf: Vec<u8>) -> Result<()> {
-        let max_payload_len = match self.dgram_max_writable_len() {
+        let max_payload_len = match self.dgram_max_writable_len(paths) {
             Some(v) => v,
 
             None => return Err(Error::InvalidState),
@@ -5786,13 +5784,13 @@ impl Connection {
     /// # Ok::<(), quiche::Error>(())
     /// ```
     #[inline]
-    pub fn dgram_max_writable_len(&self) -> Option<usize> {
+    pub fn dgram_max_writable_len(&self, paths: &mut path::PathMap) -> Option<usize> {
         match self.peer_transport_params.max_datagram_frame_size {
             None => None,
             Some(peer_frame_len) => {
-                let dcid = self.destination_id();
+                let dcid = self.destination_id(paths);
                 // Start from the maximum packet size...
-                let mut max_len = self.max_send_udp_payload_size();
+                let mut max_len = self.max_send_udp_payload_size(paths);
                 // ...subtract the Short packet header overhead...
                 // (1 byte of pkt_len + len of dcid)
                 max_len = max_len.saturating_sub(1 + dcid.len());
@@ -5863,8 +5861,8 @@ impl Connection {
     /// be called. A timeout of `None` means that the timer should be disarmed.
     ///
     /// [`on_timeout()`]: struct.Connection.html#method.on_timeout
-    pub fn timeout(&self) -> Option<time::Duration> {
-        self.timeout_instant().map(|timeout| {
+    pub fn timeout(&self, paths: &mut path::PathMap) -> Option<time::Duration> {
+        self.timeout_instant(&mut paths).map(|timeout| {
             let now = time::Instant::now();
 
             if timeout <= now {
@@ -6002,7 +6000,7 @@ impl Connection {
         if paths.get_active_path_id().is_err() {
             match paths.find_candidate_path() {
                 Some(pid) =>
-                    if self.set_active_path(pid, now).is_err() {
+                    if self.set_active_path(paths, pid, now).is_err() {
                         // The connection cannot continue.
                         self.closed = true;
                     },
@@ -6051,7 +6049,7 @@ impl Connection {
         // We may want to probe an existing path.
         let pid = match paths.path_id_from_addrs(&(local_addr, peer_addr)) {
             Some(pid) => pid,
-            None => self.create_path_on_client(local_addr, peer_addr)?,
+            None => self.create_path_on_client(paths, local_addr, peer_addr)?,
         };
 
         let path = paths.get_mut(pid)?;
@@ -6070,7 +6068,7 @@ impl Connection {
     /// [`migrate()`]: struct.Connection.html#method.migrate
     pub fn migrate_source(&mut self, paths: &mut path::PathMap, local_addr: SocketAddr) -> Result<u64> {
         let peer_addr = paths.get_active()?.peer_addr();
-        self.migrate(local_addr, peer_addr)
+        self.migrate(paths, local_addr, peer_addr)
     }
 
     /// Migrates the connection over the given network path between `local_addr`
@@ -6132,10 +6130,9 @@ impl Connection {
 
             (pid, dcid_seq)
         } else {
-            let pid = self.create_path_on_client(local_addr, peer_addr)?;
+            let pid = self.create_path_on_client(paths, local_addr, peer_addr)?;
 
-            let dcid_seq = self
-                .paths
+            let dcid_seq = paths
                 .get(pid)?
                 .active_dcid_seq
                 .ok_or(Error::InvalidState)?;
@@ -6144,7 +6141,7 @@ impl Connection {
         };
 
         // Change the active path.
-        self.set_active_path(pid, time::Instant::now())?;
+        self.set_active_path(paths, pid, time::Instant::now())?;
 
         Ok(dcid_seq)
     }
@@ -6163,8 +6160,7 @@ impl Connection {
     pub fn set_active(
         &mut self, paths: &mut path::PathMap, local: SocketAddr, peer: SocketAddr, active: bool,
     ) -> Result<()> {
-        let pid = self
-            .paths
+        let pid = paths
             .path_id_from_addrs(&(local, peer))
             .ok_or(Error::Done)?;
         let request = if active {
@@ -6175,7 +6171,7 @@ impl Connection {
         paths.request(pid, request)?;
 
         // After any path state change, check for the transmission rate.
-        self.update_tx_cap();
+        self.update_tx_cap(paths);
 
         Ok(())
     }
@@ -6191,18 +6187,16 @@ impl Connection {
     /// [`InvalidState`]: enum.Error.html#InvalidState
     /// [`Done`]: enum.Error.html#Done
     pub fn abandon_path(
-        &mut self, local: SocketAddr, peer: SocketAddr, err_code: u64,
+        &mut self, paths: &mut path::PathMap, local: SocketAddr, peer: SocketAddr, err_code: u64,
         reason: Vec<u8>,
     ) -> Result<()> {
-        let pid = self
-            .paths
+        let pid = paths
             .path_id_from_addrs(&(local, peer))
             .ok_or(Error::Done)?;
-        self.paths
-            .request(pid, path::PathRequest::Abandon(err_code, reason))?;
+        paths.request(pid, path::PathRequest::Abandon(err_code, reason))?;
 
         // After any path state change, check for the transmission rate.
-        self.update_tx_cap();
+        self.update_tx_cap(paths);
 
         Ok(())
     }
@@ -6781,11 +6775,11 @@ impl Connection {
     }
 
     fn parse_peer_transport_params(
-        &mut self, peer_params: TransportParams,
+        &mut self, paths: &mut path::PathMap, peer_params: TransportParams,
     ) -> Result<()> {
         // Validate initial_source_connection_id.
         match &peer_params.initial_source_connection_id {
-            Some(v) if v != &self.destination_id() =>
+            Some(v) if v != &self.destination_id(paths) =>
                 return Err(Error::InvalidTransportParam),
 
             Some(_) => (),
@@ -6826,7 +6820,7 @@ impl Connection {
             }
         }
 
-        self.process_peer_transport_params(peer_params)?;
+        self.process_peer_transport_params(paths, peer_params)?;
 
         self.parsed_peer_transport_params = true;
 
@@ -6839,7 +6833,7 @@ impl Connection {
         self.max_tx_data = peer_params.initial_max_data;
 
         // Update send capacity.
-        self.update_tx_cap();
+        self.update_tx_cap(paths);
 
         self.streams
             .update_peer_max_streams_bidi(peer_params.initial_max_streams_bidi);
@@ -6877,7 +6871,7 @@ impl Connection {
     /// Continues the handshake.
     ///
     /// If the connection is already established, it does nothing.
-    fn do_handshake(&mut self, now: time::Instant) -> Result<()> {
+    fn do_handshake(&mut self, paths: & mut path::PathMap, now: time::Instant) -> Result<()> {
         let mut ex_data = tls::ExData {
             application_protos: &self.application_protos,
 
@@ -6914,7 +6908,7 @@ impl Connection {
                     let peer_params =
                         TransportParams::decode(raw_params, self.is_server)?;
 
-                    self.parse_peer_transport_params(peer_params)?;
+                    self.parse_peer_transport_params(paths, peer_params)?;
                 }
 
                 return Ok(());
@@ -6933,7 +6927,7 @@ impl Connection {
             let peer_params =
                 TransportParams::decode(raw_params, self.is_server)?;
 
-            self.parse_peer_transport_params(peer_params)?;
+            self.parse_peer_transport_params(paths, peer_params)?;
         }
 
         if self.handshake_completed {
@@ -6943,7 +6937,7 @@ impl Connection {
             if self.is_server {
                 self.handshake_confirmed = true;
 
-                self.drop_epoch_state(packet::Epoch::Handshake, now);
+                self.drop_epoch_state(paths, packet::Epoch::Handshake, now);
             }
 
             // Once the handshake is completed there's no point in processing
@@ -7011,7 +7005,7 @@ impl Connection {
             if self.pkt_num_spaces.crypto.get(epoch).crypto_seal.is_none() {
                 continue;
             }
-            let space_id = match self.is_multipath_enabled() {
+            let space_id = match self.is_multipath_enabled(paths) {
                 true => send_path.active_dcid_seq,
                 false => None,
             };
@@ -7111,12 +7105,12 @@ impl Connection {
 
                 let handshake_status = self.handshake_status();
 
-                if self.use_path_pkt_num_space(epoch) {
+                if self.use_path_pkt_num_space(paths, epoch) {
                     if let Some(path_id) =
                         self.ids.get_scid(0).ok().and_then(|e| e.path_id)
                     {
                         let is_app_limited =
-                            self.delivery_rate_check_if_app_limited(path_id);
+                            self.delivery_rate_check_if_app_limited(paths, path_id);
                         let p = paths.get_mut(path_id)?;
                         if is_app_limited {
                             p.recovery.delivery_rate_update_app_limited(true);
@@ -7138,14 +7132,13 @@ impl Connection {
                 } else {
                     // This ACK may acknowledge several packets on different
                     // paths.
-                    for pid in self
-                        .paths
+                    for pid in paths
                         .iter()
                         .map(|(pid, _)| pid)
                         .collect::<Vec<usize>>()
                     {
                         let is_app_limited =
-                            self.delivery_rate_check_if_app_limited(pid);
+                            self.delivery_rate_check_if_app_limited(paths, pid);
                         let p = paths.get_mut(pid)?;
                         if is_app_limited {
                             p.recovery.delivery_rate_update_app_limited(true);
@@ -7294,7 +7287,7 @@ impl Connection {
                     self.handshake.provide_data(level, recv_buf)?;
                 }
 
-                self.do_handshake(now)?;
+                self.do_handshake(paths, now)?;
             },
 
             frame::Frame::CryptoHeader { .. } => unreachable!(),
@@ -7506,7 +7499,7 @@ impl Connection {
                         let (lost_packets, lost_bytes) = close_path(
                             &mut self.ids,
                             &mut self.pkt_num_spaces,
-                            &mut self.paths,
+                            &mut paths,
                             pid,
                             now,
                             &self.trace_id,
@@ -7529,7 +7522,7 @@ impl Connection {
             },
 
             frame::Frame::PathChallenge { data } => {
-                self.paths
+                paths
                     .get_mut(recv_path_id)?
                     .on_challenge_received(data);
             },
@@ -7572,7 +7565,7 @@ impl Connection {
                 self.handshake_confirmed = true;
 
                 // Once the handshake is confirmed, we can drop Handshake keys.
-                self.drop_epoch_state(packet::Epoch::Handshake, now);
+                self.drop_epoch_state(paths, packet::Epoch::Handshake, now);
             },
 
             frame::Frame::Datagram { data } => {
@@ -7600,7 +7593,7 @@ impl Connection {
                 ack_delay,
                 ..
             } => {
-                if !self.use_path_pkt_num_space(epoch) {
+                if !self.use_path_pkt_num_space(paths, epoch) {
                     return Err(Error::MultiPathViolation);
                 }
                 let ack_delay = ack_delay
@@ -7636,7 +7629,7 @@ impl Connection {
                 if let Ok(e) = self.ids.get_dcid(space_identifier) {
                     if let Some(path_id) = e.path_id {
                         let is_app_limited =
-                            self.delivery_rate_check_if_app_limited(path_id);
+                            self.delivery_rate_check_if_app_limited(paths, path_id);
                         let p = paths.get_mut(path_id)?;
                         if is_app_limited {
                             p.recovery.delivery_rate_update_app_limited(true);
@@ -7659,7 +7652,7 @@ impl Connection {
 
                 // Once the handshake is confirmed, we can drop Handshake keys.
                 if self.handshake_confirmed {
-                    self.drop_epoch_state(packet::Epoch::Handshake, now);
+                    self.drop_epoch_state(paths, packet::Epoch::Handshake, now);
                 }
             },
 
@@ -7669,7 +7662,7 @@ impl Connection {
                 reason,
                 ..
             } => {
-                if !self.use_path_pkt_num_space(epoch) {
+                if !self.use_path_pkt_num_space(paths, epoch) {
                     return Err(Error::MultiPathViolation);
                 }
                 let abandon_pid = match self
@@ -7692,7 +7685,7 @@ impl Connection {
                 dcid_seq_num,
                 seq_num,
             } => {
-                if !self.use_path_pkt_num_space(epoch) {
+                if !self.use_path_pkt_num_space(paths, epoch) {
                     return Err(Error::MultiPathViolation);
                 }
                 let pid = self
@@ -7707,7 +7700,7 @@ impl Connection {
                 dcid_seq_num,
                 seq_num,
             } => {
-                if !self.use_path_pkt_num_space(epoch) {
+                if !self.use_path_pkt_num_space(paths, epoch) {
                     return Err(Error::MultiPathViolation);
                 }
                 let pid = self
@@ -7940,7 +7933,7 @@ impl Connection {
             );
 
             // Notify the application.
-            self.paths
+            paths
                 .notify_event(path::PathEvent::ReusedSourceConnectionId(
                     in_scid_seq,
                     (old_local_addr, old_peer_addr),
@@ -7972,8 +7965,7 @@ impl Connection {
         // A probing packet must be sent, but only if the connection is fully
         // established.
         if self.is_established() {
-            let mut probing = self
-                .paths
+            let mut probing = paths
                 .iter()
                 .filter(|(_, p)| from.is_none() || Some(p.local_addr()) == from)
                 .filter(|(_, p)| to.is_none() || Some(p.peer_addr()) == to)
@@ -7995,8 +7987,7 @@ impl Connection {
         if paths.multipath() && (dgrams_to_emit || stream_to_emit) {
             // We loop at most twice.
             loop {
-                if let Some(pid) = self
-                    .paths
+                if let Some(pid) = paths
                     .iter()
                     .filter(|(_, p)| {
                         // Follow the filter provided as parameters.
@@ -8020,7 +8011,7 @@ impl Connection {
 
         // When using multiple packet number spaces, let's force ACK_MP sending
         // on their corresponding paths.
-        if self.is_multipath_enabled() {
+        if self.is_multipath_enabled(paths) {
             if let Some(pid) =
                 self.pkt_num_spaces
                     .spaces
@@ -8089,7 +8080,7 @@ impl Connection {
             return Ok(());
         }
 
-        self.set_active_path(new_pid, now)?;
+        self.set_active_path(paths, new_pid, now)?;
 
         let no_spare_dcid =
             paths.get_mut(new_pid)?.active_dcid_seq.is_none();
@@ -8142,8 +8133,8 @@ impl Connection {
     /// Returns whether the path-specific packet number space should be used for
     /// sending packets.
     #[inline]
-    fn use_path_pkt_num_space(&self, epoch: packet::Epoch) -> bool {
-        self.is_multipath_enabled() && epoch == packet::Epoch::Application
+    fn use_path_pkt_num_space(&self, paths: &mut path::PathMap, epoch: packet::Epoch) -> bool {
+        self.is_multipath_enabled(paths) && epoch == packet::Epoch::Application
     }
 }
 
@@ -8796,21 +8787,25 @@ pub mod testing {
             let server_scid = ConnectionId::from_ref(&server_scid);
             let server_addr = Pipe::server_addr();
 
+            let (client, client_paths) = connect(
+                Some("quic.tech"),
+                &client_scid,
+                client_addr,
+                server_addr,
+                config,
+            )?;
+
+            let (server, server_paths) = accept(
+                &server_scid,
+                None,
+                server_addr,
+                client_addr,
+                config,
+            )?;
+
             Ok(Pipe {
-                client: connect(
-                    Some("quic.tech"),
-                    &client_scid,
-                    client_addr,
-                    server_addr,
-                    config,
-                )?,
-                server: accept(
-                    &server_scid,
-                    None,
-                    server_addr,
-                    client_addr,
-                    config,
-                )?,
+                client,
+                server,
             })
         }
 
@@ -8827,21 +8822,25 @@ pub mod testing {
             let server_scid = ConnectionId::from_ref(&server_scid);
             let server_addr = Pipe::server_addr();
 
+            let (client, client_paths) = connect(
+                Some("quic.tech"),
+                &client_scid,
+                client_addr,
+                server_addr,
+                config,
+            )?;
+
+            let (server, server_paths) = accept(
+                &server_scid,
+                None,
+                server_addr,
+                client_addr,
+                config,
+            )?;
+
             Ok(Pipe {
-                client: connect(
-                    Some("quic.tech"),
-                    &client_scid,
-                    client_addr,
-                    server_addr,
-                    config,
-                )?,
-                server: accept(
-                    &server_scid,
-                    None,
-                    server_addr,
-                    client_addr,
-                    config,
-                )?,
+                client: client,
+                server: server
             })
         }
 
@@ -8867,21 +8866,25 @@ pub mod testing {
             config.set_initial_max_streams_uni(3);
             config.set_ack_delay_exponent(8);
 
+            let (client, client_paths) = connect(
+                Some("quic.tech"),
+                &client_scid,
+                client_addr,
+                server_addr,
+                client_config,
+            )?;
+
+            let (server, server_paths) = accept(
+                &server_scid,
+                None,
+                server_addr,
+                client_addr,
+                &mut config,
+            )?;
+
             Ok(Pipe {
-                client: connect(
-                    Some("quic.tech"),
-                    &client_scid,
-                    client_addr,
-                    server_addr,
-                    client_config,
-                )?,
-                server: accept(
-                    &server_scid,
-                    None,
-                    server_addr,
-                    client_addr,
-                    &mut config,
-                )?,
+                client: client,
+                server: server,
             })
         }
 
@@ -8905,21 +8908,25 @@ pub mod testing {
             config.set_initial_max_streams_uni(3);
             config.set_ack_delay_exponent(8);
 
+            let (client, client_paths) = connect(
+                Some("quic.tech"),
+                &client_scid,
+                client_addr,
+                server_addr,
+                &mut config,
+            )?;
+
+            let (server, server_paths) = accept(
+                &server_scid,
+                None,
+                server_addr,
+                client_addr,
+                server_config,
+            )?;
+
             Ok(Pipe {
-                client: connect(
-                    Some("quic.tech"),
-                    &client_scid,
-                    client_addr,
-                    server_addr,
-                    &mut config,
-                )?,
-                server: accept(
-                    &server_scid,
-                    None,
-                    server_addr,
-                    client_addr,
-                    server_config,
-                )?,
+                client: client,
+                server: server,
             })
         }
 
@@ -8936,21 +8943,25 @@ pub mod testing {
             let server_scid = ConnectionId::from_ref(&server_scid);
             let server_addr = Pipe::server_addr();
 
+            let (client, server) = connect(
+                Some("quic.tech"),
+                &client_scid,
+                client_addr,
+                server_addr,
+                client_config,
+            )?;
+
+            let (server, server_paths) = accept(
+                &server_scid,
+                None,
+                server_addr,
+                client_addr,
+                server_config,
+            )?;
+
             Ok(Pipe {
-                client: connect(
-                    Some("quic.tech"),
-                    &client_scid,
-                    client_addr,
-                    server_addr,
-                    client_config,
-                )?,
-                server: accept(
-                    &server_scid,
-                    None,
-                    server_addr,
-                    client_addr,
-                    server_config,
-                )?,
+                client: client,
+                server: server,
             })
         }
 
@@ -8991,32 +9002,32 @@ pub mod testing {
             Ok(())
         }
 
-        pub fn client_recv(&mut self, buf: &mut [u8]) -> Result<usize> {
-            let server_path = &self.server.paths.get_active().unwrap();
+        pub fn client_recv(&mut self, client_paths: &mut path::PathMap, server_paths: &mut path::PathMap, buf: &mut [u8]) -> Result<usize> {
+            let server_path = &server_paths.get_active().unwrap();
             let info = RecvInfo {
                 to: server_path.peer_addr(),
                 from: server_path.local_addr(),
             };
 
-            self.client.recv(buf, info)
+            self.client.recv(client_paths, buf, info)
         }
 
-        pub fn server_recv(&mut self, buf: &mut [u8]) -> Result<usize> {
-            let client_path = &self.client.paths.get_active().unwrap();
+        pub fn server_recv(&mut self, client_paths: &mut path::PathMap, server_paths: &mut path::PathMap, buf: &mut [u8]) -> Result<usize> {
+            let client_path = &client_paths.get_active().unwrap();
             let info = RecvInfo {
                 to: client_path.peer_addr(),
                 from: client_path.local_addr(),
             };
 
-            self.server.recv(buf, info)
+            self.server.recv(server_paths, buf, info)
         }
 
         pub fn send_pkt_to_server(
-            &mut self, pkt_type: packet::Type, frames: &[frame::Frame],
+            &mut self, paths: &mut pat::PathMap, pkt_type: packet::Type, frames: &[frame::Frame],
             buf: &mut [u8],
         ) -> Result<usize> {
             let written = encode_pkt(&mut self.client, pkt_type, frames, buf)?;
-            recv_send(&mut self.server, buf, written)
+            recv_send(&mut self.server, paths, buf, written)
         }
 
         pub fn client_update_key(&mut self) -> Result<()> {
@@ -9061,15 +9072,15 @@ pub mod testing {
     }
 
     pub fn recv_send(
-        conn: &mut Connection, buf: &mut [u8], len: usize,
+        conn: &mut Connection, paths: &mut path::PathMap, buf: &mut [u8], len: usize,
     ) -> Result<usize> {
-        let active_path = conn.paths.get_active()?;
+        let active_path = paths.get_active()?;
         let info = RecvInfo {
             to: active_path.local_addr(),
             from: active_path.peer_addr(),
         };
 
-        conn.recv(&mut buf[..len], info)?;
+        conn.recv(paths, &mut buf[..len], info)?;
 
         let mut off = 0;
 
@@ -13929,7 +13940,7 @@ mod tests {
         pipe.server.stream_send(4, &out, false).unwrap();
 
         for _ in 1..=6 {
-            assert_eq!(pipe.server.dgram_send(&out), Ok(()));
+            assert_eq!(pipe.server.dgram_send(paths, &out), Ok(()));
         }
 
         let mut off_0 = 0;
@@ -14690,7 +14701,7 @@ mod tests {
         assert!(pipe.server.is_readable());
 
         // Client received dgram.
-        assert_eq!(pipe.server.dgram_send(b"dddddddddddddd"), Ok(()));
+        assert_eq!(pipe.server.dgram_send(paths, b"dddddddddddddd"), Ok(()));
         assert_eq!(pipe.advance(), Ok(()));
 
         assert!(pipe.client.is_readable());
@@ -17314,5 +17325,4 @@ mod rand;
 mod ranges;
 mod recovery;
 mod stream;
-mod tls;
-*/
+mod tls;*/

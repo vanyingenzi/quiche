@@ -1,7 +1,7 @@
 # Multicore Impl
 
 ```bash
-cargo build --release
+RUSTFLAGS='-C target-cpu=native' cargo build --release
 mkdir -p /tmp/www; fallocate -l 4G /tmp/www/testfile
 ```
 
@@ -16,5 +16,5 @@ RUST_LOG=info ../target/release/quiche-client https:127.0.0.1:4433/testfile --no
 ```
 
 ```bash
-sudo perf record -F1000 -ag -- ../target/release/quiche-client https:127.0.0.1:4433/testfile --no-verify -A 127.0.0.1:6788 -A 127.0.0.1:6789 --multipath 1>/dev/null
+sudo perf record -e cycles -F 999 -g --call-graph lbr -- ../target/release/quiche-client https:127.0.0.1:4433/testfile --no-verify -A 127.0.0.1:6788 -A 127.0.0.1:6789 --multipath --multicore 1>/dev/null
 ```
