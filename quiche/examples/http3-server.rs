@@ -47,7 +47,7 @@ struct PartialResponse {
 
 struct Client {
     conn: quiche::Connection,
-
+    conn_paths: quiche::path::PathMap,
     http3_conn: Option<quiche::h3::Connection>,
 
     partial_responses: HashMap<u64, PartialResponse>,
@@ -120,7 +120,7 @@ fn main() {
         // Find the shorter timeout from all the active connections.
         //
         // TODO: use event loop that properly supports timers
-        let timeout = clients.values().filter_map(|c| c.conn.timeout()).min();
+        let timeout = clients.values_mut().filter_map(|c| c.conn.timeout(&mut c.conn_paths)).min();
 
         poll.poll(&mut events, timeout).unwrap();
 
@@ -133,7 +133,7 @@ fn main() {
             if events.is_empty() {
                 debug!("timed out");
 
-                clients.values_mut().for_each(|c| c.conn.on_timeout());
+                clients.values_mut().for_each(|c| c.conn.on_timeout(&mut c.conn_paths));
 
                 break 'read;
             }
@@ -263,7 +263,7 @@ fn main() {
 
                 debug!("New connection: dcid={:?} scid={:?}", hdr.dcid, scid);
 
-                let conn = quiche::accept(
+                let (conn, conn_paths) = quiche::accept(
                     &scid,
                     odcid.as_ref(),
                     local_addr,
@@ -274,6 +274,7 @@ fn main() {
 
                 let client = Client {
                     conn,
+                    conn_paths,
                     http3_conn: None,
                     partial_responses: HashMap::new(),
                 };
@@ -295,7 +296,7 @@ fn main() {
             };
 
             // Process potentially coalesced packets.
-            let read = match client.conn.recv(pkt_buf, recv_info) {
+            let read = match client.conn.recv(&mut client.conn_paths, pkt_buf, recv_info) {
                 Ok(v) => v,
 
                 Err(e) => {
@@ -342,7 +343,7 @@ fn main() {
                 loop {
                     let http3_conn = client.http3_conn.as_mut().unwrap();
 
-                    match http3_conn.poll(&mut client.conn) {
+                    match http3_conn.poll(&mut client.conn, &mut client.conn_paths) {
                         Ok((
                             stream_id,
                             quiche::h3::Event::Headers { list, .. },
@@ -397,7 +398,7 @@ fn main() {
         // packets to be sent.
         for client in clients.values_mut() {
             loop {
-                let (write, send_info) = match client.conn.send(&mut out) {
+                let (write, send_info) = match client.conn.send(&mut client.conn_paths, &mut out) {
                     Ok(v) => v,
 
                     Err(quiche::Error::Done) => {
@@ -434,7 +435,7 @@ fn main() {
                 info!(
                     "{} connection collected {:?}",
                     c.conn.trace_id(),
-                    c.conn.stats()
+                    c.conn.stats(&mut c.conn_paths)
                 );
             }
 
@@ -517,7 +518,7 @@ fn handle_request(
     // We decide the response based on headers alone, so stop reading the
     // request stream so that any body is ignored and pointless Data events
     // are not generated.
-    conn.stream_shutdown(stream_id, quiche::Shutdown::Read, 0)
+    conn.stream_shutdown(&mut client.conn_paths, stream_id, quiche::Shutdown::Read, 0)
         .unwrap();
 
     let (headers, body) = build_response(root, headers);

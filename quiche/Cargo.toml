@@ -78,3 +78,4 @@ url = "1"
 
 [lib]
 crate-type = ["lib", "staticlib", "cdylib"]
+doctest = false

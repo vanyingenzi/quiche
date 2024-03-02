@@ -2,7 +2,7 @@
 
 ```bash
 RUSTFLAGS='-C target-cpu=native' cargo build --release
-mkdir -p /tmp/www; fallocate -l 4G /tmp/www/testfile
+mkdir -p /tmp/www; fallocate -l 1G /tmp/www/testfile
 ```
 
 server

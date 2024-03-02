@@ -312,6 +312,8 @@ use qlog::events::EventImportance;
 #[cfg(feature = "qlog")]
 use qlog::events::EventType;
 
+use crate::path;
+
 /// List of ALPN tokens of supported HTTP/3 versions.
 ///
 /// This can be passed directly to the [`Config::set_application_protos()`]
@@ -1203,7 +1205,6 @@ impl Connection {
                 if !s.local_initialized() {
                     return Err(Error::FrameUnexpected);
                 },
-
             None => {
                 return Err(Error::FrameUnexpected);
             },
@@ -1301,9 +1302,9 @@ impl Connection {
     /// method.
     ///
     /// [`poll()`]: struct.Connection.html#method.poll
-    pub fn dgram_enabled_by_peer(&self, conn: &super::Connection) -> bool {
+    pub fn dgram_enabled_by_peer(&self, conn: &super::Connection, paths: &mut path::PathMap) -> bool {
         self.peer_settings.h3_datagram == Some(1) &&
-            conn.dgram_max_writable_len().is_some()
+            conn.dgram_max_writable_len(paths).is_some()
     }
 
     /// Returns whether the peer enabled extended CONNECT support.
@@ -1329,7 +1330,7 @@ impl Connection {
     /// [`Data`]: enum.Event.html#variant.Data
     /// [`Done`]: enum.Error.html#variant.Done
     pub fn recv_body(
-        &mut self, conn: &mut super::Connection, stream_id: u64, out: &mut [u8],
+        &mut self, conn: &mut super::Connection, paths: &mut path::PathMap, stream_id: u64, out: &mut [u8],
     ) -> Result<usize> {
         let mut total = 0;
 
@@ -1362,7 +1363,7 @@ impl Connection {
             // DATA frame was consumed, and another one is queued behind it,
             // this will ensure the additional data will also be returned to
             // the application.
-            match self.process_readable_stream(conn, stream_id, false) {
+            match self.process_readable_stream(conn, paths, stream_id, false) {
                 Ok(_) => unreachable!(),
 
                 Err(Error::Done) => (),
@@ -1551,7 +1552,7 @@ impl Connection {
     /// [`recv_dgram()`]: struct.Connection.html#method.recv_dgram
     /// [`take_last_priority_update()`]: struct.Connection.html#method.take_last_priority_update
     /// [`close()`]: ../struct.Connection.html#method.close
-    pub fn poll(&mut self, conn: &mut super::Connection) -> Result<(u64, Event)> {
+    pub fn poll(&mut self, conn: &mut super::Connection, paths: &mut path::PathMap) -> Result<(u64, Event)> {
         // When connection close is initiated by the local application (e.g. due
         // to a protocol error), the connection itself might be in a broken
         // state, so return early.
@@ -1561,7 +1562,7 @@ impl Connection {
 
         // Process control streams first.
         if let Some(stream_id) = self.peer_control_stream_id {
-            match self.process_control_stream(conn, stream_id) {
+            match self.process_control_stream(conn, paths, stream_id) {
                 Ok(ev) => return Ok(ev),
 
                 Err(Error::Done) => (),
@@ -1571,7 +1572,7 @@ impl Connection {
         }
 
         if let Some(stream_id) = self.peer_qpack_streams.encoder_stream_id {
-            match self.process_control_stream(conn, stream_id) {
+            match self.process_control_stream(conn, paths, stream_id) {
                 Ok(ev) => return Ok(ev),
 
                 Err(Error::Done) => (),
@@ -1581,7 +1582,7 @@ impl Connection {
         }
 
         if let Some(stream_id) = self.peer_qpack_streams.decoder_stream_id {
-            match self.process_control_stream(conn, stream_id) {
+            match self.process_control_stream(conn, paths, stream_id) {
                 Ok(ev) => return Ok(ev),
 
                 Err(Error::Done) => (),
@@ -1599,7 +1600,7 @@ impl Connection {
         for s in conn.readable() {
             trace!("{} stream id {} is readable", conn.trace_id(), s);
 
-            let ev = match self.process_readable_stream(conn, s, true) {
+            let ev = match self.process_readable_stream(conn, paths, s, true) {
                 Ok(v) => Some(v),
 
                 Err(Error::Done) => None,
@@ -1998,7 +1999,7 @@ impl Connection {
     }
 
     fn process_control_stream(
-        &mut self, conn: &mut super::Connection, stream_id: u64,
+        &mut self, conn: &mut super::Connection, paths: &mut path::PathMap, stream_id: u64,
     ) -> Result<(u64, Event)> {
         if conn.stream_finished(stream_id) {
             conn.close(
@@ -2010,7 +2011,7 @@ impl Connection {
             return Err(Error::ClosedCriticalStream);
         }
 
-        match self.process_readable_stream(conn, stream_id, true) {
+        match self.process_readable_stream(conn, paths, stream_id, true) {
             Ok(ev) => return Ok(ev),
 
             Err(Error::Done) => (),
@@ -2032,7 +2033,7 @@ impl Connection {
     }
 
     fn process_readable_stream(
-        &mut self, conn: &mut super::Connection, stream_id: u64, polling: bool,
+        &mut self, conn: &mut super::Connection, paths: &mut path::PathMap, stream_id: u64, polling: bool,
     ) -> Result<(u64, Event)> {
         self.streams
             .entry(stream_id)
@@ -2265,7 +2266,7 @@ impl Connection {
                         },
                     };
 
-                    match self.process_frame(conn, stream_id, frame, payload_len)
+                    match self.process_frame(conn, paths, stream_id, frame, payload_len)
                     {
                         Ok(ev) => return Ok(ev),
 
@@ -2308,6 +2309,7 @@ impl Connection {
                 stream::State::Drain => {
                     // Discard incoming data on the stream.
                     conn.stream_shutdown(
+                        paths,
                         stream_id,
                         crate::Shutdown::Read,
                         0x100,
@@ -2346,7 +2348,7 @@ impl Connection {
     }
 
     fn process_frame(
-        &mut self, conn: &mut super::Connection, stream_id: u64,
+        &mut self, conn: &mut super::Connection, paths: &mut path::PathMap, stream_id: u64,
         frame: frame::Frame, payload_len: u64,
     ) -> Result<(u64, Event)> {
         trace!(
@@ -2393,7 +2395,7 @@ impl Connection {
 
                 if let Some(1) = h3_datagram {
                     // The peer MUST have also enabled DATAGRAM with a TP
-                    if conn.dgram_max_writable_len().is_none() {
+                    if conn.dgram_max_writable_len(paths).is_none() {
                         conn.close(
                             true,
                             Error::SettingsError.to_wire(),
@@ -2820,11 +2822,11 @@ pub mod testing {
 
             self.advance().ok();
 
-            while self.client.poll(&mut self.pipe.client).is_ok() {
+            while self.client.poll(&mut self.pipe.client, &mut self.pipe.client_paths).is_ok() {
                 // Do nothing.
             }
 
-            while self.server.poll(&mut self.pipe.server).is_ok() {
+            while self.server.poll(&mut self.pipe.server, &mut self.pipe.server_paths).is_ok() {
                 // Do nothing.
             }
 
@@ -2838,12 +2840,12 @@ pub mod testing {
 
         /// Polls the client for events.
         pub fn poll_client(&mut self) -> Result<(u64, Event)> {
-            self.client.poll(&mut self.pipe.client)
+            self.client.poll(&mut self.pipe.client, &mut self.pipe.client_paths)
         }
 
         /// Polls the server for events.
         pub fn poll_server(&mut self) -> Result<(u64, Event)> {
-            self.server.poll(&mut self.pipe.server)
+            self.server.poll(&mut self.pipe.server, &mut self.pipe.server_paths)
         }
 
         /// Sends a request from client with default headers.
@@ -2911,7 +2913,7 @@ pub mod testing {
         pub fn recv_body_client(
             &mut self, stream: u64, buf: &mut [u8],
         ) -> Result<usize> {
-            self.client.recv_body(&mut self.pipe.client, stream, buf)
+            self.client.recv_body(&mut self.pipe.client, &mut self.pipe.client_paths, stream, buf)
         }
 
         /// Sends some default payload from server.
@@ -2936,7 +2938,7 @@ pub mod testing {
         pub fn recv_body_server(
             &mut self, stream: u64, buf: &mut [u8],
         ) -> Result<usize> {
-            self.server.recv_body(&mut self.pipe.server, stream, buf)
+            self.server.recv_body(&mut self.pipe.server, &mut self.pipe.server_paths, stream, buf)
         }
 
         /// Sends a single HTTP/3 frame from the client.
@@ -2969,7 +2971,7 @@ pub mod testing {
             b.put_varint(flow_id)?;
             b.put_bytes(&bytes)?;
 
-            self.pipe.client.dgram_send(&d)?;
+            self.pipe.client.dgram_send(&mut self.pipe.client_paths, &d)?;
 
             self.advance().ok();
 
@@ -3002,7 +3004,7 @@ pub mod testing {
             b.put_varint(flow_id)?;
             b.put_bytes(&bytes)?;
 
-            self.pipe.server.dgram_send(&d)?;
+            self.pipe.server.dgram_send(&mut self.pipe.server_paths, &d)?;
 
             self.advance().ok();
 
@@ -3111,7 +3113,7 @@ mod tests {
 
         // Configure session on new connection.
         let mut pipe = crate::testing::Pipe::with_config(&mut config).unwrap();
-        assert_eq!(pipe.client.set_session(session), Ok(()));
+        assert_eq!(pipe.client.set_session(&mut pipe.client_paths, session), Ok(()));
 
         // Can't create an H3 connection until the QUIC connection is determined
         // to have made sufficient early data progress.
@@ -3121,7 +3123,7 @@ mod tests {
         ));
 
         // Client sends initial flight.
-        let (len, _) = pipe.client.send(&mut buf).unwrap();
+        let (len, _) = pipe.client.send(&mut pipe.client_paths, &mut buf).unwrap();
 
         // Now an H3 connection can be created.
         assert!(Connection::with_transport(&mut pipe.client, &h3_config).is_ok());
@@ -4241,11 +4243,11 @@ mod tests {
 
         s.pipe
             .client
-            .stream_shutdown(stream, crate::Shutdown::Write, 0x100)
+            .stream_shutdown(&mut s.pipe.client_paths, stream, crate::Shutdown::Write, 0x100)
             .unwrap();
         s.pipe
             .client
-            .stream_shutdown(stream, crate::Shutdown::Read, 0x100)
+            .stream_shutdown(&mut s.pipe.client_paths, stream, crate::Shutdown::Read, 0x100)
             .unwrap();
 
         s.advance().ok();
@@ -4416,7 +4418,7 @@ mod tests {
         .unwrap();
 
         loop {
-            match s.server.poll(&mut s.pipe.server) {
+            match s.server.poll(&mut s.pipe.server, &mut s.pipe.server_paths) {
                 Ok(_) => (),
 
                 Err(Error::Done) => {
@@ -4452,7 +4454,7 @@ mod tests {
         s.advance().ok();
 
         loop {
-            match s.server.poll(&mut s.pipe.server) {
+            match s.server.poll( &mut s.pipe.server, &mut s.pipe.server_paths) {
                 Ok(_) => (),
 
                 Err(Error::Done) => {
@@ -4490,7 +4492,7 @@ mod tests {
         s.advance().ok();
 
         loop {
-            match s.server.poll(&mut s.pipe.server) {
+            match s.server.poll(&mut s.pipe.server, &mut s.pipe.server_paths) {
                 Ok(_) => (),
 
                 Err(Error::Done) => {
@@ -4530,7 +4532,7 @@ mod tests {
             has_body: true,
         };
 
-        assert_eq!(s.server.poll(&mut s.pipe.server), Ok((0, ev_headers)));
+        assert_eq!(s.server.poll(&mut s.pipe.server, &mut s.pipe.server_paths), Ok((0, ev_headers)));
 
         // DATA frames don't consume the state buffer, so can be of any size.
         let mut d = [42; 128];
@@ -4546,7 +4548,7 @@ mod tests {
 
         s.advance().ok();
 
-        assert_eq!(s.server.poll(&mut s.pipe.server), Ok((0, Event::Data)));
+        assert_eq!(s.server.poll(&mut s.pipe.server, &mut s.pipe.server_paths), Ok((0, Event::Data)));
 
         // GREASE frames consume the state buffer, so need to be limited.
         let mut s = Session::new().unwrap();
@@ -4565,7 +4567,7 @@ mod tests {
 
         s.advance().ok();
 
-        assert_eq!(s.server.poll(&mut s.pipe.server), Err(Error::ExcessiveLoad));
+        assert_eq!(s.server.poll(&mut s.pipe.server, &mut s.pipe.server_paths), Err(Error::ExcessiveLoad));
     }
 
     #[test]
@@ -4733,7 +4735,7 @@ mod tests {
         s.advance().ok();
 
         assert_eq!(
-            s.server.poll(&mut s.pipe.server),
+            s.server.poll(&mut s.pipe.server, &mut s.pipe.server_paths),
             Err(Error::FrameUnexpected)
         );
     }
@@ -4757,10 +4759,10 @@ mod tests {
 
         s.advance().ok();
 
-        assert_eq!(s.server.poll(&mut s.pipe.server), Err(Error::ExcessiveLoad));
+        assert_eq!(s.server.poll(&mut s.pipe.server, &mut s.pipe.server_paths), Err(Error::ExcessiveLoad));
 
         // Try to call poll() again after an error occurred.
-        assert_eq!(s.server.poll(&mut s.pipe.server), Err(Error::Done));
+        assert_eq!(s.server.poll(&mut s.pipe.server, &mut s.pipe.server_paths), Err(Error::Done));
     }
 
     #[test]
@@ -4938,9 +4940,9 @@ mod tests {
 
         // Now read raw frames to see what the QUIC layer did
         let mut buf = [0; 65535];
-        let (len, _) = s.pipe.server.send(&mut buf).unwrap();
+        let (len, _) = s.pipe.server.send(&mut s.pipe.server_paths, &mut buf).unwrap();
 
-        let frames = decode_pkt(&mut s.pipe.client, &mut buf[..len]).unwrap();
+        let frames = decode_pkt(&mut s.pipe.client, &mut s.pipe.client_paths, &mut buf[..len]).unwrap();
 
         let mut iter = frames.iter();
 
@@ -4967,7 +4969,7 @@ mod tests {
             Err(Error::Done)
         );
         assert_eq!(s.pipe.server.streams.blocked().len(), 0);
-        assert_eq!(s.pipe.server.send(&mut buf), Err(crate::Error::Done));
+        assert_eq!(s.pipe.server.send(&mut s.pipe.server_paths, &mut buf), Err(crate::Error::Done));
 
         // Now update the client's max offset manually.
         let frames = [crate::frame::Frame::MaxStreamData {
@@ -4996,9 +4998,9 @@ mod tests {
         );
         assert_eq!(s.pipe.server.streams.blocked().len(), 1);
 
-        let (len, _) = s.pipe.server.send(&mut buf).unwrap();
+        let (len, _) = s.pipe.server.send(&mut s.pipe.server_paths, &mut buf).unwrap();
 
-        let frames = decode_pkt(&mut s.pipe.client, &mut buf[..len]).unwrap();
+        let frames = decode_pkt(&mut s.pipe.client, &mut s.pipe.client_paths, &mut buf[..len]).unwrap();
 
         let mut iter = frames.iter();
 
@@ -5331,18 +5333,18 @@ mod tests {
 
         // Before processing SETTINGS (via poll), HTTP/3 DATAGRAMS are not
         // enabled.
-        assert!(!s.server.dgram_enabled_by_peer(&s.pipe.server));
+        assert!(!s.server.dgram_enabled_by_peer(&s.pipe.server, &mut s.pipe.server_paths));
 
         // When everything is ok, poll returns Done and DATAGRAM is enabled.
-        assert_eq!(s.server.poll(&mut s.pipe.server), Err(Error::Done));
-        assert!(s.server.dgram_enabled_by_peer(&s.pipe.server));
+        assert_eq!(s.server.poll(&mut s.pipe.server, &mut s.pipe.server_paths), Err(Error::Done));
+        assert!(s.server.dgram_enabled_by_peer(&s.pipe.server, &mut s.pipe.server_paths));
 
         // Now detect things on the client
         s.server.send_settings(&mut s.pipe.server).unwrap();
         assert_eq!(s.pipe.advance(), Ok(()));
-        assert!(!s.client.dgram_enabled_by_peer(&s.pipe.client));
-        assert_eq!(s.client.poll(&mut s.pipe.client), Err(Error::Done));
-        assert!(s.client.dgram_enabled_by_peer(&s.pipe.client));
+        assert!(!s.client.dgram_enabled_by_peer(&s.pipe.client, &mut s.pipe.client_paths));
+        assert_eq!(s.client.poll(&mut s.pipe.client, &mut s.pipe.client_paths), Err(Error::Done));
+        assert!(s.client.dgram_enabled_by_peer(&s.pipe.client, &mut s.pipe.client_paths));
     }
 
     #[test]
@@ -5394,7 +5396,7 @@ mod tests {
 
         assert_eq!(s.pipe.advance(), Ok(()));
 
-        assert_eq!(s.server.poll(&mut s.pipe.server), Err(Error::SettingsError));
+        assert_eq!(s.server.poll(&mut s.pipe.server, &mut s.pipe.server_paths), Err(Error::SettingsError));
     }
 
     #[test]
@@ -5463,9 +5465,9 @@ mod tests {
 
         assert_eq!(s.pipe.advance(), Ok(()));
 
-        assert_eq!(s.server.poll(&mut s.pipe.server), Err(Error::SettingsError));
+        assert_eq!(s.server.poll(&mut s.pipe.server, &mut s.pipe.server_paths), Err(Error::SettingsError));
 
-        assert_eq!(s.client.poll(&mut s.pipe.client), Err(Error::SettingsError));
+        assert_eq!(s.client.poll(&mut s.pipe.client, &mut s.pipe.client_paths), Err(Error::SettingsError));
     }
 
     #[test]
@@ -6163,7 +6165,7 @@ mod tests {
 
         // ..then Client sends RESET_STREAM
         assert_eq!(
-            s.pipe.client.stream_shutdown(0, crate::Shutdown::Write, 0),
+            s.pipe.client.stream_shutdown(&mut s.pipe.client_paths, 0, crate::Shutdown::Write, 0),
             Ok(())
         );
 
@@ -6178,7 +6180,7 @@ mod tests {
 
         // ..then Client sends RESET_STREAM
         assert_eq!(
-            s.pipe.client.stream_shutdown(4, crate::Shutdown::Write, 0),
+            s.pipe.client.stream_shutdown(&mut s.pipe.client_paths, 4, crate::Shutdown::Write, 0),
             Ok(())
         );
 
@@ -6220,7 +6222,7 @@ mod tests {
         assert_eq!(
             s.pipe
                 .server
-                .stream_shutdown(stream, crate::Shutdown::Write, 0),
+                .stream_shutdown(&mut s.pipe.server_paths, stream, crate::Shutdown::Write, 0),
             Ok(())
         );
 

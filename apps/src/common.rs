@@ -83,6 +83,8 @@ pub type ClientId = u64;
 pub struct Client {
     pub conn: quiche::Connection,
 
+    pub conn_paths: quiche::path::PathMap,
+
     pub http_conn: Option<Box<dyn HttpConn>>,
 
     pub client_id: ClientId,
@@ -314,7 +316,7 @@ pub fn priority_from_query_string(url: &url::Url) -> Option<Priority> {
 }
 
 fn send_h3_dgram(
-    conn: &mut quiche::Connection, flow_id: u64, dgram_content: &[u8],
+    conn: &mut quiche::Connection, conn_paths: &mut quiche::path::PathMap, flow_id: u64, dgram_content: &[u8],
 ) -> quiche::Result<()> {
     info!(
         "sending HTTP/3 DATAGRAM on flow_id={} with data {:?}",
@@ -330,23 +332,23 @@ fn send_h3_dgram(
     b.put_bytes(dgram_content)
         .map_err(|_| quiche::Error::BufferTooShort)?;
 
-    conn.dgram_send(&d)
+    conn.dgram_send(conn_paths, &d)
 }
 
 pub trait HttpConn {
     fn send_requests(
-        &mut self, conn: &mut quiche::Connection, target_path: &Option<String>,
+        &mut self, conn: &mut quiche::Connection, conn_paths: &mut quiche::path::PathMap, target_path: &Option<String>,
     );
 
     fn handle_responses(
-        &mut self, conn: &mut quiche::Connection, buf: &mut [u8],
+        &mut self, conn: &mut quiche::Connection, conn_paths: &mut quiche::path::PathMap, buf: &mut [u8],
         req_start: &std::time::Instant,
     );
 
     fn report_incomplete(&self, start: &std::time::Instant) -> bool;
 
     fn handle_requests(
-        &mut self, conn: &mut quiche::Connection,
+        &mut self, conn: &mut quiche::Connection, conn_paths: &mut quiche::path::PathMap,
         partial_requests: &mut HashMap<u64, PartialRequest>,
         partial_responses: &mut HashMap<u64, PartialResponse>, root: &str,
         index: &str, buf: &mut [u8],
@@ -439,7 +441,7 @@ impl Http09Conn {
 
 impl HttpConn for Http09Conn {
     fn send_requests(
-        &mut self, conn: &mut quiche::Connection, target_path: &Option<String>,
+        &mut self, conn: &mut quiche::Connection, _: &mut quiche::path::PathMap, target_path: &Option<String>,
     ) {
         let mut reqs_done = 0;
 
@@ -477,7 +479,7 @@ impl HttpConn for Http09Conn {
     }
 
     fn handle_responses(
-        &mut self, conn: &mut quiche::Connection, buf: &mut [u8],
+        &mut self, conn: &mut quiche::Connection, _: &mut quiche::path::PathMap, buf: &mut [u8],
         req_start: &std::time::Instant,
     ) {
         // Process all readable streams.
@@ -564,7 +566,7 @@ impl HttpConn for Http09Conn {
     }
 
     fn handle_requests(
-        &mut self, conn: &mut quiche::Connection,
+        &mut self, conn: &mut quiche::Connection, _conn_paths: &mut quiche::path::PathMap,
         partial_requests: &mut HashMap<u64, PartialRequest>,
         partial_responses: &mut HashMap<u64, PartialResponse>, root: &str,
         index: &str, buf: &mut [u8],
@@ -1115,7 +1117,7 @@ impl Http3Conn {
 
 impl HttpConn for Http3Conn {
     fn send_requests(
-        &mut self, conn: &mut quiche::Connection, target_path: &Option<String>,
+        &mut self, conn: &mut quiche::Connection, conn_paths: &mut quiche::path::PathMap, target_path: &Option<String>,
     ) {
         let mut reqs_done = 0;
 
@@ -1198,7 +1200,7 @@ impl HttpConn for Http3Conn {
             let mut dgrams_done = 0;
 
             for _ in ds.dgrams_sent..ds.dgram_count {
-                match send_h3_dgram(conn, ds.flow_id, ds.dgram_content.as_bytes())
+                match send_h3_dgram(conn, conn_paths, ds.flow_id, ds.dgram_content.as_bytes())
                 {
                     Ok(v) => v,
 
@@ -1216,11 +1218,11 @@ impl HttpConn for Http3Conn {
     }
 
     fn handle_responses(
-        &mut self, conn: &mut quiche::Connection, buf: &mut [u8],
+        &mut self, conn: &mut quiche::Connection, conn_paths: &mut quiche::path::PathMap, buf: &mut [u8],
         req_start: &std::time::Instant,
     ) {
         loop {
-            match self.h3_conn.poll(conn) {
+            match self.h3_conn.poll(conn, conn_paths) {
                 Ok((stream_id, quiche::h3::Event::Headers { list, .. })) => {
                     debug!(
                         "got response headers {:?} on stream id {}",
@@ -1239,7 +1241,7 @@ impl HttpConn for Http3Conn {
 
                 Ok((stream_id, quiche::h3::Event::Data)) => {
                     while let Ok(read) =
-                        self.h3_conn.recv_body(conn, stream_id, buf)
+                        self.h3_conn.recv_body(conn, conn_paths, stream_id, buf)
                     {
                         debug!(
                             "got {} bytes of response data on stream {}",
@@ -1388,14 +1390,14 @@ impl HttpConn for Http3Conn {
     }
 
     fn handle_requests(
-        &mut self, conn: &mut quiche::Connection,
+        &mut self, conn: &mut quiche::Connection, conn_paths: &mut quiche::path::PathMap,
         _partial_requests: &mut HashMap<u64, PartialRequest>,
         partial_responses: &mut HashMap<u64, PartialResponse>, root: &str,
         index: &str, buf: &mut [u8],
     ) -> quiche::h3::Result<()> {
         // Process HTTP stream-related events.
         loop {
-            match self.h3_conn.poll(conn) {
+            match self.h3_conn.poll(conn, conn_paths) {
                 Ok((stream_id, quiche::h3::Event::Headers { list, .. })) => {
                     info!(
                         "{} got request {:?} on stream id {}",
@@ -1411,7 +1413,7 @@ impl HttpConn for Http3Conn {
                     // stop reading the request stream so that any body
                     // is ignored and pointless Data events are not
                     // generated.
-                    conn.stream_shutdown(stream_id, quiche::Shutdown::Read, 0)
+                    conn.stream_shutdown(conn_paths, stream_id, quiche::Shutdown::Read, 0)
                         .unwrap();
 
                     let (mut headers, body, mut priority) =
@@ -1420,6 +1422,7 @@ impl HttpConn for Http3Conn {
 
                             Err((error_code, _)) => {
                                 conn.stream_shutdown(
+                                    conn_paths,
                                     stream_id,
                                     quiche::Shutdown::Write,
                                     error_code,
@@ -1568,7 +1571,7 @@ impl HttpConn for Http3Conn {
             let mut dgrams_done = 0;
 
             for _ in ds.dgrams_sent..ds.dgram_count {
-                match send_h3_dgram(conn, ds.flow_id, ds.dgram_content.as_bytes())
+                match send_h3_dgram(conn,conn_paths, ds.flow_id, ds.dgram_content.as_bytes())
                 {
                     Ok(v) => v,
 

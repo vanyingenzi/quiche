@@ -57,95 +57,8 @@ use std::sync::{Arc, Mutex};
 const MAX_BUF_SIZE: usize = 65507;
 const MAX_DATAGRAM_SIZE: usize = 1350;
 
-#[derive(Debug)]
-struct MulticoreReadPacket {
-    rcv_info: quiche::RecvInfo, 
-    packet_offset: usize, 
-    packet_len: usize
-}
-
-/// Reads the packets on the socket and feeds them to quiche.
-pub fn read_packets_on_socket_v2(
-    socket: &UdpSocket, events: &Events, conn_guard: &Arc<Mutex<Connection>>,
-    pkt_count: &mut u64, dump_packet_path: &Option<String>, buf: &mut [u8],
-) -> Result<(), ClientError> {
-    let local_addr = socket.local_addr().unwrap();
-    let mut read_packets_info = Vec::new();
-    let mut offset: usize = 0;
-    'event: for event in events {
-        match event.token() {
-            _ => {
-                // As there's only one socket listen per thread
-                if event.is_readable() {
-                    'read: loop {
-                        let (len, from) = match socket.recv_from(&mut buf[offset..]) {
-                            Ok(v) => v,
-
-                            Err(e) => {
-                                // There are no more UDP packets to read on this socket.
-                                // Process subsequent events.
-                                if e.kind() == std::io::ErrorKind::WouldBlock {
-                                    trace!("{}: recv() would block", local_addr);
-                                    break 'read;
-                                }
-
-                                return Err(ClientError::Other(format!(
-                                    "{local_addr}: recv() failed: {e:?}"
-                                )));
-                            },
-                        };
-
-                        trace!("{}: got {} bytes", local_addr, len);
-
-                        if let Some(target_path) = dump_packet_path.as_ref() {
-                            let path = format!("{target_path}/{pkt_count}.pkt");
-
-                            if let Ok(f) = std::fs::File::create(path) {
-                                let mut f = std::io::BufWriter::new(f);
-                                f.write_all(&buf[..len]).ok();
-                            }
-                        }
-
-                        *pkt_count += 1;
-
-                        let recv_info = quiche::RecvInfo {
-                            to: local_addr,
-                            from,
-                        };
-
-                        read_packets_info.push(MulticoreReadPacket{
-                            rcv_info: recv_info, 
-                            packet_offset: offset, 
-                            packet_len: len
-                        });
-
-                        offset += len;
-
-                        if MAX_BUF_SIZE - offset < MAX_DATAGRAM_SIZE {
-                            break 'event;
-                        }
-                    }
-                }
-            },
-        }
-    }
-    let mut conn = conn_guard.lock().unwrap();
-    for packet_info in read_packets_info{
-        let read = match conn.recv(&mut buf[packet_info.packet_offset..packet_info.packet_offset+packet_info.packet_len], packet_info.rcv_info) {
-            Ok(v) => v,
-    
-            Err(e) => {
-                error!("{}: recv failed: {:?}", local_addr, e);
-                0
-            },
-        };
-        trace!("{}: processed {} bytes", local_addr, read);
-    }
-    Ok(())
-}
-
 pub fn read_packets_on_socket(
-    socket: &UdpSocket, events: &Events, conn: &mut Connection,
+    socket: &UdpSocket, events: &Events, conn: &mut Connection, paths: &mut quiche::path::PathMap,
     pkt_count: &mut u64, dump_packet_path: &Option<String>, buf: &mut [u8],
 ) -> Result<(), ClientError> {
     let local_addr = socket.local_addr().unwrap();
@@ -191,7 +104,7 @@ pub fn read_packets_on_socket(
                         };
 
                         // Process potentially coalesced packets.
-                        let read = match conn.recv(&mut buf[..len], recv_info) {
+                        let read = match conn.recv(paths, &mut buf[..len], recv_info) {
                             Ok(v) => v,
 
                             Err(e) => {
@@ -211,11 +124,11 @@ pub fn read_packets_on_socket(
 
 pub fn write_packets_on_path(
     local_addr: &SocketAddr, peer_addr: &SocketAddr, socket: &UdpSocket,
-    conn: &mut Connection, out: &mut [u8],
+    conn: &mut Connection, paths: &mut quiche::path::PathMap, out: &mut [u8],
 ) -> Result<(), ClientError> {
     loop {
         let (write, send_info) =
-            match conn.send_on_path(out, Some(*local_addr), Some(*peer_addr)) {
+            match conn.send_on_path(paths, out, Some(*local_addr), Some(*peer_addr)) {
                 Ok(v) => v,
 
                 Err(quiche::Error::Done) => {
@@ -263,15 +176,15 @@ fn multicore_create_socket(
 
 fn multicore_initiate_connection(
     peer_addr: &std::net::SocketAddr, local_addr: &std::net::SocketAddr,
-    out: &mut [u8], scid: &ConnectionId, conn: &mut Connection,
-    socket: &mut mio::net::UdpSocket,
+    out: &mut [u8], scid: &ConnectionId, conn: &mut Connection, paths: &mut quiche::path::PathMap,
+    socket: &mut mio::net::UdpSocket, 
 ) -> Result<(), ClientError> {
     info!(
         "connecting to {:} from {:} with scid {:?}",
         peer_addr, local_addr, scid,
     );
 
-    let (write, send_info) = conn.send(out).expect("initial send failed");
+    let (write, send_info) = conn.send(paths, out).expect("initial send failed");
 
     while let Err(e) = socket.send_to(&out[..write], send_info.to) {
         if e.kind() == std::io::ErrorKind::WouldBlock {
@@ -290,12 +203,12 @@ fn multicore_initiate_connection(
 }
 
 #[inline]
-fn can_send_on_path(conn: &mut Connection, local_addr: SocketAddr, peer_addr: SocketAddr) -> bool {
-    conn.path_stats().any(|p| p.local_addr == local_addr && p.peer_addr == peer_addr)
+fn can_send_on_path(paths: &mut quiche::path::PathMap, local_addr: SocketAddr, peer_addr: SocketAddr) -> bool {
+    paths.iter().map(|(_, p)| p.stats()).any(|p| p.local_addr == local_addr && p.peer_addr == peer_addr)
 }
 
 fn client_thread(
-    quiche_conn: Arc<Mutex<Connection>>,
+    quiche_conn: Arc<Mutex<(Connection, quiche::path::PathMap)>>,
     app_proto_selected_guard: Arc<Mutex<bool>>,
     dump_packet_path: Option<String>,
     addrs: (SocketAddr, SocketAddr), 
@@ -311,8 +224,8 @@ fn client_thread(
     let (local_addr, peer_addr) = addrs;
     let mut socket = multicore_create_socket((&local_addr, &peer_addr), &mut poll);
     if initiate_connection {
-        let conn = &mut quiche_conn.lock().unwrap();
-        multicore_initiate_connection(&peer_addr, &local_addr, &mut out,&scid, conn, &mut socket)?;
+        let (ref mut conn, ref mut conn_paths) = *quiche_conn.lock().unwrap();
+        multicore_initiate_connection(&peer_addr, &local_addr, &mut out, &scid, conn, conn_paths, &mut socket)?;
         *sent_conn_init_pkt.lock().unwrap() = true;
     } else {
         while !*sent_conn_init_pkt.lock().unwrap() {}
@@ -331,25 +244,25 @@ fn client_thread(
     loop {
         poll.poll(&mut events, Some(Duration::ZERO)).unwrap();
         if events.is_empty() {
-            let conn = &mut quiche_conn.lock().unwrap();
+            let (ref mut conn, ref mut conn_paths) = *quiche_conn.lock().unwrap();
             app_proto_selected = *app_proto_selected_guard.lock().unwrap();
             conn_is_in_early_data = conn.is_in_early_data(); // Check stage of the connection
             if !conn_is_in_early_data || app_proto_selected {
-                conn.on_timeout();
+                conn.on_timeout(conn_paths);
             }
         }
 
         // Reading from socket critical section
         if !events.is_empty() {
-            let mut conn = quiche_conn.lock().unwrap();
-            read_packets_on_socket(&socket, &events, &mut conn, &mut pkt_count, &dump_packet_path, &mut buf)?;
+            let (ref mut conn, ref mut conn_paths) = *quiche_conn.lock().unwrap();
+            read_packets_on_socket(&socket, &events, conn, conn_paths, &mut pkt_count, &dump_packet_path, &mut buf)?;
         }
 
         {
             // Writing to socket critical section
-            let mut conn = quiche_conn.lock().unwrap();
-            if can_send_on_path(&mut conn, local_addr, peer_addr) {
-                write_packets_on_path(&local_addr, &peer_addr, &socket, &mut conn, &mut out).ok();
+            let (ref mut conn, ref mut conn_paths) = *quiche_conn.lock().unwrap();
+            if can_send_on_path(conn_paths, local_addr, peer_addr) {
+                write_packets_on_path(&local_addr, &peer_addr, &socket, conn, conn_paths, &mut out).ok();
             }
             if conn.is_closed() {
                 break;
@@ -486,7 +399,7 @@ pub fn multicore_connect(
     let scid = quiche::ConnectionId::from_ref(&scid);
     let scid = Arc::new(scid.into_owned());
     // Create a QUIC connection and initiate handshake.
-    let mut conn = quiche::connect(
+    let (mut conn, mut conn_paths) = quiche::connect(
         connect_url.domain(),
         &scid,
         local_addr,
@@ -517,11 +430,11 @@ pub fn multicore_connect(
 
     if let Some(session_file) = &args.session_file {
         if let Ok(session) = std::fs::read(session_file) {
-            conn.set_session(&session).ok();
+            conn.set_session(&mut conn_paths, &session).ok();
         }
     }
 
-    let conn_guard = Arc::new(Mutex::new(conn));
+    let conn_guard = Arc::new(Mutex::new((conn, conn_paths)));
     let app_proto_selected_guard = Arc::new(Mutex::new(false));
     let sent_connection_initial_packet = Arc::new(Mutex::new(false));
 
@@ -571,12 +484,12 @@ pub fn multicore_connect(
 
     loop {
         {
-            let mut conn = conn_guard.lock().unwrap();
+            let (ref mut conn, ref mut conn_paths) = *conn_guard.lock().unwrap();
             if conn.is_closed() {
                 info!(
                     "connection closed, {:?} {:?}",
-                    conn.stats(),
-                    conn.path_stats().collect::<Vec<quiche::PathStats>>()
+                    conn.stats(conn_paths),
+                    conn_paths.iter().map(|(_, p)| p.stats()).collect::<Vec<quiche::PathStats>>()
                 );
 
                 if !conn.is_established() {
@@ -640,7 +553,7 @@ pub fn multicore_connect(
                     };
 
                     http_conn = Some(Http3Conn::with_urls(
-                        &mut conn,
+                        conn,
                         &args.urls,
                         args.reqs_cardinal,
                         &args.req_headers,
@@ -664,12 +577,12 @@ pub fn multicore_connect(
             // process received data.
 
             if let Some(h_conn) = http_conn.as_mut() {
-                h_conn.send_requests(&mut conn, &args.dump_response_path);
-                h_conn.handle_responses(&mut conn, &mut buf, &app_data_start);
+                h_conn.send_requests(conn, conn_paths, &args.dump_response_path);
+                h_conn.handle_responses(conn, conn_paths, &mut buf, &app_data_start);
             }
 
             // Handle path events.
-            while let Some(qe) = conn.path_event_next() {
+            while let Some(qe) = conn.path_event_next(conn_paths) {
                 match qe {
                     quiche::PathEvent::New(..) => unreachable!(),
 
@@ -678,10 +591,10 @@ pub fn multicore_connect(
                             "[Connection Thread] Path ({}, {}) is now validated",
                             local_addr, peer_addr
                         );
-                        if conn.is_multipath_enabled() {
-                            conn.set_active(local_addr, peer_addr, true).ok();
+                        if conn.is_multipath_enabled(conn_paths,) {
+                            conn.set_active(conn_paths, local_addr, peer_addr, true).ok();
                         } else if args.perform_migration {
-                            conn.migrate(local_addr, peer_addr).unwrap();
+                            conn.migrate(conn_paths, local_addr, peer_addr).unwrap();
                             migrated = true;
                         }
                     },
@@ -744,7 +657,7 @@ pub fn multicore_connect(
             if conn_args.multipath
                 && probed_paths < addrs.len()
                 && conn.available_dcids() > 0
-                && conn.probe_path(addrs[probed_paths], peer_addr).is_ok()
+                && conn.probe_path(conn_paths, addrs[probed_paths], peer_addr).is_ok()
             {
                 info!("Probing path {} <-> {}", addrs[probed_paths], peer_addr);
                 probed_paths += 1;
@@ -757,15 +670,16 @@ pub fn multicore_connect(
                 && conn.available_dcids() > 0
             {
                 let additional_local_addr = sockets_addrs[1].0;
-                conn.probe_path(additional_local_addr, peer_addr).unwrap();
+                conn.probe_path(conn_paths,additional_local_addr, peer_addr).unwrap();
                 new_path_probed = true;
             }
 
-            if conn.is_multipath_enabled() {
+            if conn.is_multipath_enabled(conn_paths) {
                 rm_addrs.retain(|(d, addr)| {
                     if app_data_start.elapsed() >= *d {
                         info!("Abandoning path {:?}", addr);
                         conn.abandon_path(
+                            conn_paths,
                             *addr,
                             peer_addr,
                             0,
@@ -782,7 +696,7 @@ pub fn multicore_connect(
                     if app_data_start.elapsed() >= *d {
                         let status = (*available).into();
                         info!("Advertising path status {status:?} to {addr:?}");
-                        conn.set_path_status(*addr, peer_addr, status, true)
+                        conn.set_path_status(conn_paths, *addr, peer_addr, status, true)
                             .is_err()
                     } else {
                         true
@@ -792,12 +706,12 @@ pub fn multicore_connect(
         }
 
         {
-            let conn = conn_guard.lock().unwrap();
+            let (ref mut conn, ref mut conn_paths) = *conn_guard.lock().unwrap();
             if conn.is_closed() {
                 info!(
                     "connection closed, {:?} {:?}",
-                    conn.stats(),
-                    conn.path_stats().collect::<Vec<quiche::PathStats>>()
+                    conn.stats(conn_paths,),
+                    conn_paths.iter().map(|(_, p)| p.stats()).collect::<Vec<quiche::PathStats>>()
                 );
 
                 if !conn.is_established() {

@@ -187,7 +187,7 @@ fn main() {
         let timeout = match continue_write {
             true => Some(std::time::Duration::from_secs(0)),
 
-            false => clients.values().filter_map(|c| c.conn.timeout()).min(),
+            false => clients.values_mut().filter_map(|c| c.conn.timeout(&mut c.conn_paths)).min(),
         };
 
         poll.poll(&mut events, timeout).unwrap();
@@ -201,7 +201,7 @@ fn main() {
             if events.is_empty() && !continue_write {
                 trace!("timed out");
 
-                clients.values_mut().for_each(|c| c.conn.on_timeout());
+                clients.values_mut().for_each(|c| c.conn.on_timeout(&mut c.conn_paths));
 
                 break 'read;
             }
@@ -348,7 +348,7 @@ fn main() {
                 debug!("New connection: dcid={:?} scid={:?}", hdr.dcid, scid);
 
                 #[allow(unused_mut)]
-                let mut conn = quiche::accept(
+                let (mut conn, mut conn_paths) = quiche::accept(
                     &scid,
                     odcid.as_ref(),
                     local_addr,
@@ -382,6 +382,7 @@ fn main() {
 
                 let client = Client {
                     conn,
+                    conn_paths,
                     http_conn: None,
                     client_id,
                     partial_requests: HashMap::new(),
@@ -415,7 +416,7 @@ fn main() {
             };
 
             // Process potentially coalesced packets.
-            let read = match client.conn.recv(pkt_buf, recv_info) {
+            let read = match client.conn.recv(&mut client.conn_paths, pkt_buf, recv_info) {
                 Ok(v) => v,
 
                 Err(e) => {
@@ -478,7 +479,7 @@ fn main() {
 
                 // Update max_datagram_size after connection established.
                 client.max_datagram_size =
-                    client.conn.max_send_udp_payload_size();
+                    client.conn.max_send_udp_payload_size(&mut client.conn_paths);
             }
 
             if client.http_conn.is_some() {
@@ -494,6 +495,7 @@ fn main() {
                 if http_conn
                     .handle_requests(
                         conn,
+                        &mut client.conn_paths,
                         &mut client.partial_requests,
                         partial_responses,
                         &args.root,
@@ -536,7 +538,7 @@ fn main() {
         for (k, client) in clients.iter_mut() {
             // Reduce max_send_burst by 25% if loss is increasing more than 0.1%.
             let loss_rate =
-                client.conn.stats().lost as f64 / client.conn.stats().sent as f64;
+                client.conn.stats(&mut client.conn_paths).lost as f64 / client.conn.stats(&mut client.conn_paths).sent as f64;
             if loss_rate > client.loss_rate + 0.001 {
                 client.max_send_burst = client.max_send_burst / 4 * 3;
                 // Minimun bound of 10xMSS.
@@ -546,7 +548,7 @@ fn main() {
             }
 
             let max_send_burst =
-                client.conn.send_quantum().min(client.max_send_burst) /
+                client.conn.send_quantum(&mut client.conn_paths).min(client.max_send_burst) /
                     client.max_datagram_size *
                     client.max_datagram_size;
             let mut total_write = 0;
@@ -556,11 +558,11 @@ fn main() {
             while total_write < max_send_burst {
 
                 let res = if let Some(info) = dst_info {
-                    client.conn.send_on_path(&mut out[total_write..max_send_burst], Some(info.from), Some(info.to))
+                    client.conn.send_on_path(&mut client.conn_paths, &mut out[total_write..max_send_burst], Some(info.from), Some(info.to))
                 } else if let Some((local, peer)) = path_scheduled {
-                    client.conn.send_on_path(&mut out[total_write..max_send_burst], Some(local), Some(peer))
+                    client.conn.send_on_path(&mut client.conn_paths, &mut out[total_write..max_send_burst], Some(local), Some(peer))
                 } else {
-                    client.conn.send(&mut out[total_write..max_send_burst])
+                    client.conn.send(&mut client.conn_paths,&mut out[total_write..max_send_burst])
                 };
 
                 let (write, send_info) = match res {
@@ -635,8 +637,8 @@ fn main() {
                 info!(
                     "{} connection collected {:?} {:?}",
                     c.conn.trace_id(),
-                    c.conn.stats(),
-                    c.conn.path_stats().collect::<Vec<quiche::PathStats>>()
+                    c.conn.stats(&mut c.conn_paths),
+                    c.conn_paths.iter().map(|(_, p)| p.stats()).collect::<Vec<quiche::PathStats>>()
                 );
 
                 for id in c.conn.source_ids() {
@@ -708,7 +710,7 @@ fn validate_token<'a>(
 }
 
 fn handle_path_events(client: &mut Client, scheduler: &mut Scheduler) {
-    while let Some(qe) = client.conn.path_event_next() {
+    while let Some(qe) = client.conn.path_event_next(&mut client.conn_paths) {
         match qe {
             quiche::PathEvent::New(local_addr, peer_addr) => {
                 info!(
@@ -723,7 +725,7 @@ fn handle_path_events(client: &mut Client, scheduler: &mut Scheduler) {
                 // Directly probe the new path.
                 client
                     .conn
-                    .probe_path(local_addr, peer_addr)
+                    .probe_path(&mut client.conn_paths,local_addr, peer_addr)
                     .map_err(|e| error!("cannot probe: {}", e))
                     .ok();
             },
@@ -735,10 +737,10 @@ fn handle_path_events(client: &mut Client, scheduler: &mut Scheduler) {
                     local_addr,
                     peer_addr
                 );
-                if client.conn.is_multipath_enabled() {
+                if client.conn.is_multipath_enabled(&mut client.conn_paths) {
                     match client
                         .conn
-                        .set_active(local_addr, peer_addr, true)
+                        .set_active(&mut client.conn_paths, local_addr, peer_addr, true)
                         .map_err(|e| error!("cannot set path active: {}", e))
                         .ok()
                     {
@@ -793,7 +795,7 @@ fn handle_path_events(client: &mut Client, scheduler: &mut Scheduler) {
                 info!("Peer asks status {:?} for {:?}", path_status, addr,);
                 client
                     .conn
-                    .set_path_status(addr.0, addr.1, path_status, false)
+                    .set_path_status(&mut client.conn_paths, addr.0, addr.1, path_status, false)
                     .map_err(|e| error!("cannot follow status request: {}", e))
                     .ok();
             },

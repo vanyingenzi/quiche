@@ -177,7 +177,7 @@ pub fn connect(
     let scid = quiche::ConnectionId::from_ref(&scid);
 
     // Create a QUIC connection and initiate handshake.
-    let mut conn = quiche::connect(
+    let (mut conn, mut conn_paths) = quiche::connect(
         connect_url.domain(),
         &scid,
         local_addr,
@@ -209,7 +209,7 @@ pub fn connect(
 
     if let Some(session_file) = &args.session_file {
         if let Ok(session) = std::fs::read(session_file) {
-            conn.set_session(&session).ok();
+            conn.set_session(&mut conn_paths, &session).ok();
         }
     }
 
@@ -218,7 +218,7 @@ pub fn connect(
         peer_addr, local_addr, scid,
     );
 
-    let (write, send_info) = conn.send(&mut out).expect("initial send failed");
+    let (write, send_info) = conn.send(&mut conn_paths, &mut out).expect("initial send failed");
     let token = src_addr_to_token[&send_info.from];
 
     while let Err(e) = sockets[token].send_to(&out[..write], send_info.to) {
@@ -248,7 +248,7 @@ pub fn connect(
     loop {
 
         if !conn.is_in_early_data() || app_proto_selected {
-            poll.poll(&mut events, conn.timeout()).unwrap();
+            poll.poll(&mut events, conn.timeout(&mut conn_paths)).unwrap();
         }
 
         // If the event loop reported no events, it means that the timeout
@@ -256,7 +256,7 @@ pub fn connect(
         // will then proceed with the send loop.
         if events.is_empty() {
             trace!("timed out");
-            conn.on_timeout();
+            conn.on_timeout(&mut conn_paths);
         }
 
         // Read incoming UDP packets from the socket and feed them to quiche,
@@ -301,7 +301,7 @@ pub fn connect(
 
                 
                 // Process potentially coalesced packets.
-                let read = match conn.recv(&mut buf[..len], recv_info) {
+                let read = match conn.recv(&mut conn_paths,&mut buf[..len], recv_info) {
                     Ok(v) => v,
 
                     Err(e) => {
@@ -319,8 +319,8 @@ pub fn connect(
         if conn.is_closed() {
             info!(
                 "connection closed, {:?} {:?}",
-                conn.stats(),
-                conn.path_stats().collect::<Vec<quiche::PathStats>>()
+                conn.stats(&mut conn_paths),
+                conn_paths.iter().map(|(_, p)| p.stats()).collect::<Vec<quiche::PathStats>>()
             );
 
             if !conn.is_established() {
@@ -405,12 +405,12 @@ pub fn connect(
         // If we have an HTTP connection, first issue the requests then
         // process received data.
         if let Some(h_conn) = http_conn.as_mut() {
-            h_conn.send_requests(&mut conn, &args.dump_response_path);
-            h_conn.handle_responses(&mut conn, &mut buf, &app_data_start);
+            h_conn.send_requests(&mut conn, &mut conn_paths, &args.dump_response_path);
+            h_conn.handle_responses(&mut conn,  &mut conn_paths, &mut buf, &app_data_start);
         }
 
         // Handle path events.
-        while let Some(qe) = conn.path_event_next() {
+        while let Some(qe) = conn.path_event_next(&mut conn_paths) {
             match qe {
                 quiche::PathEvent::New(..) => unreachable!(),
 
@@ -419,10 +419,10 @@ pub fn connect(
                         "Path ({}, {}) is now validated",
                         local_addr, peer_addr
                     );
-                    if conn.is_multipath_enabled() {
-                        conn.set_active(local_addr, peer_addr, true).ok();
+                    if conn.is_multipath_enabled(&mut conn_paths) {
+                        conn.set_active(&mut conn_paths,local_addr, peer_addr, true).ok();
                     } else if args.perform_migration {
-                        conn.migrate(local_addr, peer_addr).unwrap();
+                        conn.migrate(&mut conn_paths, local_addr, peer_addr).unwrap();
                         migrated = true;
                     }
                 },
@@ -477,7 +477,7 @@ pub fn connect(
         if conn_args.multipath &&
             probed_paths < addrs.len() &&
             conn.available_dcids() > 0 &&
-            conn.probe_path(addrs[probed_paths], peer_addr).is_ok()
+            conn.probe_path(&mut conn_paths, addrs[probed_paths], peer_addr).is_ok()
         {
             debug!("Probed path {:?}", (addrs[probed_paths], peer_addr));
             probed_paths += 1;
@@ -490,16 +490,17 @@ pub fn connect(
             conn.available_dcids() > 0
         {
             let additional_local_addr = sockets[1].local_addr().unwrap();
-            conn.probe_path(additional_local_addr, peer_addr).unwrap();
+            conn.probe_path(&mut conn_paths, additional_local_addr, peer_addr).unwrap();
 
             new_path_probed = true;
         }
 
-        if conn.is_multipath_enabled() {
+        if conn.is_multipath_enabled(&mut conn_paths) {
             rm_addrs.retain(|(d, addr)| {
                 if app_data_start.elapsed() >= *d {
                     info!("Abandoning path {:?}", addr);
                     conn.abandon_path(
+                        &mut conn_paths,
                         *addr,
                         peer_addr,
                         0,
@@ -515,7 +516,7 @@ pub fn connect(
                 if app_data_start.elapsed() >= *d {
                     let status = (*available).into();
                     info!("Advertising path status {status:?} to {addr:?}");
-                    conn.set_path_status(*addr, peer_addr, status, true)
+                    conn.set_path_status(&mut conn_paths, *addr, peer_addr, status, true)
                         .is_err()
                 } else {
                     true
@@ -524,7 +525,7 @@ pub fn connect(
         }
 
         // Determine in which order we are going to iterate over paths.
-        let scheduled_tuples = lowest_latency_scheduler(&conn);
+        let scheduled_tuples = lowest_latency_scheduler(&conn_paths);
 
         // Generate outgoing QUIC packets and send them on the UDP socket, until
         // quiche reports that there are no more packets to be sent.
@@ -533,6 +534,7 @@ pub fn connect(
             let socket = &sockets[token];
             loop {
                 let (write, send_info) = match conn.send_on_path(
+                    &mut conn_paths,
                     &mut out,
                     Some(local_addr),
                     Some(peer_addr),
@@ -578,8 +580,8 @@ pub fn connect(
         if conn.is_closed() {
             info!(
                 "connection closed, {:?} {:?}",
-                conn.stats(),
-                conn.path_stats().collect::<Vec<quiche::PathStats>>()
+                conn.stats(&mut conn_paths),
+                conn_paths.iter().map(|(_, p)| p.stats()).collect::<Vec<quiche::PathStats>>()
             );
 
             if !conn.is_established() {
@@ -673,10 +675,10 @@ pub fn create_sockets(
 /// Generate a ordered list of 4-tuples on which the host should send packets,
 /// following a lowest-latency scheduling.
 pub fn lowest_latency_scheduler(
-    conn: &quiche::Connection,
+    conn_paths: &quiche::path::PathMap,
 ) -> impl Iterator<Item = (std::net::SocketAddr, std::net::SocketAddr)> {
     use itertools::Itertools;
-    conn.path_stats()
+    conn_paths.iter().map(|(_, p)| p.stats())
         .filter(|p| !matches!(p.state, quiche::PathState::Closed(_, _)))
         .sorted_by_key(|p| p.rtt)
         .map(|p| (p.local_addr, p.peer_addr))
