@@ -3098,7 +3098,7 @@ impl Connection {
         }
 
         // Update send capacity.
-        self.update_tx_cap(paths);
+        self.update_tx_cap(paths.get_cwin_available());
 
         self.recv_count += 1;
         paths.get_mut(recv_pid)?.recv_count += 1;
@@ -3307,7 +3307,7 @@ impl Connection {
 
         // Limit output packet size to respect the sender and receiver's
         // maximum UDP payload size limit.
-        let mut left = cmp::min(out.len(), self.max_send_udp_payload_size(paths));
+        let mut left = cmp::min(out.len(), self.max_send_udp_payload_size(paths.get_max_datagram_size()));
 
         let send_pid = match (from, to) {
             (Some(f), Some(t)) => paths
@@ -4703,6 +4703,7 @@ impl Connection {
         Ok((pkt_type, written))
     }
 
+    /*
     /// Returns the size of the send quantum, in bytes.
     ///
     /// This represents the maximum size of a packet burst as determined by the
@@ -4717,8 +4718,9 @@ impl Connection {
             Ok(p) => p.recovery.send_quantum(),
             _ => 0,
         }
-    }
+    }*/
 
+    /*
     /// Returns the size of the send quantum over the given 4-tuple, in bytes.
     ///
     /// This represents the maximum size of a packet burst as determined by the
@@ -4738,7 +4740,7 @@ impl Connection {
             .and_then(|pid| paths.get(pid).ok())
             .map(|path| path.recovery.send_quantum())
             .unwrap_or(0)
-    }
+    }*/
 
     /// Reads contiguous data from a stream into the provided slice.
     ///
@@ -5158,11 +5160,10 @@ impl Connection {
                 // buffered but not actually sent before the stream was reset.
                 self.tx_data = self.tx_data.saturating_sub(unsent);
 
-                self.tx_buffered =
-                    self.tx_buffered.saturating_sub(unsent as usize);
+                self.tx_buffered = self.tx_buffered.saturating_sub(unsent as usize);
 
                 // Update send capacity.
-                self.update_tx_cap(paths);
+                self.update_tx_cap(paths.get_cwin_available());
 
                 self.streams.insert_reset(stream_id, err, final_size);
 
@@ -5475,12 +5476,7 @@ impl Connection {
     /// [`set_max_send_udp_payload_size()`]:
     ///     struct.Config.html#method.set_max_send_udp_payload_size
     /// [`send()`]: struct.Connection.html#method.send
-    pub fn max_send_udp_payload_size(&self, paths: &mut path::PathMap) -> usize {
-        let max_datagram_size = paths
-            .get_active()
-            .ok()
-            .map(|p| p.recovery.max_datagram_size());
-
+    pub fn max_send_udp_payload_size(&self, max_datagram_size: Option<usize>) -> usize {
         if let Some(max_datagram_size) = max_datagram_size {
             if self.is_established() {
                 // We cap the maximum packet size to 16KB or so, so that it can be
@@ -5788,7 +5784,7 @@ impl Connection {
             Some(peer_frame_len) => {
                 let dcid = self.destination_id(paths);
                 // Start from the maximum packet size...
-                let mut max_len = self.max_send_udp_payload_size(paths);
+                let mut max_len = self.max_send_udp_payload_size(paths.get_max_datagram_size());
                 // ...subtract the Short packet header overhead...
                 // (1 byte of pkt_len + len of dcid)
                 max_len = max_len.saturating_sub(1 + dcid.len());
@@ -6169,7 +6165,7 @@ impl Connection {
         paths.request(pid, request)?;
 
         // After any path state change, check for the transmission rate.
-        self.update_tx_cap(paths);
+        self.update_tx_cap(paths.get_cwin_available());
 
         Ok(())
     }
@@ -6194,7 +6190,7 @@ impl Connection {
         paths.request(pid, path::PathRequest::Abandon(err_code, reason))?;
 
         // After any path state change, check for the transmission rate.
-        self.update_tx_cap(paths);
+        self.update_tx_cap(paths.get_cwin_available());
 
         Ok(())
     }
@@ -6831,7 +6827,8 @@ impl Connection {
         self.max_tx_data = peer_params.initial_max_data;
 
         // Update send capacity.
-        self.update_tx_cap(paths);
+        
+        self.update_tx_cap(paths.get_cwin_available());
 
         self.streams
             .update_peer_max_streams_bidi(peer_params.initial_max_streams_bidi);
@@ -7724,8 +7721,7 @@ impl Connection {
 
         let handshake_status = self.handshake_status();
         for (_, p) in paths.iter_mut() {
-            p.recovery
-                .on_pkt_num_space_discarded(epoch, handshake_status, now);
+            p.recovery.on_pkt_num_space_discarded(epoch, handshake_status, now);
         }
 
         trace!("{} dropped epoch {} state", self.trace_id, epoch);
@@ -7802,13 +7798,13 @@ impl Connection {
     }
 
     /// Updates send capacity.
-    fn update_tx_cap(&mut self, paths: &mut path::PathMap) {
-        let cwin_available = paths
+    fn update_tx_cap(&mut self, cwin_available: usize) {
+        /*let cwin_available = paths
             .iter()
             .filter(|(_, p)| p.active())
             .map(|(_, p)| p.recovery.cwnd_available())
             .filter(|cwnd| *cwnd != std::usize::MAX)
-            .sum();
+            .sum(); */
         self.tx_cap = cmp::min(
             cwin_available,
             (self.max_tx_data - self.tx_data)

@@ -334,7 +334,6 @@ fn send_h3_dgram(
 
     conn.dgram_send(conn_paths, &d)
 }
-
 pub trait HttpConn {
     fn send_requests(
         &mut self, conn: &mut quiche::Connection, conn_paths: &mut quiche::path::PathMap, target_path: &Option<String>,

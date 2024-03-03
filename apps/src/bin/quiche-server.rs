@@ -479,7 +479,7 @@ fn main() {
 
                 // Update max_datagram_size after connection established.
                 client.max_datagram_size =
-                    client.conn.max_send_udp_payload_size(&mut client.conn_paths);
+                    client.conn.max_send_udp_payload_size(client.conn_paths.get_max_datagram_size());
             }
 
             if client.http_conn.is_some() {
@@ -548,7 +548,7 @@ fn main() {
             }
 
             let max_send_burst =
-                client.conn.send_quantum(&mut client.conn_paths).min(client.max_send_burst) /
+                    client.conn_paths.send_quantum().min(client.max_send_burst) /
                     client.max_datagram_size *
                     client.max_datagram_size;
             let mut total_write = 0;

@@ -765,6 +765,32 @@ impl PathMap {
             .ok_or(Error::InvalidState)
     }
 
+    #[inline]
+    pub fn send_quantum(&self) -> usize {
+        match self.get_active() {
+            Ok(p) => p.recovery.send_quantum(),
+            _ => 0,
+        }
+    }
+
+    #[inline]
+    pub fn get_max_datagram_size(&self) -> Option<usize>{
+        self
+            .get_active()
+            .ok()
+            .map(|p| p.recovery.max_datagram_size())
+    }
+
+    #[inline]
+    pub fn get_cwin_available(&self) -> usize {
+        self
+            .iter()
+            .filter(|(_, p)| p.active())
+            .map(|(_, p)| p.recovery.cwnd_available())
+            .filter(|cwnd| *cwnd != std::usize::MAX)
+            .sum()
+    }
+
     /// Gets an mutable reference to the active path with the lowest identifier.
     /// If there is no active path, returns an [`InvalidState`].
     ///
