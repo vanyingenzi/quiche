@@ -55,14 +55,14 @@ use quiche::ConnectionId;
 use ring::rand::*;
 use std::sync::{Arc, Mutex};
 
-const MAX_BUF_SIZE: usize = 65507;
+const MAX_BUF_SIZE: usize = 65507 * 2;
 const MAX_DATAGRAM_SIZE: usize = 1350;
 
-fn rwlock_exp_backoff(rwlock: &Arc<RwLock<bool>>){
+fn rwlock_exp_backoff(rwlock: &Arc<RwLock<bool>>)  {
     let mut wait_duration = Duration::from_nanos(1);
     while !*rwlock.read().unwrap() {
         std::thread::sleep(wait_duration);
-        wait_duration = if wait_duration.as_millis() < 1 {
+        wait_duration = if wait_duration < Duration::from_micros(1) {
             wait_duration * 2
         } else {
             Duration::from_nanos(1)
@@ -71,67 +71,76 @@ fn rwlock_exp_backoff(rwlock: &Arc<RwLock<bool>>){
     *rwlock.write().unwrap() = false;
 }
 
+#[inline]
 pub fn read_packets_on_socket(
-    socket: &UdpSocket, events: &Events, conn: &mut Connection, paths: &mut quiche::path::PathMap,
-    pkt_count: &mut u64, dump_packet_path: &Option<String>, buf: &mut [u8],
+    socket: &UdpSocket, events: &Events, quiche_conn: &Arc<Mutex<(Connection, quiche::path::PathMap)>>,
+    pkt_count: &mut u64, dump_packet_path: &Option<String>, buf: &mut [u8], local_addr: SocketAddr, peer_addr: SocketAddr
 ) -> Result<(), ClientError> {
-    let local_addr = socket.local_addr().unwrap();
-    for event in events {
-        match event.token() {
-            _ => {
-                // As there's only one socket listen per thread
-                if event.is_readable() {
-                    'read: loop {
-                        let (len, from) = match socket.recv_from(buf) {
-                            Ok(v) => v,
+    let mut offset_buf = vec![(0, 0); 64];
+    let mut count = 0;
+    let mut offset = 0;
+    'events: for event in events {
+        if event.is_readable() {
+            'read: loop {
+                let (len, from) = match socket.recv_from(&mut buf[offset..]) {
+                    Ok(v) => v,
 
-                            Err(e) => {
-                                // There are no more UDP packets to read on this socket.
-                                // Process subsequent events.
-                                if e.kind() == std::io::ErrorKind::WouldBlock {
-                                    trace!("{}: recv() would block", local_addr);
-                                    break 'read;
-                                }
-
-                                return Err(ClientError::Other(format!(
-                                    "{local_addr}: recv() failed: {e:?}"
-                                )));
-                            },
-                        };
-
-                        trace!("{}: got {} bytes", local_addr, len);
-
-                        if let Some(target_path) = dump_packet_path.as_ref() {
-                            let path = format!("{target_path}/{pkt_count}.pkt");
-
-                            if let Ok(f) = std::fs::File::create(path) {
-                                let mut f = std::io::BufWriter::new(f);
-                                f.write_all(&buf[..len]).ok();
-                            }
+                    Err(e) => {
+                        // There are no more UDP packets to read on this socket.
+                        // Process subsequent events.
+                        if e.kind() == std::io::ErrorKind::WouldBlock {
+                            trace!("{}: recv() would block", local_addr);
+                            break 'read;
                         }
+                        
+                        return Err(ClientError::Other(format!(
+                            "{local_addr}: recv() failed: {e:?}"
+                        )));
+                    },
+                };
 
-                        *pkt_count += 1;
+                trace!("{}: got {} bytes", local_addr, len);
+                
+                if let Some(target_path) = dump_packet_path.as_ref() {
+                    let path = format!("{target_path}/{pkt_count}.pkt");
 
-                        let recv_info = quiche::RecvInfo {
-                            to: local_addr,
-                            from,
-                        };
-
-                        // Process potentially coalesced packets.
-                        let read = match conn.recv(paths, &mut buf[..len], recv_info) {
-                            Ok(v) => v,
-
-                            Err(e) => {
-                                error!("{}: recv failed: {:?}", local_addr, e);
-                                continue 'read;
-                            },
-                        };
-
-                        trace!("{}: processed {} bytes", local_addr, read);
+                    if let Ok(f) = std::fs::File::create(path) {
+                        let mut f = std::io::BufWriter::new(f);
+                        f.write_all(&buf[..len]).ok();
                     }
                 }
-            },
+
+                *pkt_count += 1;
+                
+                if from == peer_addr {
+                    offset_buf[count] = (offset, len);
+                    count += 1;
+                }
+
+                offset += len;
+                if count == 64 {
+                    break 'events;
+                }
+            }
         }
+    }
+
+    let (ref mut conn, ref mut conn_paths) = *quiche_conn.lock().unwrap();
+    for i in 0..count {
+        let (offset, len) = offset_buf[i];
+        // Process potentially coalesced packets.
+        let read = match conn.recv(conn_paths, &mut buf[offset..(offset+len)], quiche::RecvInfo {
+            to: local_addr,
+            from: peer_addr,
+        }) {
+            Ok(v) => v,
+    
+            Err(e) => {
+                error!("{}: recv failed: {:?}", local_addr, e);
+                0
+            },
+        };
+        trace!("{}: processed {} bytes", local_addr, read);
     }
     Ok(())
 }
@@ -146,7 +155,6 @@ pub fn write_packets_on_path(
                 Ok(v) => v,
 
                 Err(quiche::Error::Done) => {
-                    trace!("{} -> {}: done writing", local_addr, peer_addr);
                     break;
                 },
 
@@ -223,7 +231,6 @@ fn can_send_on_path(paths: &quiche::path::PathMap, local_addr: SocketAddr, peer_
 
 fn client_thread(
     quiche_conn: Arc<Mutex<(Connection, quiche::path::PathMap)>>,
-    app_proto_selected_guard: Arc<RwLock<bool>>,
     dump_packet_path: Option<String>,
     addrs: (SocketAddr, SocketAddr), 
     initiate_connection: bool,
@@ -238,6 +245,7 @@ fn client_thread(
     let mut events = mio::Events::with_capacity(1024);
     let (local_addr, peer_addr) = addrs;
     let mut socket = multicore_create_socket((&local_addr, &peer_addr), &mut poll);
+
     if initiate_connection {
         let (ref mut conn, ref mut conn_paths) = *quiche_conn.lock().unwrap();
         multicore_initiate_connection(&peer_addr, &local_addr, &mut out, &scid, conn, conn_paths, &mut socket)?;
@@ -245,9 +253,6 @@ fn client_thread(
     } else {
         while !*sent_conn_init_pkt.read().unwrap() {}
     }
-
-    let mut conn_is_in_early_data;
-    let mut app_proto_selected;
 
     debug!(
         "[Path Thread]: Thread {:?}, started with path {} <-> {}",
@@ -257,23 +262,22 @@ fn client_thread(
     );
 
     let mut can_send = initiate_connection; // Initial path can send
+    let mut conn_closed= false;
+    let mut timeout ;
 
     loop {
-        poll.poll(&mut events, Some(Duration::ZERO)).unwrap();
-
-        if events.is_empty() {
+        {
             let (ref mut conn, ref mut conn_paths) = *quiche_conn.lock().unwrap();
-            app_proto_selected = *app_proto_selected_guard.read().unwrap();
-            conn_is_in_early_data = conn.is_in_early_data(); // Check stage of the connection
-            if !conn_is_in_early_data || app_proto_selected {
-                conn.on_timeout(conn_paths);
-            }
+            timeout = conn.path_timeout(conn_paths, local_addr, peer_addr);
         }
 
-        // Reading from socket critical section
-        if !events.is_empty() {
-            let (ref mut conn, ref mut conn_paths) = *quiche_conn.lock().unwrap();
-            read_packets_on_socket(&socket, &events, conn, conn_paths, &mut pkt_count, &dump_packet_path, &mut buf)?;
+        poll.poll(&mut events, timeout).unwrap();
+
+        if events.is_empty() {
+            let (ref mut conn, _) = *quiche_conn.lock().unwrap();
+            conn_closed = conn.is_closed();
+        } else {
+            read_packets_on_socket(&socket, &events, &quiche_conn, &mut pkt_count, &dump_packet_path, &mut buf, local_addr, peer_addr)?;
             if !*main_thread_advance_lock.read().unwrap(){
                 *main_thread_advance_lock.write().unwrap() = true;
             }
@@ -283,22 +287,22 @@ fn client_thread(
         if can_send {
             let (ref mut conn, ref mut conn_paths) = *quiche_conn.lock().unwrap();
             write_packets_on_path(&local_addr, &peer_addr, &socket, conn, conn_paths, &mut out).ok();
+            conn_closed = conn.is_closed();
         } else {
             let (_, ref conn_paths) = *quiche_conn.lock().unwrap();
-            can_send = can_send_on_path(conn_paths, local_addr, peer_addr)
+            can_send = can_send_on_path(conn_paths, local_addr, peer_addr);
         }
 
-        {
-            let (ref mut conn, _) = *quiche_conn.lock().unwrap();
-            if conn.is_closed() {
-                break;
-            }
+        if conn_closed {
+            break;
         }
     }
+
     if !*main_thread_advance_lock.read().unwrap(){
         *main_thread_advance_lock.write().unwrap() = true;
     }
-    debug!("[Path Thread]: Thread {:?}, Done", thread::current().id());
+
+    info!("[Path Thread]: Thread {:?}, Done", thread::current().id());
     Ok(())
 }
 
@@ -474,13 +478,12 @@ pub fn multicore_connect(
 
     for (local, peer) in sockets_addrs.clone() {
         let conn_cloned = conn_guard.clone();
-        let app_proto_selected = app_proto_selected_guard.clone();
         // HTTPConn doesn't implement Send therefore can't be used in a Mutex
         let dump_packet_path = conn_args.dump_packet_path.clone();
         let clone_scid = scid.clone();
         let clone_sent_conn_init_packet = sent_connection_initial_packet.clone();
-        let core_id = core_ids[current_path_thread_idx];
         let main_thread_advance_lock = main_thread_advance.clone();
+        let core_id = core_ids[current_path_thread_idx % core_ids.len()];
         thread::spawn(move || {
             if core_affinity::set_for_current(core_id) {
                 debug!("Set core affinity for {:?}", thread::current().id());
@@ -493,7 +496,6 @@ pub fn multicore_connect(
             );
             client_thread(
                 conn_cloned,
-                app_proto_selected,
                 dump_packet_path,
                 (local, peer),
                 local == local_addr,
@@ -517,6 +519,7 @@ pub fn multicore_connect(
 
     loop {
         rwlock_exp_backoff(&main_thread_advance);
+
         {
             let (ref mut conn, ref mut conn_paths) = *conn_guard.lock().unwrap();
             if conn.is_closed() {

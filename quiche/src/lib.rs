@@ -481,7 +481,7 @@ const CONNECTION_WINDOW_FACTOR: f64 = 1.5;
 
 // How many probing packet timeouts do we tolerate before considering the path
 // validation as failed.
-const MAX_PROBING_TIMEOUTS: usize = 3; // ! Vany Ingenzi increased this to accomodate scheduling issues in multicore
+const MAX_PROBING_TIMEOUTS: usize = 3;
 
 // The default initial congestion window size in terms of packet count.
 const DEFAULT_INITIAL_CONGESTION_WINDOW_PACKETS: usize = 10;
@@ -5562,6 +5562,7 @@ impl Connection {
         match self.dgram_recv_queue.pop() {
             Some(d) => {
                 if d.len() > buf.len() {
+                    info!("Datagram rcv");
                     return Err(Error::BufferTooShort);
                 }
 
@@ -5688,6 +5689,7 @@ impl Connection {
         };
 
         if buf.len() > max_payload_len {
+            info!("Max payload len");
             return Err(Error::BufferTooShort);
         }
 
@@ -5718,6 +5720,7 @@ impl Connection {
         };
 
         if buf.len() > max_payload_len {
+            info!("Max payload len");
             return Err(Error::BufferTooShort);
         }
 
