@@ -57,18 +57,21 @@ use std::sync::{Arc, Mutex};
 
 const MAX_BUF_SIZE: usize = 65507 * 2;
 const MAX_DATAGRAM_SIZE: usize = 1350;
+const MAX_OFFSET: usize = MAX_BUF_SIZE / MAX_DATAGRAM_SIZE;
 
-fn rwlock_exp_backoff(rwlock: &Arc<RwLock<bool>>)  {
+fn rwlock_exp_backoff(rwlock: &Arc<RwLock<bool>>, max_duration: Duration) -> bool{
     let mut wait_duration = Duration::from_nanos(1);
     while !*rwlock.read().unwrap() {
         std::thread::sleep(wait_duration);
-        wait_duration = if wait_duration < Duration::from_micros(1) {
-            wait_duration * 2
+        wait_duration = if wait_duration < max_duration {
+            *rwlock.write().unwrap() = false;
+            return false;
         } else {
             Duration::from_nanos(1)
         };
     }
     *rwlock.write().unwrap() = false;
+    true
 }
 
 #[inline]
@@ -76,7 +79,7 @@ pub fn read_packets_on_socket(
     socket: &UdpSocket, events: &Events, quiche_conn: &Arc<Mutex<(Connection, quiche::path::PathMap)>>,
     pkt_count: &mut u64, dump_packet_path: &Option<String>, buf: &mut [u8], local_addr: SocketAddr, peer_addr: SocketAddr
 ) -> Result<(), ClientError> {
-    let mut offset_buf = vec![(0, 0); 64];
+    let mut offset_buf = vec![(0, 0); MAX_OFFSET];
     let mut count = 0;
     let mut offset = 0;
     'events: for event in events {
@@ -106,19 +109,18 @@ pub fn read_packets_on_socket(
 
                     if let Ok(f) = std::fs::File::create(path) {
                         let mut f = std::io::BufWriter::new(f);
-                        f.write_all(&buf[..len]).ok();
+                        f.write_all(&buf[offset..len]).ok();
                     }
                 }
 
                 *pkt_count += 1;
-                
                 if from == peer_addr {
                     offset_buf[count] = (offset, len);
                     count += 1;
                 }
 
                 offset += len;
-                if count == 64 {
+                if MAX_BUF_SIZE - offset < MAX_DATAGRAM_SIZE || count == offset_buf.len() {
                     break 'events;
                 }
             }
@@ -128,7 +130,6 @@ pub fn read_packets_on_socket(
     let (ref mut conn, ref mut conn_paths) = *quiche_conn.lock().unwrap();
     for i in 0..count {
         let (offset, len) = offset_buf[i];
-        // Process potentially coalesced packets.
         let read = match conn.recv(conn_paths, &mut buf[offset..(offset+len)], quiche::RecvInfo {
             to: local_addr,
             from: peer_addr,
@@ -155,6 +156,7 @@ pub fn write_packets_on_path(
                 Ok(v) => v,
 
                 Err(quiche::Error::Done) => {
+                    trace!("{} -> {}: done writing", local_addr, peer_addr);
                     break;
                 },
 
@@ -245,7 +247,6 @@ fn client_thread(
     let mut events = mio::Events::with_capacity(1024);
     let (local_addr, peer_addr) = addrs;
     let mut socket = multicore_create_socket((&local_addr, &peer_addr), &mut poll);
-
     if initiate_connection {
         let (ref mut conn, ref mut conn_paths) = *quiche_conn.lock().unwrap();
         multicore_initiate_connection(&peer_addr, &local_addr, &mut out, &scid, conn, conn_paths, &mut socket)?;
@@ -262,22 +263,21 @@ fn client_thread(
     );
 
     let mut can_send = initiate_connection; // Initial path can send
-    let mut conn_closed= false;
-    let mut timeout ;
-
+    let mut local_timeout = Duration::from_nanos(1);
     loop {
-        {
-            let (ref mut conn, ref mut conn_paths) = *quiche_conn.lock().unwrap();
-            timeout = conn.path_timeout(conn_paths, local_addr, peer_addr);
-        }
-
-        poll.poll(&mut events, timeout).unwrap();
+        poll.poll(&mut events, Some(local_timeout)).unwrap();
 
         if events.is_empty() {
-            let (ref mut conn, _) = *quiche_conn.lock().unwrap();
-            conn_closed = conn.is_closed();
-        } else {
-            read_packets_on_socket(&socket, &events, &quiche_conn, &mut pkt_count, &dump_packet_path, &mut buf, local_addr, peer_addr)?;
+            local_timeout = if local_timeout < Duration::from_millis(1) {
+                local_timeout * 2
+            } else {
+                Duration::from_nanos(1)
+            };
+        }
+
+        // Reading from socket critical section
+        if !events.is_empty() {
+            read_packets_on_socket(&socket, &events,&quiche_conn, &mut pkt_count, &dump_packet_path, &mut buf, local_addr, peer_addr)?;
             if !*main_thread_advance_lock.read().unwrap(){
                 *main_thread_advance_lock.write().unwrap() = true;
             }
@@ -287,22 +287,22 @@ fn client_thread(
         if can_send {
             let (ref mut conn, ref mut conn_paths) = *quiche_conn.lock().unwrap();
             write_packets_on_path(&local_addr, &peer_addr, &socket, conn, conn_paths, &mut out).ok();
-            conn_closed = conn.is_closed();
         } else {
             let (_, ref conn_paths) = *quiche_conn.lock().unwrap();
-            can_send = can_send_on_path(conn_paths, local_addr, peer_addr);
+            can_send = can_send_on_path(conn_paths, local_addr, peer_addr)
         }
 
-        if conn_closed {
-            break;
+        {
+            let (ref mut conn, _) = *quiche_conn.lock().unwrap();
+            if conn.is_closed() {
+                break;
+            }
         }
     }
-
     if !*main_thread_advance_lock.read().unwrap(){
         *main_thread_advance_lock.write().unwrap() = true;
     }
-
-    info!("[Path Thread]: Thread {:?}, Done", thread::current().id());
+    debug!("[Path Thread]: Thread {:?}, Done", thread::current().id());
     Ok(())
 }
 
@@ -468,9 +468,8 @@ pub fn multicore_connect(
     }
 
     let conn_guard = Arc::new(Mutex::new((conn, conn_paths)));
-    let app_proto_selected_guard = Arc::new(RwLock::new(false));
     let sent_connection_initial_packet = Arc::new(RwLock::new(false));
-
+    
     let main_thread_advance = Arc::new(RwLock::new(false));
 
     let core_ids = core_affinity::get_core_ids().unwrap();
@@ -482,8 +481,8 @@ pub fn multicore_connect(
         let dump_packet_path = conn_args.dump_packet_path.clone();
         let clone_scid = scid.clone();
         let clone_sent_conn_init_packet = sent_connection_initial_packet.clone();
+        let core_id = core_ids[current_path_thread_idx];
         let main_thread_advance_lock = main_thread_advance.clone();
-        let core_id = core_ids[current_path_thread_idx % core_ids.len()];
         thread::spawn(move || {
             if core_affinity::set_for_current(core_id) {
                 debug!("Set core affinity for {:?}", thread::current().id());
@@ -510,16 +509,26 @@ pub fn multicore_connect(
 
     while !*sent_connection_initial_packet.read().unwrap() {
     }
-
+    
     let mut new_path_probed = false;
     let mut probed_paths = 0;
     let app_data_start = std::time::Instant::now();
     let mut scid_sent = false;
     let mut migrated = false;
-
+    let mut app_proto_selected = false;
+    let mut conn_timeout;
+    
     loop {
-        rwlock_exp_backoff(&main_thread_advance);
-
+        {
+            let (ref mut conn, ref mut conn_paths) = *conn_guard.lock().unwrap();
+            conn_timeout = conn.timeout(conn_paths).unwrap_or(Duration::ZERO);
+        }
+        if !rwlock_exp_backoff(&main_thread_advance, conn_timeout){
+            let (ref mut conn, ref mut conn_paths) = *conn_guard.lock().unwrap();
+            trace!("timed out");
+            conn.on_timeout(conn_paths);
+        }
+        
         {
             let (ref mut conn, ref mut conn_paths) = *conn_guard.lock().unwrap();
             if conn.is_closed() {
@@ -553,7 +562,6 @@ pub fn multicore_connect(
                 break;
             }
 
-            let app_proto_selected = *app_proto_selected_guard.read().unwrap();
             // Create a new application protocol session once the QUIC connection is
             // established.
             if (conn.is_established() || conn.is_in_early_data())
@@ -577,7 +585,7 @@ pub fn multicore_connect(
                         Rc::clone(&output_sink),
                     ));
 
-                    *app_proto_selected_guard.write().unwrap() = true;
+                    app_proto_selected = true;
                 } else if alpns::HTTP_3.contains(&app_proto) {
                     let dgram_sender = if conn_args.dgrams_enabled {
                         Some(Http3DgramSender::new(
@@ -605,7 +613,7 @@ pub fn multicore_connect(
                         Rc::clone(&output_sink),
                     ));
 
-                    *app_proto_selected_guard.write().unwrap() = true;
+                    app_proto_selected = true;
                 }
             }
 

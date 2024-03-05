@@ -2309,7 +2309,7 @@ impl Connection {
                 stream::State::Drain => {
                     // Discard incoming data on the stream.
                     conn.stream_shutdown(
-                        paths,
+                        paths.get_cwin_available(),
                         stream_id,
                         crate::Shutdown::Read,
                         0x100,
@@ -4243,11 +4243,11 @@ mod tests {
 
         s.pipe
             .client
-            .stream_shutdown(&mut s.pipe.client_paths, stream, crate::Shutdown::Write, 0x100)
+            .stream_shutdown(s.pipe.client_paths.get_cwin_available(), stream, crate::Shutdown::Write, 0x100)
             .unwrap();
         s.pipe
             .client
-            .stream_shutdown(&mut s.pipe.client_paths, stream, crate::Shutdown::Read, 0x100)
+            .stream_shutdown(s.pipe.client_paths.get_cwin_available(), stream, crate::Shutdown::Read, 0x100)
             .unwrap();
 
         s.advance().ok();
@@ -6165,7 +6165,7 @@ mod tests {
 
         // ..then Client sends RESET_STREAM
         assert_eq!(
-            s.pipe.client.stream_shutdown(&mut s.pipe.client_paths, 0, crate::Shutdown::Write, 0),
+            s.pipe.client.stream_shutdown(s.pipe.client_paths.get_cwin_available(), 0, crate::Shutdown::Write, 0),
             Ok(())
         );
 
@@ -6180,7 +6180,7 @@ mod tests {
 
         // ..then Client sends RESET_STREAM
         assert_eq!(
-            s.pipe.client.stream_shutdown(&mut s.pipe.client_paths, 4, crate::Shutdown::Write, 0),
+            s.pipe.client.stream_shutdown(s.pipe.client_paths.get_cwin_available(), 4, crate::Shutdown::Write, 0),
             Ok(())
         );
 
@@ -6222,7 +6222,7 @@ mod tests {
         assert_eq!(
             s.pipe
                 .server
-                .stream_shutdown(&mut s.pipe.server_paths, stream, crate::Shutdown::Write, 0),
+                .stream_shutdown(s.pipe.server_paths.get_cwin_available(), stream, crate::Shutdown::Write, 0),
             Ok(())
         );
 

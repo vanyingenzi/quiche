@@ -1412,7 +1412,7 @@ impl HttpConn for Http3Conn {
                     // stop reading the request stream so that any body
                     // is ignored and pointless Data events are not
                     // generated.
-                    conn.stream_shutdown(conn_paths, stream_id, quiche::Shutdown::Read, 0)
+                    conn.stream_shutdown(conn_paths.get_cwin_available(), stream_id, quiche::Shutdown::Read, 0)
                         .unwrap();
 
                     let (mut headers, body, mut priority) =
@@ -1421,7 +1421,7 @@ impl HttpConn for Http3Conn {
 
                             Err((error_code, _)) => {
                                 conn.stream_shutdown(
-                                    conn_paths,
+                                    conn_paths.get_cwin_available(),
                                     stream_id,
                                     quiche::Shutdown::Write,
                                     error_code,

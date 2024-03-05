@@ -481,7 +481,7 @@ const CONNECTION_WINDOW_FACTOR: f64 = 1.5;
 
 // How many probing packet timeouts do we tolerate before considering the path
 // validation as failed.
-const MAX_PROBING_TIMEOUTS: usize = 3;
+const MAX_PROBING_TIMEOUTS: usize = 5; // TODO push back to 3
 
 // The default initial congestion window size in terms of packet count.
 const DEFAULT_INITIAL_CONGESTION_WINDOW_PACKETS: usize = 10;
@@ -5118,7 +5118,7 @@ impl Connection {
     /// [`stream_send()`]: struct.Connection.html#method.stream_send
     /// [`InvalidStreamState`]: enum.Error.html#variant.InvalidStreamState
     pub fn stream_shutdown(
-        &mut self, paths: &mut path::PathMap, stream_id: u64, direction: Shutdown, err: u64,
+        &mut self, cwin_available: usize, stream_id: u64, direction: Shutdown, err: u64,
     ) -> Result<()> {
         // Don't try to stop a local unidirectional stream.
         if direction == Shutdown::Read &&
@@ -5163,7 +5163,7 @@ impl Connection {
                 self.tx_buffered = self.tx_buffered.saturating_sub(unsent as usize);
 
                 // Update send capacity.
-                self.update_tx_cap(paths.get_cwin_available());
+                self.update_tx_cap(cwin_available);
 
                 self.streams.insert_reset(stream_id, err, final_size);
 
@@ -5837,8 +5837,7 @@ impl Connection {
             // detection timers. If they are both unset (i.e. `None`) then the
             // result is `None`, but if at least one of them is set then a
             // `Some(...)` value is returned.
-            let path_timer =
-                paths.iter().filter_map(|(_, p)| p.path_timer()).min();
+            let path_timer = paths.iter().filter_map(|(_, p)| p.path_timer()).min();
             let key_update_timer = self
                 .pkt_num_spaces
                 .crypto
@@ -10462,7 +10461,7 @@ mod tests {
         assert_eq!(pipe.client.stream_send(8, b"aaaaa", true), Ok(5));
 
         // Server shuts down one stream.
-        assert_eq!(pipe.server.stream_shutdown(&mut pipe.server_paths, 4, Shutdown::Read, 42), Ok(()));
+        assert_eq!(pipe.server.stream_shutdown(pipe.server_paths.get_cwin_available(), 4, Shutdown::Read, 42), Ok(()));
 
         let mut r = pipe.server.readable();
         assert_eq!(r.next(), None);
@@ -10761,7 +10760,7 @@ mod tests {
 
         // Client resets the stream.
         pipe.client
-            .stream_shutdown(&mut pipe.client_paths, 0, Shutdown::Write, 1001)
+            .stream_shutdown(pipe.client_paths.get_cwin_available(), 0, Shutdown::Write, 1001)
             .unwrap();
         pipe.advance().unwrap();
 
@@ -10784,7 +10783,7 @@ mod tests {
 
         // Server resets the stream in reaction.
         pipe.server
-            .stream_shutdown(&mut pipe.server_paths, 0, Shutdown::Write, 1001)
+            .stream_shutdown(pipe.server_paths.get_cwin_available(), 0, Shutdown::Write, 1001)
             .unwrap();
         pipe.advance().unwrap();
 
@@ -10792,10 +10791,10 @@ mod tests {
 
         // Repeat for the other 2 streams
         pipe.client
-            .stream_shutdown(&mut pipe.client_paths, 4, Shutdown::Write, 1001)
+            .stream_shutdown(pipe.client_paths.get_cwin_available(), 4, Shutdown::Write, 1001)
             .unwrap();
         pipe.client
-            .stream_shutdown(&mut pipe.client_paths, 8, Shutdown::Write, 1001)
+            .stream_shutdown(pipe.client_paths.get_cwin_available(), 8, Shutdown::Write, 1001)
             .unwrap();
         pipe.advance().unwrap();
 
@@ -10818,10 +10817,10 @@ mod tests {
         assert_eq!(None, r.next());
 
         pipe.server
-            .stream_shutdown(&mut pipe.server_paths, 4, Shutdown::Write, 1001)
+            .stream_shutdown(pipe.server_paths.get_cwin_available(), 4, Shutdown::Write, 1001)
             .unwrap();
         pipe.server
-            .stream_shutdown(&mut pipe.server_paths, 8, Shutdown::Write, 1001)
+            .stream_shutdown(pipe.server_paths.get_cwin_available(), 8, Shutdown::Write, 1001)
             .unwrap();
         pipe.advance().unwrap();
 
@@ -11525,7 +11524,7 @@ mod tests {
         assert_eq!(pipe.server.streams.len(), 1);
 
         // Server shuts down stream.
-        assert_eq!(pipe.server.stream_shutdown(&mut pipe.server_paths, 4, Shutdown::Read, 42), Ok(()));
+        assert_eq!(pipe.server.stream_shutdown(pipe.server_paths.get_cwin_available(), 4, Shutdown::Read, 42), Ok(()));
 
         let mut r = pipe.server.readable();
         assert_eq!(r.next(), None);
@@ -11577,7 +11576,7 @@ mod tests {
         assert_eq!(pipe.server.streams.len(), 0);
 
         assert_eq!(
-            pipe.server.stream_shutdown(&mut pipe.server_paths, 4, Shutdown::Read, 0),
+            pipe.server.stream_shutdown(pipe.server_paths.get_cwin_available(), 4, Shutdown::Read, 0),
             Err(Error::Done)
         );
     }
@@ -11601,7 +11600,7 @@ mod tests {
         assert_eq!(pipe.server.streams.len(), 1);
 
         // Server shuts down stream.
-        assert_eq!(pipe.server.stream_shutdown(&mut pipe.server_paths, 4, Shutdown::Read, 42), Ok(()));
+        assert_eq!(pipe.server.stream_shutdown(pipe.server_paths.get_cwin_available(), 4, Shutdown::Read, 42), Ok(()));
 
         let mut r = pipe.server.readable();
         assert_eq!(r.next(), None);
@@ -11628,7 +11627,7 @@ mod tests {
         assert_eq!(pipe.server.streams.len(), 0);
 
         assert_eq!(
-            pipe.server.stream_shutdown(&mut pipe.server_paths, 4, Shutdown::Read, 0),
+            pipe.server.stream_shutdown(pipe.server_paths.get_cwin_available(), 4, Shutdown::Read, 0),
             Err(Error::Done)
         );
     }
@@ -11660,7 +11659,7 @@ mod tests {
         assert_eq!(pipe.advance(), Ok(()));
 
         assert_eq!(pipe.server.stream_recv(0, &mut buf), Ok((1, false)));
-        assert_eq!(pipe.server.stream_shutdown(&mut pipe.server_paths, 0, Shutdown::Read, 123), Ok(()));
+        assert_eq!(pipe.server.stream_shutdown(pipe.server_paths.get_cwin_available(), 0, Shutdown::Read, 123), Ok(()));
 
         assert_eq!(pipe.server.rx_data, 1);
         assert_eq!(pipe.client.tx_data, 1);
@@ -11693,17 +11692,17 @@ mod tests {
         assert_eq!(pipe.advance(), Ok(()));
 
         // Test local and remote shutdown.
-        assert_eq!(pipe.client.stream_shutdown(&mut pipe.client_paths, 2, Shutdown::Write, 42), Ok(()));
+        assert_eq!(pipe.client.stream_shutdown(pipe.client_paths.get_cwin_available(), 2, Shutdown::Write, 42), Ok(()));
         assert_eq!(
-            pipe.client.stream_shutdown(&mut pipe.client_paths, 2, Shutdown::Read, 42),
+            pipe.client.stream_shutdown(pipe.client_paths.get_cwin_available(), 2, Shutdown::Read, 42),
             Err(Error::InvalidStreamState(2))
         );
 
         assert_eq!(
-            pipe.client.stream_shutdown(&mut pipe.client_paths, 3, Shutdown::Write, 42),
+            pipe.client.stream_shutdown(pipe.client_paths.get_cwin_available(), 3, Shutdown::Write, 42),
             Err(Error::InvalidStreamState(3))
         );
-        assert_eq!(pipe.client.stream_shutdown(&mut pipe.client_paths, 3, Shutdown::Read, 42), Ok(()));
+        assert_eq!(pipe.client.stream_shutdown(pipe.client_paths.get_cwin_available(), 3, Shutdown::Read, 42), Ok(()));
     }
 
     #[test]
@@ -11733,7 +11732,7 @@ mod tests {
         assert_eq!(pipe.advance(), Ok(()));
 
         // Server shuts down stream.
-        assert_eq!(pipe.server.stream_shutdown(&mut pipe.server_paths,4, Shutdown::Write, 42), Ok(()));
+        assert_eq!(pipe.server.stream_shutdown(pipe.server_paths.get_cwin_available(),4, Shutdown::Write, 42), Ok(()));
 
         let mut r = pipe.server.writable();
         assert_eq!(r.next(), None);
@@ -11791,7 +11790,7 @@ mod tests {
         assert_eq!(pipe.server.streams.len(), 0);
 
         assert_eq!(
-            pipe.server.stream_shutdown( &mut pipe.server_paths, 4, Shutdown::Write, 0),
+            pipe.server.stream_shutdown(pipe.server_paths.get_cwin_available(), 4, Shutdown::Write, 0),
             Err(Error::Done)
         );
     }
@@ -11847,7 +11846,7 @@ mod tests {
         assert!(!pipe.client.should_update_max_data());
 
         // Server shuts down stream.
-        assert_eq!(pipe.server.stream_shutdown( &mut pipe.server_paths, 4, Shutdown::Write, 42), Ok(()));
+        assert_eq!(pipe.server.stream_shutdown(pipe.server_paths.get_cwin_available(), 4, Shutdown::Write, 42), Ok(()));
         assert_eq!(pipe.advance(), Ok(()));
 
         // Server can now send more data (on a different stream).
@@ -11969,7 +11968,7 @@ mod tests {
         assert_eq!(r.next(), Some(0));
         assert_eq!(r.next(), None);
 
-        assert_eq!(pipe.server.stream_shutdown( &mut pipe.server_paths,0, Shutdown::Read, 0), Ok(()));
+        assert_eq!(pipe.server.stream_shutdown( pipe.server_paths.get_cwin_available(),0, Shutdown::Read, 0), Ok(()));
 
         let mut r = pipe.server.readable();
         assert_eq!(r.next(), None);
@@ -12037,7 +12036,7 @@ mod tests {
         assert_eq!(w.next(), None);
 
         // Server shuts down stream.
-        assert_eq!(pipe.server.stream_shutdown( &mut pipe.server_paths,0, Shutdown::Write, 0), Ok(()));
+        assert_eq!(pipe.server.stream_shutdown( pipe.server_paths.get_cwin_available(),0, Shutdown::Write, 0), Ok(()));
 
         let mut w = pipe.server.writable();
         assert_eq!(w.next(), None);
@@ -14682,7 +14681,7 @@ mod tests {
         assert!(pipe.server.is_readable());
 
         // Server shuts down stream.
-        assert_eq!(pipe.server.stream_shutdown( &mut pipe.server_paths,4, Shutdown::Read, 0), Ok(()));
+        assert_eq!(pipe.server.stream_shutdown( pipe.server_paths.get_cwin_available(),4, Shutdown::Read, 0), Ok(()));
         assert!(!pipe.server.is_readable());
 
         // Server received dgram.
