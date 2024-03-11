@@ -706,9 +706,8 @@ fn handle_path_events(client: &mut Client, scheduler: &mut Scheduler) {
                                 peer_addr
                             );
                             if client.conn_paths.multipath() {
-                                match client
-                                    .conn
-                                    .set_active(&mut client.conn_paths, local_addr, peer_addr, true)
+                                match client.conn_paths
+                                    .set_active( local_addr, peer_addr, true)
                                     .map_err(|e| error!("cannot set path active: {}", e))
                                     .ok()
                                 {
@@ -762,8 +761,8 @@ fn handle_path_events(client: &mut Client, scheduler: &mut Scheduler) {
                         quiche::PathEvent::PeerPathStatus(addr, path_status) => {
                             info!("Peer asks status {:?} for {:?}", path_status, addr,);
                             client
-                                .conn
-                                .set_path_status(&mut client.conn_paths, addr.0, addr.1, path_status, false)
+                                .conn_paths
+                                .set_path_status( addr.0, addr.1, path_status, false)
                                 .map_err(|e| error!("cannot follow status request: {}", e))
                                 .ok();
                         },

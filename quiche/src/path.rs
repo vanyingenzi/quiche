@@ -34,7 +34,7 @@ use std::net::SocketAddr;
 use smallvec::SmallVec;
 
 use slab::Slab;
-
+use crate::packet;
 use crate::Error;
 use crate::Result;
 
@@ -1087,6 +1087,8 @@ impl PathMap {
         self.multipath = v;
     }
 
+    
+
     /// Changes the state of the path with the identifier `path_id` according to
     /// the provided `PathRequest`.
     ///
@@ -1111,6 +1113,28 @@ impl PathMap {
         Ok(())
     }
 
+    pub fn paths_iter(&self, from: SocketAddr) -> SocketAddrIter {
+        // Instead of trying to identify whether packets will be sent on the
+        // given 4-tuple, simply filter paths that cannot be used.
+        SocketAddrIter {
+            sockaddrs: self
+                .iter()
+                .filter(|(_, p)| p.active_dcid_seq.is_some())
+                .filter(|(_, p)| p.usable() || p.probing_required())
+                .filter(|(_, p)| p.local_addr() == from)
+                .map(|(_, p)| p.peer_addr())
+                .collect(),
+
+            index: 0,
+        }
+    }
+
+    /// Attenion not to be called if the connection is draining or closed
+    pub fn send_ack_eliciting(&mut self) -> Result<()> {
+        self.get_active_mut()?.needs_ack_eliciting = true;
+        Ok(())
+    }
+
     /// Sets the path with identifier 'path_id' to be active.
     ///
     /// When multipath extensions are disabled, there can be exactly one active
@@ -1128,7 +1152,7 @@ impl PathMap {
     /// calling [`request()`] with `PathRequest::Active`.
     ///
     /// [`request()`]: struct.PathManager.html#method.request
-    pub fn set_active_path(&mut self, path_id: usize) -> Result<()> {
+    pub fn set_active_path_from_pid(&mut self, path_id: usize) -> Result<()> {
         let is_server = self.is_server;
         let multipath = self.multipath;
         if !multipath {
@@ -1157,8 +1181,73 @@ impl PathMap {
         Ok(())
     }
 
+    pub fn set_active_path(
+        &mut self, path_id: usize, now: time::Instant, trace_id: &String
+    ) -> Result<(usize, usize)> {
+        let mut lc = 0;
+        let mut lb = 0;
+        if let Ok(old_active_path) = self.get_active_mut() {
+            for &e in packet::Epoch::epochs(
+                packet::Epoch::Initial..=packet::Epoch::Application,
+            ) {
+                let (lost_packets, lost_bytes) = old_active_path
+                    .recovery
+                    .on_path_change(e, now, trace_id);
+
+                lc += lost_packets;
+                lb += lost_bytes;
+            }
+        }
+        self.set_active_path_from_pid(path_id)?;
+        Ok((lc, lb))
+    }
+
+    pub fn set_active(
+        &mut self, local: SocketAddr, peer: SocketAddr, active: bool,
+    ) -> Result<()> {
+        let pid = self
+            .path_id_from_addrs(&(local, peer))
+            .ok_or(Error::Done)?;
+        let request = if active {
+            PathRequest::Active
+        } else {
+            PathRequest::Unused
+        };
+        self.request(pid, request)?;
+        Ok(())
+    }
+
+    pub fn on_peer_migrated(
+        &mut self, new_pid: usize, disable_dcid_reuse: bool, now: time::Instant, trace_id: &String
+    ) -> Result<(usize, usize)> {
+        let active_path_id = self.get_active_path_id()?;
+        let mut lc = 0;
+        let mut lb = 0;
+
+        if active_path_id == new_pid {
+            return Ok((lc, lb));
+        }
+
+        match self.set_active_path(new_pid, now, trace_id) {
+            Ok((lost_packets, lost_bytes)) => {
+                lc += lost_packets;
+                lb += lost_bytes;
+            },
+            Err(_) => return Err(Error::InvalidState)
+        };
+
+        let no_spare_dcid =
+            self.get_mut(new_pid)?.active_dcid_seq.is_none();
+
+        if no_spare_dcid && !disable_dcid_reuse {
+            self.get_mut(new_pid)?.active_dcid_seq = self.get_mut(active_path_id)?.active_dcid_seq;
+        }
+
+        Ok((lc, lb))
+    }
+
     /// Sets the provided `status` on he path identified by `path_id`.
-    pub fn set_path_status(
+    pub fn set_path_status_from_pid(
         &mut self, path_id: usize, status: PathStatus,
     ) -> Result<()> {
         self.get_mut(path_id)?.status = status;
@@ -1174,6 +1263,52 @@ impl PathMap {
             status.into(),
         ));
         self.next_path_status_seq_num += 1;
+        Ok(())
+    }
+
+    pub fn is_path_validated(
+        &self, from: SocketAddr, to: SocketAddr,
+    ) -> Result<bool> {
+        let pid = self
+            .path_id_from_addrs(&(from, to))
+            .ok_or(Error::InvalidState)?;
+
+        Ok(self.get(pid)?.validated())
+    }
+
+    pub fn abandon_path(
+        &mut self, local: SocketAddr, peer: SocketAddr, err_code: u64,
+        reason: Vec<u8>,
+    ) -> Result<()> {
+        let pid = self
+            .path_id_from_addrs(&(local, peer))
+            .ok_or(Error::Done)?;
+        self.request(pid, PathRequest::Abandon(err_code, reason))?;
+
+        Ok(())
+    }
+
+    /// Specifies the status of the path, and advertises it to the peer
+    /// if requested.
+    ///
+    /// This status applies on the whole connection (including, e.g.,
+    /// DATAGRAMs).
+    ///
+    /// When `advertise` is set, this call also advertises the path status to
+    /// the peer, asking it to take the provided status into account.
+    ///
+    /// Note that specifying a 4-tuple that does not map to existing paths has
+    /// no effect.
+    pub fn set_path_status(
+        &mut self, local: SocketAddr, peer: SocketAddr, status: PathStatus,
+        advertise: bool,
+    ) -> Result<()> {
+        if let Some(path_id) = self.path_id_from_addrs(&(local, peer)) {
+            self.set_path_status_from_pid(path_id, status)?;
+            if advertise {
+                self.advertise_path_status(path_id)?;
+            }
+        }
         Ok(())
     }
 
@@ -1207,6 +1342,9 @@ impl PathMap {
             }
         }
     }
+
+
+
 }
 
 /// Statistics about the path of a connection.
@@ -1513,7 +1651,7 @@ mod tests {
             Path::new(client_addr_3, server_addr, &recovery_config, false);
         let pid_3 = paths.insert_path(path_3, false).unwrap();
 
-        assert_eq!(paths.set_path_status(pid_2, PathStatus::Standby), Ok(()));
+        assert_eq!(paths.set_path_status_from_pid(pid_2, PathStatus::Standby), Ok(()));
         assert_eq!(
             paths
                 .iter()
@@ -1529,7 +1667,7 @@ mod tests {
             vec![pid, pid_3]
         );
         assert_eq!(
-            paths.set_path_status(42, PathStatus::Standby),
+            paths.set_path_status_from_pid(42, PathStatus::Standby),
             Err(Error::InvalidState)
         );
 
@@ -1548,8 +1686,8 @@ mod tests {
         assert_eq!(paths.has_path_status(), false);
         assert_eq!(paths.path_status(), None);
 
-        assert_eq!(paths.set_path_status(pid_3, PathStatus::Standby), Ok(()));
-        assert_eq!(paths.set_path_status(pid_2, PathStatus::Available), Ok(()));
+        assert_eq!(paths.set_path_status_from_pid(pid_3, PathStatus::Standby), Ok(()));
+        assert_eq!(paths.set_path_status_from_pid(pid_2, PathStatus::Available), Ok(()));
         paths.advertise_path_status(pid_2).unwrap();
         paths.advertise_path_status(pid_3).unwrap();
         assert_eq!(paths.has_path_status(), true);

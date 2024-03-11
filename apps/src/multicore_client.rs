@@ -646,7 +646,7 @@ pub fn multicore_connect(
                                         local_addr, peer_addr
                                     );
                                     if conn_paths.multipath() {
-                                        conn.set_active(conn_paths,local_addr, peer_addr, true).ok();
+                                        conn_paths.set_active(local_addr, peer_addr, true).ok();
                                     } else if args.perform_migration {
                                         conn.migrate(conn_paths, local_addr, peer_addr).unwrap();
                                         migrated = true;
@@ -727,8 +727,7 @@ pub fn multicore_connect(
                 rm_addrs.retain(|(d, addr)| {
                     if app_data_start.elapsed() >= *d {
                         info!("Abandoning path {:?}", addr);
-                        conn.abandon_path(
-                            conn_paths,
+                        conn_paths.abandon_path(
                             *addr,
                             peer_addr,
                             0,
@@ -745,7 +744,7 @@ pub fn multicore_connect(
                     if app_data_start.elapsed() >= *d {
                         let status = (*available).into();
                         info!("Advertising path status {status:?} to {addr:?}");
-                        conn.set_path_status(conn_paths, *addr, peer_addr, status, true)
+                        conn_paths.set_path_status( *addr, peer_addr, status, true)
                             .is_err()
                     } else {
                         true

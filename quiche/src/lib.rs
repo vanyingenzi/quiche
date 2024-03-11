@@ -3089,7 +3089,13 @@ impl Connection {
                 recv_pid != active_path_id &&
                 pkt_num_space.largest_rx_non_probing_pkt_num == pn
             {
-                self.on_peer_migrated(paths, recv_pid, self.disable_dcid_reuse, now)?;
+                match paths.on_peer_migrated(recv_pid, self.disable_dcid_reuse, now, &self.trace_id) {
+                    Ok((lc, lb)) => {
+                        self.lost_count += lc;
+                        self.lost_bytes += lb as u64;
+                    }, 
+                    Err(_) => return Err(Error::InvalidState),
+                }
             }
         }
 
@@ -5490,6 +5496,7 @@ impl Connection {
         MIN_CLIENT_INITIAL_LEN
     }
 
+    /*
     /// Schedule an ack-eliciting packet on the active path.
     ///
     /// QUIC packets might not contain ack-eliciting frames during normal
@@ -5507,8 +5514,9 @@ impl Connection {
         }
         paths.get_active_mut()?.needs_ack_eliciting = true;
         Ok(())
-    }
+    }*/
 
+    /*
     /// Schedule an ack-eliciting packet on the specified path.
     ///
     /// See [`send_ack_eliciting()`] for more detail. [`InvalidState`] is
@@ -5527,7 +5535,7 @@ impl Connection {
             .ok_or(Error::InvalidState)?;
         paths.get_mut(path_id)?.needs_ack_eliciting = true;
         Ok(())
-    }
+    }*/
 
     /// Reads the first received DATAGRAM.
     ///
@@ -5996,9 +6004,14 @@ impl Connection {
         if paths.get_active_path_id().is_err() {
             match paths.find_candidate_path() {
                 Some(pid) =>
-                    if self.set_active_path(paths, pid, now).is_err() {
-                        // The connection cannot continue.
-                        self.closed = true;
+                    match paths.set_active_path(pid, now, &self.trace_id){
+                        Ok((lost_count, lost_bytes)) => {
+                            self.lost_count += lost_count;
+                            self.lost_bytes += lost_bytes as u64;
+                        }, 
+                        Err(..) => {
+                            self.closed = true;
+                        }
                     },
 
                 // The connection cannot continue.
@@ -6137,11 +6150,18 @@ impl Connection {
         };
 
         // Change the active path.
-        self.set_active_path(paths, pid, time::Instant::now())?;
+        match paths.set_active_path(pid, time::Instant::now(), &self.trace_id) {
+            Ok((lost_packets, lost_bytes)) => {
+                self.lost_count += lost_packets;
+                self.lost_bytes += lost_bytes as u64;
+            },
+            Err(_) => return Err(Error::InvalidState)
+        };
 
         Ok(dcid_seq)
     }
 
+    /*
     /// Request the usage of the provided 4-tuple to send non-probing packets.
     ///
     /// This API is only available when the multipath extensions were negotiated
@@ -6170,8 +6190,9 @@ impl Connection {
         self.update_tx_cap(paths.get_cwin_available());
 
         Ok(())
-    }
+    }*/
 
+    /*
     /// Abandon the provided 4-tuple.
     ///
     /// This API is only available when the multipath extensions were negotiated
@@ -6195,8 +6216,9 @@ impl Connection {
         self.update_tx_cap(paths.get_cwin_available());
 
         Ok(())
-    }
+    }*/
 
+    /*
     /// Specifies the status of the path, and advertises it to the peer
     /// if requested.
     ///
@@ -6220,7 +6242,7 @@ impl Connection {
         }
 
         Ok(())
-    }
+    } */
 
     /// Provides additional source Connection IDs that the peer can use to reach
     /// this host.
@@ -6388,6 +6410,8 @@ impl Connection {
         self.ids.available_dcids()
     }
 
+
+    /*
     /// Returns an iterator over destination `SockAddr`s whose association
     /// with `from` forms a known QUIC path on which packets can be sent to.
     ///
@@ -6449,7 +6473,7 @@ impl Connection {
 
             index: 0,
         }
-    }
+    }*/
 
     /// Returns whether the multipath extensions have been enabled on this
     /// connection.
@@ -6649,7 +6673,7 @@ impl Connection {
     /// [`InvalidState`].
     ///
     /// [`InvalidState`]: enum.Error.html#variant.InvalidState
-    pub fn is_path_validated(
+    /*pub fn is_path_validated(
         &self, paths: &mut path::PathMap, from: SocketAddr, to: SocketAddr,
     ) -> Result<bool> {
         let pid = paths
@@ -6657,7 +6681,7 @@ impl Connection {
             .ok_or(Error::InvalidState)?;
 
         Ok(paths.get(pid)?.validated())
-    }
+    }*/
 
     /// Returns true if the connection is draining.
     ///
@@ -7802,12 +7826,6 @@ impl Connection {
 
     /// Updates send capacity.
     fn update_tx_cap(&mut self, cwin_available: usize) {
-        /*let cwin_available = paths
-            .iter()
-            .filter(|(_, p)| p.active())
-            .map(|(_, p)| p.recovery.cwnd_available())
-            .filter(|cwnd| *cwnd != std::usize::MAX)
-            .sum(); */
         self.tx_cap = cmp::min(
             cwin_available,
             (self.max_tx_data - self.tx_data)
@@ -8047,6 +8065,7 @@ impl Connection {
         Err(Error::InvalidState)
     }
 
+    /*
     /// Sets the path with identifier 'path_id' to be active.
     fn set_active_path(
         &mut self, paths: &mut path::PathMap, path_id: usize, now: time::Instant,
@@ -8065,10 +8084,10 @@ impl Connection {
         }
 
         paths.set_active_path(path_id)
-    }
+    }*/
 
     /// Handles potential connection migration.
-    fn on_peer_migrated(
+    /*fn on_peer_migrated(
         &mut self, paths: &mut path::PathMap, new_pid: usize, disable_dcid_reuse: bool, now: time::Instant,
     ) -> Result<()> {
         let active_path_id = paths.get_active_path_id()?;
@@ -8077,7 +8096,13 @@ impl Connection {
             return Ok(());
         }
 
-        self.set_active_path(paths, new_pid, now)?;
+        match paths.set_active_path(new_pid, now, &self.trace_id) {
+            Ok((lost_packets, lost_bytes)) => {
+                self.lost_count += lost_packets;
+                self.lost_bytes += lost_bytes as u64;
+            },
+            Err(_) => return Err(Error::InvalidState)
+        };
 
         let no_spare_dcid =
             paths.get_mut(new_pid)?.active_dcid_seq.is_none();
@@ -8088,7 +8113,7 @@ impl Connection {
         }
 
         Ok(())
-    }
+    }*/
 
     /// Creates a new client-side path.
     fn create_path_on_client(
@@ -16014,7 +16039,7 @@ mod tests {
         let client_addr_2 = "127.0.0.1:5678".parse().unwrap();
         assert_eq!(pipe.client.probe_path(&mut pipe.client_paths, client_addr_2, server_addr), Ok(1));
 
-        let mut got = pipe.client.paths_iter(&mut pipe.client_paths, client_addr_2).collect::<Vec<_>>();
+        let mut got = pipe.client_paths.paths_iter(client_addr_2).collect::<Vec<_>>();
         let mut expected = vec![server_addr];
         got.sort();
         expected.sort();
@@ -16075,13 +16100,13 @@ mod tests {
         // Just to fit in two packets.
         assert_eq!(pipe.client.stream_send(0, &buf[..1201], true), Ok(1201));
 
-        let mut got = pipe.client.paths_iter(&mut pipe.client_paths, client_addr).collect::<Vec<_>>();
+        let mut got = pipe.client_paths.paths_iter(client_addr).collect::<Vec<_>>();
         let mut expected = vec![server_addr, server_addr_2];
         got.sort();
         expected.sort();
         assert_eq!(got, expected);
 
-        let mut got = pipe.client.paths_iter(&mut pipe.client_paths, client_addr_3).collect::<Vec<_>>();
+        let mut got = pipe.client_paths.paths_iter(client_addr_3).collect::<Vec<_>>();
         let mut expected = vec![server_addr];
         got.sort();
         expected.sort();
@@ -16157,7 +16182,7 @@ mod tests {
 
         assert_eq!(pipe.advance(), Ok(()));
 
-        let mut v1 = pipe.client.paths_iter(&mut pipe.client_paths, client_addr).collect::<Vec<_>>();
+        let mut v1 = pipe.client_paths.paths_iter(client_addr).collect::<Vec<_>>();
         let mut v2 = vec![server_addr, server_addr_2];
 
         v1.sort();
@@ -16165,7 +16190,7 @@ mod tests {
 
         assert_eq!(v1, v2);
 
-        let mut v1 = pipe.client.paths_iter(&mut pipe.client_paths, client_addr_2).collect::<Vec<_>>();
+        let mut v1 = pipe.client_paths.paths_iter(client_addr_2).collect::<Vec<_>>();
         let mut v2 = vec![server_addr];
 
         v1.sort();
@@ -16173,7 +16198,7 @@ mod tests {
 
         assert_eq!(v1, v2);
 
-        let mut v1 = pipe.client.paths_iter(&mut pipe.client_paths, client_addr_3).collect::<Vec<_>>();
+        let mut v1 = pipe.client_paths.paths_iter(client_addr_3).collect::<Vec<_>>();
         let mut v2 = vec![server_addr];
 
         v1.sort();
@@ -16227,11 +16252,11 @@ mod tests {
             Some(PathEvent::Validated(server_addr, client_addr_2))
         );
         assert_eq!(
-            pipe.client.is_path_validated(&mut pipe.client_paths, client_addr_2, server_addr),
+            pipe.client_paths.is_path_validated(client_addr_2, server_addr),
             Ok(true)
         );
         assert_eq!(
-            pipe.server.is_path_validated(&mut pipe.server_paths, server_addr, client_addr_2),
+            pipe.server_paths.is_path_validated(server_addr, client_addr_2),
             Ok(true)
         );
         // The server can never initiates the connection migration.
@@ -16584,12 +16609,11 @@ mod tests {
         );
 
         assert_eq!(
-            pipe.server.is_path_validated(&mut pipe.server_paths, server_addr, client_addr),
+            pipe.server_paths.is_path_validated(server_addr, client_addr),
             Ok(true)
         );
         assert_eq!(
-            pipe.server
-                .is_path_validated(&mut pipe.server_paths, server_addr, spoofed_client_addr),
+            pipe.server_paths.is_path_validated(server_addr, spoofed_client_addr),
             Ok(false)
         );
 
@@ -16623,12 +16647,11 @@ mod tests {
         );
 
         assert_eq!(
-            pipe.server.is_path_validated(&mut pipe.server_paths, server_addr, client_addr),
+            pipe.server_paths.is_path_validated(server_addr, client_addr),
             Ok(true)
         );
         assert_eq!(
-            pipe.server
-                .is_path_validated(&mut pipe.server_paths, server_addr, spoofed_client_addr),
+            pipe.server_paths.is_path_validated(server_addr, spoofed_client_addr),
             Ok(false)
         );
 
@@ -16693,7 +16716,7 @@ mod tests {
         assert_eq!(pipe.handshake(), Ok(()));
 
         // Queue a PING frame
-        pipe.server.send_ack_eliciting(&mut pipe.server_paths,).unwrap();
+        pipe.server_paths.send_ack_eliciting().unwrap();
 
         // Make sure ping is sent
         let mut buf = [0; 1500];
@@ -16713,7 +16736,7 @@ mod tests {
         assert_eq!(pipe.handshake(), Ok(()));
 
         // Queue a PING frame
-        pipe.server.send_ack_eliciting(&mut pipe.server_paths,).unwrap();
+        pipe.server_paths.send_ack_eliciting().unwrap();
 
         // Send a stream frame, which is ACK-eliciting to make sure the ping is
         // not sent
@@ -17034,8 +17057,8 @@ mod tests {
 
         // Show that the new path is not considered a destination path by quiche
         assert!(!pipe
-            .server
-            .paths_iter(&mut pipe.server_paths, server_addr)
+            .server_paths
+            .paths_iter(server_addr)
             .any(|path| path == client_addr_2));
     }
 
@@ -17118,11 +17141,11 @@ mod tests {
         assert_eq!(path_s2c_1.active(), false);
 
         assert_eq!(
-            pipe.client.set_active(&mut pipe.client_paths, client_addr_2, server_addr, true,),
+            pipe.client_paths.set_active(client_addr_2, server_addr, true),
             Ok(())
         );
         assert_eq!(
-            pipe.server.set_active(&mut pipe.server_paths, server_addr, client_addr_2, true,),
+            pipe.server_paths.set_active(server_addr, client_addr_2, true),
             Ok(())
         );
 
@@ -17167,8 +17190,7 @@ mod tests {
 
         // Now close the initial path.
         assert_eq!(
-            pipe.client.abandon_path(
-                &mut pipe.client_paths,
+            pipe.client_paths.abandon_path(
                 client_addr,
                 server_addr,
                 0,
