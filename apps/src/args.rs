@@ -34,6 +34,7 @@ pub trait Args {
 }
 
 /// Contains commons arguments for creating a quiche QUIC connection.
+#[derive(Debug)]
 pub struct CommonArgs {
     pub alpns: Vec<&'static [u8]>,
     pub max_data: u64,
@@ -554,6 +555,7 @@ Options:
 ";
 
 // Application-specific arguments that compliment the `CommonArgs`.
+#[derive(Debug)]
 pub struct ServerArgs {
     pub listen: String,
     pub no_retry: bool,

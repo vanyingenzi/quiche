@@ -481,7 +481,7 @@ const CONNECTION_WINDOW_FACTOR: f64 = 1.5;
 
 // How many probing packet timeouts do we tolerate before considering the path
 // validation as failed.
-const MAX_PROBING_TIMEOUTS: usize = 5; // TODO push back to 3
+const MAX_PROBING_TIMEOUTS: usize = 3; // TODO push back to 3
 
 // The default initial congestion window size in terms of packet count.
 const DEFAULT_INITIAL_CONGESTION_WINDOW_PACKETS: usize = 10;
@@ -2564,7 +2564,7 @@ impl Connection {
             drop_pkt_on_err(e, self.recv_count, self.is_server, &self.trace_id)
         })?;
 
-        let space_id = if self.is_multipath_enabled(paths) {
+        let space_id = if paths.multipath() {
             if let Some((scid_seq, _)) = self.ids.find_scid_seq(&hdr.dcid) {
                 scid_seq
             } else {
@@ -6348,6 +6348,7 @@ impl Connection {
         Ok(())
     }
 
+    /*
     /// Processes path-specific events.
     ///
     /// On success it returns a [`PathEvent`], or `None` when there are no
@@ -6361,7 +6362,7 @@ impl Connection {
     /// [`PathEvent`]: enum.PathEvent.html
     pub fn path_event_next(&mut self, paths: &mut path::PathMap) -> Option<PathEvent> {
         paths.pop_event()
-    }
+    }*/
 
     /// Returns the number of source Connection IDs that are retired.
     pub fn retired_scids(&self) -> usize {
@@ -6452,10 +6453,10 @@ impl Connection {
 
     /// Returns whether the multipath extensions have been enabled on this
     /// connection.
-    #[inline]
+    /*#[inline]
     pub fn is_multipath_enabled(&self, paths: &path::PathMap) -> bool {
         paths.multipath()
-    }
+    }*/
 
     /// Closes the connection with the given error and reason.
     ///
@@ -7002,7 +7003,7 @@ impl Connection {
             if self.pkt_num_spaces.crypto.get(epoch).crypto_seal.is_none() {
                 continue;
             }
-            let space_id = match self.is_multipath_enabled(paths) {
+            let space_id = match paths.multipath() {
                 true => send_path.active_dcid_seq,
                 false => None,
             };
@@ -8007,7 +8008,7 @@ impl Connection {
 
         // When using multiple packet number spaces, let's force ACK_MP sending
         // on their corresponding paths.
-        if self.is_multipath_enabled(paths) {
+        if paths.multipath() {
             if let Some(pid) =
                 self.pkt_num_spaces
                     .spaces
@@ -8130,7 +8131,7 @@ impl Connection {
     /// sending packets.
     #[inline]
     fn use_path_pkt_num_space(&self, paths: &mut path::PathMap, epoch: packet::Epoch) -> bool {
-        self.is_multipath_enabled(paths) && epoch == packet::Epoch::Application
+        paths.multipath() && epoch == packet::Epoch::Application
     }
 }
 
@@ -9168,7 +9169,7 @@ pub mod testing {
 
         let epoch = pkt_type.to_epoch()?;
 
-        let multipath_multiple_spaces = conn.is_multipath_enabled(paths);
+        let multipath_multiple_spaces = paths.multipath();
         let pn = conn.pkt_num_spaces.spaces.get(epoch, 0)?.next_pkt_num;
         let pn_len = 4;
 
@@ -9275,7 +9276,7 @@ pub mod testing {
             hdr.pkt_num_len,
         );
 
-        let space_seq = if conn.is_multipath_enabled(paths) {
+        let space_seq = if paths.multipath() {
             conn.ids
                 .find_scid_seq(&hdr.dcid)
                 .map(|(seq, _)| seq)
@@ -12263,7 +12264,7 @@ mod tests {
             frame.to_bytes(&mut b).unwrap();
         }
 
-        let space_seq = if pipe.client.is_multipath_enabled(&mut pipe.client_paths) {
+        let space_seq = if pipe.client_paths.multipath() {
             pipe.client
                 .ids
                 .find_scid_seq(&hdr.dcid)
@@ -15286,8 +15287,8 @@ mod tests {
         assert_eq!(pipe.handshake(), Ok(()));
 
         // So far, there should not have any QUIC event.
-        assert_eq!(pipe.client.path_event_next(&mut pipe.client_paths), None);
-        assert_eq!(pipe.server.path_event_next(&mut pipe.server_paths), None);
+        assert_eq!(pipe.client_paths.pop_event(pipe.client_paths.get_active().unwrap().local_addr(), pipe.client_paths.get_active().unwrap().peer_addr()), None);
+        assert_eq!(pipe.server_paths.pop_event(pipe.server_paths.get_active().unwrap().local_addr(), pipe.server_paths.get_active().unwrap().peer_addr()), None);
         assert_eq!(pipe.client.source_cids_left(), 2);
 
         let (scid, reset_token) = testing::create_cid_and_reset_token(16);
@@ -15298,8 +15299,8 @@ mod tests {
 
         // At this point, the server should be notified that it has a new CID.
         assert_eq!(pipe.server.available_dcids(), 1);
-        assert_eq!(pipe.server.path_event_next(&mut pipe.server_paths), None);
-        assert_eq!(pipe.client.path_event_next(&mut pipe.client_paths), None);
+        assert_eq!(pipe.server_paths.pop_event(pipe.server_paths.get_active().unwrap().local_addr(), pipe.server_paths.get_active().unwrap().peer_addr()), None);
+        assert_eq!(pipe.client_paths.pop_event(pipe.client_paths.get_active().unwrap().local_addr(), pipe.client_paths.get_active().unwrap().peer_addr()), None);
         assert_eq!(pipe.client.source_cids_left(), 1);
 
         // Now, a second CID can be provided.
@@ -15311,8 +15312,8 @@ mod tests {
 
         // At this point, the server should be notified that it has a new CID.
         assert_eq!(pipe.server.available_dcids(), 2);
-        assert_eq!(pipe.server.path_event_next(&mut pipe.server_paths), None);
-        assert_eq!(pipe.client.path_event_next(&mut pipe.client_paths), None);
+        assert_eq!(pipe.server_paths.pop_event(pipe.server_paths.get_active().unwrap().local_addr(), pipe.server_paths.get_active().unwrap().peer_addr()), None);
+        assert_eq!(pipe.client_paths.pop_event(pipe.client_paths.get_active().unwrap().local_addr(), pipe.client_paths.get_active().unwrap().peer_addr()), None);
         assert_eq!(pipe.client.source_cids_left(), 0);
 
         // If now the client tries to send another CID, it reports an error
@@ -15345,8 +15346,8 @@ mod tests {
         assert_eq!(pipe.handshake(), Ok(()));
 
         // So far, there should not have any QUIC event.
-        assert_eq!(pipe.client.path_event_next(&mut pipe.client_paths), None);
-        assert_eq!(pipe.server.path_event_next(&mut pipe.server_paths), None);
+        assert_eq!(pipe.client_paths.pop_event(pipe.client_paths.get_active().unwrap().local_addr(), pipe.client_paths.get_active().unwrap().peer_addr()), None);
+        assert_eq!(pipe.server_paths.pop_event(pipe.server_paths.get_active().unwrap().local_addr(), pipe.server_paths.get_active().unwrap().peer_addr()), None);
         assert_eq!(pipe.client.source_cids_left(), 1);
 
         let scid = pipe.client.source_id(&mut pipe.client_paths).into_owned();
@@ -15362,8 +15363,8 @@ mod tests {
 
         // At this point, the server should be notified that it has a new CID.
         assert_eq!(pipe.server.available_dcids(), 1);
-        assert_eq!(pipe.server.path_event_next(&mut pipe.server_paths), None);
-        assert_eq!(pipe.client.path_event_next(&mut pipe.client_paths), None);
+        assert_eq!(pipe.server_paths.pop_event(pipe.server_paths.get_active().unwrap().local_addr(), pipe.server_paths.get_active().unwrap().peer_addr()), None);
+        assert_eq!(pipe.client_paths.pop_event(pipe.client_paths.get_active().unwrap().local_addr(), pipe.client_paths.get_active().unwrap().peer_addr()), None);
         assert_eq!(pipe.client.source_cids_left(), 0);
 
         // Now we assume that the client wants to advertise more source
@@ -15382,13 +15383,13 @@ mod tests {
 
         // At this point, the server still have a spare DCID.
         assert_eq!(pipe.server.available_dcids(), 1);
-        assert_eq!(pipe.server.path_event_next(&mut pipe.server_paths), None);
+        assert_eq!(pipe.server_paths.pop_event(pipe.server_paths.get_active().unwrap().local_addr(), pipe.server_paths.get_active().unwrap().peer_addr()), None);
 
         // Client should have received a retired notification.
         assert_eq!(pipe.client.retired_scid_next(), Some(scid));
         assert_eq!(pipe.client.retired_scid_next(), None);
 
-        assert_eq!(pipe.client.path_event_next(&mut pipe.client_paths), None);
+        assert_eq!(pipe.client_paths.pop_event(pipe.client_paths.get_active().unwrap().local_addr(), pipe.client_paths.get_active().unwrap().peer_addr()), None);
         assert_eq!(pipe.client.source_cids_left(), 0);
 
         // The active Destination Connection ID of the server should now be the
@@ -15412,7 +15413,7 @@ mod tests {
         // Let exchange packets over the connection.
         assert_eq!(pipe.advance(), Ok(()));
 
-        assert_eq!(pipe.server.path_event_next(&mut pipe.server_paths), None);
+        assert_eq!(pipe.server_paths.pop_event(pipe.server_paths.get_active().unwrap().local_addr(), pipe.server_paths.get_active().unwrap().peer_addr()), None);
         assert_eq!(pipe.client.retired_scid_next(), Some(scid_1));
         assert_eq!(pipe.client.retired_scid_next(), None);
 
@@ -15601,8 +15602,8 @@ mod tests {
             assert_eq!(pipe.client.available_dcids(), additional_cids);
         }
 
-        assert_eq!(pipe.server.path_event_next(&mut pipe.server_paths), None);
-        assert_eq!(pipe.client.path_event_next(&mut pipe.client_paths), None);
+        assert_eq!(pipe.server_paths.pop_event(pipe.server_paths.get_active().unwrap().local_addr(), pipe.server_paths.get_active().unwrap().peer_addr()), None);
+        assert_eq!(pipe.client_paths.pop_event(pipe.client_paths.get_active().unwrap().local_addr(), pipe.client_paths.get_active().unwrap().peer_addr()), None);
 
         pipe
     }
@@ -15657,9 +15658,9 @@ mod tests {
         assert_eq!(pipe.advance(), Ok(()));
 
         assert_eq!(pipe.server.available_dcids(), 1);
-        assert_eq!(pipe.server.path_event_next(&mut pipe.server_paths), None);
+        assert_eq!(pipe.server_paths.pop_event(pipe.server_paths.get_active().unwrap().local_addr(), pipe.server_paths.get_active().unwrap().peer_addr()), None);
         assert_eq!(pipe.client.available_dcids(), 1);
-        assert_eq!(pipe.client.path_event_next(&mut pipe.client_paths), None);
+        assert_eq!(pipe.client_paths.pop_event(pipe.client_paths.get_active().unwrap().local_addr(), pipe.client_paths.get_active().unwrap().peer_addr()), None);
 
         // Now the path probing can work.
         assert_eq!(pipe.client.probe_path(&mut pipe.client_paths, client_addr_2, server_addr), Ok(1));
@@ -15674,28 +15675,28 @@ mod tests {
 
         // The path should be validated at some point.
         assert_eq!(
-            pipe.client.path_event_next(&mut pipe.client_paths),
+            pipe.client_paths.pop_event(client_addr_2, server_addr),
             Some(PathEvent::Validated(client_addr_2, server_addr)),
         );
-        assert_eq!(pipe.client.path_event_next(&mut pipe.client_paths), None);
+        assert_eq!(pipe.client_paths.pop_event(pipe.client_paths.get_active().unwrap().local_addr(), pipe.client_paths.get_active().unwrap().peer_addr()), None);
 
         // The server should be notified of this new path.
         assert_eq!(
-            pipe.server.path_event_next(&mut pipe.server_paths),
+            pipe.server_paths.pop_event(server_addr, client_addr_2),
             Some(PathEvent::New(server_addr, client_addr_2)),
         );
         assert_eq!(
-            pipe.server.path_event_next(&mut pipe.server_paths),
+            pipe.server_paths.pop_event(server_addr, client_addr_2),
             Some(PathEvent::Validated(server_addr, client_addr_2)),
         );
-        assert_eq!(pipe.server.path_event_next(&mut pipe.server_paths), None);
+        assert_eq!(pipe.server_paths.pop_event(pipe.server_paths.get_active().unwrap().local_addr(), pipe.server_paths.get_active().unwrap().peer_addr()), None);
 
         // The server can later probe the path again.
         assert_eq!(pipe.server.probe_path(&mut pipe.server_paths, server_addr, client_addr_2), Ok(1));
 
         // This should not trigger any event at client side.
-        assert_eq!(pipe.client.path_event_next(&mut pipe.client_paths), None);
-        assert_eq!(pipe.server.path_event_next(&mut pipe.server_paths), None);
+        assert_eq!(pipe.client_paths.pop_event(pipe.client_paths.get_active().unwrap().local_addr(), pipe.client_paths.get_active().unwrap().peer_addr()), None);
+        assert_eq!(pipe.server_paths.pop_event(pipe.server_paths.get_active().unwrap().local_addr(), pipe.server_paths.get_active().unwrap().peer_addr()), None);
     }
 
     #[test]
@@ -15741,21 +15742,21 @@ mod tests {
 
         // The path should be validated at some point.
         assert_eq!(
-            pipe.client.path_event_next(&mut pipe.client_paths),
+            pipe.client_paths.pop_event(client_addr_2, server_addr),
             Some(PathEvent::Validated(client_addr_2, server_addr))
         );
-        assert_eq!(pipe.client.path_event_next(&mut pipe.client_paths), None);
+        assert_eq!(pipe.client_paths.pop_event(pipe.client_paths.get_active().unwrap().local_addr(), pipe.client_paths.get_active().unwrap().peer_addr()), None);
 
         assert_eq!(
-            pipe.server.path_event_next(&mut pipe.server_paths),
+            pipe.server_paths.pop_event(server_addr, client_addr_2),
             Some(PathEvent::New(server_addr, client_addr_2))
         );
         // The path should be validated at some point.
         assert_eq!(
-            pipe.server.path_event_next(&mut pipe.server_paths),
+            pipe.server_paths.pop_event(server_addr, client_addr_2),
             Some(PathEvent::Validated(server_addr, client_addr_2))
         );
-        assert_eq!(pipe.server.path_event_next(&mut pipe.server_paths), None);
+        assert_eq!(pipe.server_paths.pop_event(pipe.server_paths.get_active().unwrap().local_addr(), pipe.server_paths.get_active().unwrap().peer_addr()), None);
     }
 
     #[test]
@@ -15803,7 +15804,7 @@ mod tests {
         }
 
         assert_eq!(
-            pipe.client.path_event_next(&mut pipe.client_paths),
+            pipe.client_paths.pop_event(client_addr_2, server_addr),
             Some(PathEvent::FailedValidation(client_addr_2, server_addr)),
         );
     }
@@ -15885,12 +15886,12 @@ mod tests {
             .path_id_from_addrs(&(client_addr_2, server_addr))
             .unwrap();
         assert!(!pipe.client_paths.get(probed_pid).unwrap().validated(),);
-        assert_eq!(pipe.client.path_event_next(&mut pipe.client_paths), None);
+        assert_eq!(pipe.client_paths.pop_event(pipe.client_paths.get_active().unwrap().local_addr(), pipe.client_paths.get_active().unwrap().peer_addr()), None);
         // Now let the client probe at its MTU.
         assert_eq!(pipe.advance(), Ok(()));
         assert!(pipe.client_paths.get(probed_pid).unwrap().validated());
         assert_eq!(
-            pipe.client.path_event_next(&mut pipe.client_paths),
+            pipe.client_paths.pop_event(client_addr_2, server_addr),
             Some(PathEvent::Validated(client_addr_2, server_addr))
         );
     }
@@ -15920,21 +15921,21 @@ mod tests {
 
         // The path should be validated at some point.
         assert_eq!(
-            pipe.client.path_event_next(&mut pipe.client_paths),
+            pipe.client_paths.pop_event(client_addr_2, server_addr),
             Some(PathEvent::Validated(client_addr_2, server_addr))
         );
-        assert_eq!(pipe.client.path_event_next(&mut pipe.client_paths), None);
+        assert_eq!(pipe.client_paths.pop_event(pipe.client_paths.get_active().unwrap().local_addr(), pipe.client_paths.get_active().unwrap().peer_addr()), None);
 
         // The server should be notified of this new path.
         assert_eq!(
-            pipe.server.path_event_next(&mut pipe.server_paths),
+            pipe.server_paths.pop_event(server_addr, client_addr_2),
             Some(PathEvent::New(server_addr, client_addr_2))
         );
         assert_eq!(
-            pipe.server.path_event_next(&mut pipe.server_paths),
+            pipe.server_paths.pop_event(server_addr, client_addr_2),
             Some(PathEvent::Validated(server_addr, client_addr_2))
         );
-        assert_eq!(pipe.server.path_event_next(&mut pipe.server_paths), None);
+        assert_eq!(pipe.server_paths.pop_event(pipe.server_paths.get_active().unwrap().local_addr(), pipe.server_paths.get_active().unwrap().peer_addr()), None);
 
         assert_eq!(pipe.server_paths.len(), 2);
 
@@ -15951,14 +15952,14 @@ mod tests {
             .expect("failed to process");
         assert_eq!(pipe.server_paths.len(), 2);
         assert_eq!(
-            pipe.server.path_event_next(&mut pipe.server_paths),
+            pipe.server_paths.pop_event(server_addr, client_addr_2),
             Some(PathEvent::ReusedSourceConnectionId(
                 1,
                 (server_addr, client_addr_2),
                 (server_addr, client_addr_3)
             ))
         );
-        assert_eq!(pipe.server.path_event_next(&mut pipe.server_paths), None);
+        assert_eq!(pipe.server_paths.pop_event(pipe.server_paths.get_active().unwrap().local_addr(), pipe.server_paths.get_active().unwrap().peer_addr()), None);
     }
 
     #[test]
@@ -16213,16 +16214,16 @@ mod tests {
         assert_eq!(pipe.client.probe_path(&mut pipe.client_paths, client_addr_2, server_addr), Ok(1));
         assert_eq!(pipe.advance(), Ok(()));
         assert_eq!(
-            pipe.client.path_event_next(&mut pipe.client_paths),
+            pipe.client_paths.pop_event(client_addr_2, server_addr),
             Some(PathEvent::Validated(client_addr_2, server_addr))
         );
-        assert_eq!(pipe.client.path_event_next(&mut pipe.client_paths), None);
+        assert_eq!(pipe.client_paths.pop_event(pipe.client_paths.get_active().unwrap().local_addr(), pipe.client_paths.get_active().unwrap().peer_addr()), None);
         assert_eq!(
-            pipe.server.path_event_next(&mut pipe.server_paths),
+            pipe.server_paths.pop_event(server_addr, client_addr_2),
             Some(PathEvent::New(server_addr, client_addr_2))
         );
         assert_eq!(
-            pipe.server.path_event_next(&mut pipe.server_paths),
+            pipe.server_paths.pop_event(server_addr, client_addr_2),
             Some(PathEvent::Validated(server_addr, client_addr_2))
         );
         assert_eq!(
@@ -16256,10 +16257,10 @@ mod tests {
             server_addr
         );
         assert_eq!(
-            pipe.server.path_event_next(&mut pipe.server_paths),
+            pipe.server_paths.pop_event(pipe.server_paths.get_active().unwrap().local_addr(), pipe.server_paths.get_active().unwrap().peer_addr()),
             Some(PathEvent::PeerMigrated(server_addr, client_addr_2))
         );
-        assert_eq!(pipe.server.path_event_next(&mut pipe.server_paths), None);
+        assert_eq!(pipe.server_paths.pop_event(pipe.server_paths.get_active().unwrap().local_addr(), pipe.server_paths.get_active().unwrap().peer_addr()), None);
         assert_eq!(
             pipe.server_paths
                 .get_active()
@@ -16295,18 +16296,18 @@ mod tests {
             server_addr
         );
         assert_eq!(
-            pipe.server.path_event_next(&mut pipe.server_paths),
+            pipe.server_paths.pop_event(pipe.server_paths.get_active().unwrap().local_addr(), pipe.server_paths.get_active().unwrap().peer_addr()),
             Some(PathEvent::New(server_addr, client_addr_3))
         );
         assert_eq!(
-            pipe.server.path_event_next(&mut pipe.server_paths),
+            pipe.server_paths.pop_event(pipe.server_paths.get_active().unwrap().local_addr(), pipe.server_paths.get_active().unwrap().peer_addr()),
             Some(PathEvent::Validated(server_addr, client_addr_3))
         );
         assert_eq!(
-            pipe.server.path_event_next(&mut pipe.server_paths),
+            pipe.server_paths.pop_event(pipe.server_paths.get_active().unwrap().local_addr(), pipe.server_paths.get_active().unwrap().peer_addr()),
             Some(PathEvent::PeerMigrated(server_addr, client_addr_3))
         );
-        assert_eq!(pipe.server.path_event_next(&mut pipe.server_paths), None);
+        assert_eq!(pipe.server_paths.pop_event(pipe.server_paths.get_active().unwrap().local_addr(), pipe.server_paths.get_active().unwrap().peer_addr()), None);
         assert_eq!(
             pipe.server_paths
                 .get_active()
@@ -16327,7 +16328,7 @@ mod tests {
         assert_eq!(pipe.client.migrate(&mut pipe.client_paths, client_addr_3, server_addr), Ok(2));
         assert_eq!(pipe.client.stream_send(8, b"data", true), Ok(4));
         assert_eq!(pipe.advance(), Ok(()));
-        assert_eq!(pipe.client.path_event_next(&mut pipe.client_paths), None);
+        assert_eq!(pipe.client_paths.pop_event(pipe.client_paths.get_active().unwrap().local_addr(), pipe.client_paths.get_active().unwrap().peer_addr()), None);
         assert_eq!(
             pipe.client_paths
                 .get_active()
@@ -16342,7 +16343,7 @@ mod tests {
                 .peer_addr(),
             server_addr
         );
-        assert_eq!(pipe.server.path_event_next(&mut pipe.server_paths), None);
+        assert_eq!(pipe.server_paths.pop_event(pipe.server_paths.get_active().unwrap().local_addr(), pipe.server_paths.get_active().unwrap().peer_addr()), None);
         assert_eq!(
             pipe.server_paths
                 .get_active()
@@ -16425,18 +16426,18 @@ mod tests {
             server_addr
         );
         assert_eq!(
-            pipe.server.path_event_next(&mut pipe.server_paths),
+            pipe.server_paths.pop_event(pipe.server_paths.get_active().unwrap().local_addr(), pipe.server_paths.get_active().unwrap().peer_addr()),
             Some(PathEvent::New(server_addr, client_addr_2))
         );
         assert_eq!(
-            pipe.server.path_event_next(&mut pipe.server_paths),
+            pipe.server_paths.pop_event(pipe.server_paths.get_active().unwrap().local_addr(), pipe.server_paths.get_active().unwrap().peer_addr()),
             Some(PathEvent::Validated(server_addr, client_addr_2))
         );
         assert_eq!(
-            pipe.server.path_event_next(&mut pipe.server_paths),
+            pipe.server_paths.pop_event(pipe.server_paths.get_active().unwrap().local_addr(), pipe.server_paths.get_active().unwrap().peer_addr()),
             Some(PathEvent::PeerMigrated(server_addr, client_addr_2))
         );
-        assert_eq!(pipe.server.path_event_next(&mut pipe.server_paths), None);
+        assert_eq!(pipe.server_paths.pop_event(pipe.server_paths.get_active().unwrap().local_addr(), pipe.server_paths.get_active().unwrap().peer_addr()), None);
         assert_eq!(
             pipe.server_paths
                 .get_active()
@@ -16482,19 +16483,19 @@ mod tests {
         assert_eq!(pipe.client.probe_path(&mut pipe.client_paths, client_addr_2, server_addr), Ok(1));
         assert_eq!(pipe.advance(), Ok(()));
         assert_eq!(
-            pipe.client.path_event_next(&mut pipe.client_paths),
+            pipe.client_paths.pop_event(client_addr_2, server_addr),
             Some(PathEvent::Validated(client_addr_2, server_addr))
         );
-        assert_eq!(pipe.client.path_event_next(&mut pipe.client_paths), None);
+        assert_eq!(pipe.client_paths.pop_event(pipe.client_paths.get_active().unwrap().local_addr(), pipe.client_paths.get_active().unwrap().peer_addr()), None);
         assert_eq!(
-            pipe.server.path_event_next(&mut pipe.server_paths),
+            pipe.server_paths.pop_event(server_addr, client_addr_2),
             Some(PathEvent::New(server_addr, client_addr_2))
         );
         assert_eq!(
-            pipe.server.path_event_next(&mut pipe.server_paths),
+            pipe.server_paths.pop_event(server_addr, client_addr_2),
             Some(PathEvent::Validated(server_addr, client_addr_2))
         );
-        assert_eq!(pipe.server.path_event_next(&mut pipe.server_paths), None);
+        assert_eq!(pipe.server_paths.pop_event(pipe.server_paths.get_active().unwrap().local_addr(), pipe.server_paths.get_active().unwrap().peer_addr()), None);
 
         // A first flight sent from secondary address.
         assert_eq!(pipe.client.stream_send(0, b"data", true), Ok(4));
@@ -16509,7 +16510,7 @@ mod tests {
 
         // Server does not perform connection migration because of packet
         // reordering.
-        assert_eq!(pipe.server.path_event_next(&mut pipe.server_paths), None);
+        assert_eq!(pipe.server_paths.pop_event(pipe.server_paths.get_active().unwrap().local_addr(), pipe.server_paths.get_active().unwrap().peer_addr()), None);
         assert_eq!(
             pipe.server_paths
                 .get_active()
@@ -16570,7 +16571,7 @@ mod tests {
         );
         assert_eq!(pipe.server.stream_send(1, &buf[12000..], true), Ok(12000));
         assert_eq!(
-            pipe.server.path_event_next(&mut pipe.server_paths),
+            pipe.server_paths.pop_event(server_addr, client_addr),
             Some(PathEvent::ReusedSourceConnectionId(
                 0,
                 (server_addr, client_addr),
@@ -16578,7 +16579,7 @@ mod tests {
             ))
         );
         assert_eq!(
-            pipe.server.path_event_next(&mut pipe.server_paths),
+            pipe.server_paths.pop_event(server_addr, spoofed_client_addr),
             Some(PathEvent::New(server_addr, spoofed_client_addr))
         );
 
@@ -16614,7 +16615,7 @@ mod tests {
         // Because of the small ACK size, the server cannot send more to the
         // client. Fallback on the previous active path.
         assert_eq!(
-            pipe.server.path_event_next(&mut pipe.server_paths),
+            pipe.server_paths.pop_event(server_addr, spoofed_client_addr),
             Some(PathEvent::FailedValidation(
                 server_addr,
                 spoofed_client_addr
@@ -17062,8 +17063,8 @@ mod tests {
 
         let mut pipe = pipe_with_exchanged_cids(&mut config, 16, 16, 1);
 
-        assert_eq!(pipe.client.is_multipath_enabled(&mut pipe.client_paths), true);
-        assert_eq!(pipe.server.is_multipath_enabled(&mut pipe.server_paths), true);
+        assert_eq!(pipe.client_paths.multipath(), true);
+        assert_eq!(pipe.server_paths.multipath(), true);
 
         let client_addr = testing::Pipe::client_addr();
         let server_addr = testing::Pipe::server_addr();
@@ -17075,19 +17076,19 @@ mod tests {
         assert_eq!(pipe.client.probe_path(&mut pipe.client_paths, client_addr_2, server_addr), Ok(1));
         assert_eq!(pipe.advance(), Ok(()));
         assert_eq!(
-            pipe.client.path_event_next(&mut pipe.client_paths),
+            pipe.client_paths.pop_event(client_addr_2, server_addr),
             Some(PathEvent::Validated(client_addr_2, server_addr))
         );
-        assert_eq!(pipe.client.path_event_next(&mut pipe.client_paths), None);
+        assert_eq!(pipe.client_paths.pop_event(pipe.client_paths.get_active().unwrap().local_addr(), pipe.client_paths.get_active().unwrap().peer_addr()), None);
         assert_eq!(
-            pipe.server.path_event_next(&mut pipe.server_paths),
+            pipe.server_paths.pop_event(server_addr, client_addr_2),
             Some(PathEvent::New(server_addr, client_addr_2))
         );
         assert_eq!(
-            pipe.server.path_event_next(&mut pipe.server_paths),
+            pipe.server_paths.pop_event(server_addr,client_addr_2),
             Some(PathEvent::Validated(server_addr, client_addr_2))
         );
-        assert_eq!(pipe.server.path_event_next(&mut pipe.server_paths), None);
+        assert_eq!(pipe.server_paths.pop_event(pipe.server_paths.get_active().unwrap().local_addr(), pipe.server_paths.get_active().unwrap().peer_addr()), None);
 
         let pid_c2s_0 = pipe
             .client_paths
@@ -17150,7 +17151,7 @@ mod tests {
         assert_eq!(fin, true);
         assert_eq!(rcv_data, DATA_BYTES);
 
-        assert_eq!(pipe.server.path_event_next(&mut pipe.server_paths), None);
+        assert_eq!(pipe.server_paths.pop_event(pipe.server_paths.get_active().unwrap().local_addr(), pipe.server_paths.get_active().unwrap().peer_addr()), None);
 
         let path_c2s_0 = pipe.client_paths.get(pid_c2s_0).expect("no such path");
         let path_c2s_1 = pipe.client_paths.get(pid_c2s_1).expect("no such path");
@@ -17212,7 +17213,7 @@ mod tests {
         assert_eq!(pipe.server.retired_scid_next(), None);
 
         assert_eq!(
-            pipe.server.path_event_next(&mut pipe.server_paths),
+            pipe.server_paths.pop_event(server_addr, client_addr),
             Some(PathEvent::Closed(
                 server_addr,
                 client_addr,
@@ -17225,7 +17226,7 @@ mod tests {
         assert_eq!(pipe.client.retired_scid_next(), None);
 
         assert_eq!(
-            pipe.client.path_event_next(&mut pipe.client_paths),
+            pipe.client_paths.pop_event(client_addr, server_addr),
             Some(PathEvent::Closed(
                 client_addr,
                 server_addr,
@@ -17255,9 +17256,9 @@ mod tests {
         config.set_initial_max_streams_bidi(2);
         config.set_multipath(true);
 
-        let mut pipe = pipe_with_exchanged_cids(&mut config, 0, 16, 1);
+        let pipe = pipe_with_exchanged_cids(&mut config, 0, 16, 1);
 
-        assert_eq!(pipe.client.is_multipath_enabled(&mut pipe.client_paths), false);
+        assert_eq!(pipe.client_paths.multipath(), false);
     }
 }
 

@@ -24,6 +24,7 @@
 // NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
 // SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
+use std::collections::HashMap;
 use std::time;
 
 use std::collections::BTreeMap;
@@ -173,6 +174,18 @@ pub enum PathEvent {
 
     /// The peer advertised the path status for the mentioned 4-tuple.
     PeerPathStatus((SocketAddr, SocketAddr), PathStatus),
+}
+
+fn get_addrs_from_event(event: &PathEvent) -> Result<(SocketAddr, SocketAddr)> {
+    match event {
+        PathEvent::New(local, peer) => Ok((*local, *peer)), 
+        PathEvent::Validated(local, peer) => Ok((*local, *peer)), 
+        PathEvent::FailedValidation(local, peer) => Ok((*local, *peer)), 
+        PathEvent::Closed(local, peer, ..) => Ok((*local, *peer)),
+        PathEvent::ReusedSourceConnectionId(_, (local, peer), _) => Ok((*local, *peer)),
+        PathEvent::PeerMigrated(local, peer) => Ok((*local, *peer)),
+        PathEvent::PeerPathStatus((local, peer), _) => Ok((*local, *peer)),
+    }
 }
 
 /// A network path on which QUIC packets can be sent.
@@ -667,7 +680,7 @@ pub struct PathMap {
     addrs_to_paths: BTreeMap<(SocketAddr, SocketAddr), usize>,
 
     /// Path-specific events to be notified to the application.
-    events: VecDeque<PathEvent>,
+    // events: VecDeque<PathEvent>,
 
     /// Whether this manager serves a connection as a server.
     is_server: bool,
@@ -683,6 +696,9 @@ pub struct PathMap {
     path_status_to_advertise: VecDeque<(usize, u64, bool)>,
     /// The sequence number for the next PATH_STATUS.
     next_path_status_seq_num: u64,
+
+    /// Similar to events but this is done per thread
+    per_path_events: HashMap<usize, VecDeque<PathEvent>>
 }
 
 impl PathMap {
@@ -693,26 +709,29 @@ impl PathMap {
     ) -> Self {
         let mut paths = Slab::with_capacity(1); // most connections only have one path
         let mut addrs_to_paths = BTreeMap::new();
-
+        let mut per_path_events = HashMap::new();
+        
         let local_addr = initial_path.local_addr;
         let peer_addr = initial_path.peer_addr;
 
         // As it is the first path, it is active by default.
         initial_path.state = PathState::Active;
-
+        
         let active_path_id = paths.insert(initial_path);
         addrs_to_paths.insert((local_addr, peer_addr), active_path_id);
+        per_path_events.insert(active_path_id, VecDeque::new());
 
         Self {
             paths,
             max_concurrent_paths,
             addrs_to_paths,
-            events: VecDeque::new(),
+            // events: VecDeque::new(),
             is_server,
             multipath: false,
             path_abandon: VecDeque::new(),
             path_status_to_advertise: VecDeque::new(),
             next_path_status_seq_num: 0,
+            per_path_events: per_path_events
         }
     }
 
@@ -900,6 +919,7 @@ impl PathMap {
 
         let pid = self.paths.insert(path);
         self.addrs_to_paths.insert((local_addr, peer_addr), pid);
+        self.per_path_events.insert(pid, VecDeque::new());
 
         // Notifies the application if we are in server mode.
         if is_server {
@@ -911,12 +931,16 @@ impl PathMap {
 
     /// Notifies a path event to the application served by the connection.
     pub fn notify_event(&mut self, ev: PathEvent) {
-        self.events.push_back(ev);
+        let addresses = get_addrs_from_event(&ev).unwrap();
+        let pid = self.addrs_to_paths.get(&addresses).unwrap();
+        self.per_path_events.get_mut(pid).unwrap().push_back(ev);
+        // self.events.push_back(ev);
     }
 
-    /// Gets the first path event to be notified to the application.
-    pub fn pop_event(&mut self) -> Option<PathEvent> {
-        self.events.pop_front()
+    /// Gets the first path event to be notified to the application on the given path
+    pub fn pop_event(&mut self, local_addr: SocketAddr, peer_addr: SocketAddr) -> Option<PathEvent> {
+        let pid = self.addrs_to_paths.get(&(local_addr, peer_addr)).unwrap();
+        self.per_path_events.get_mut(pid).unwrap().pop_front()
     }
 
     /// Notifies all failed validations to the application.
@@ -927,7 +951,8 @@ impl PathMap {
             .filter(|(_, p)| p.validation_failed() && !p.failure_notified);
 
         for (_, p) in validation_failed {
-            self.events.push_back(PathEvent::FailedValidation(
+            let pid = self.addrs_to_paths.get(&(p.local_addr, p.peer_addr)).unwrap();
+            self.per_path_events.get_mut(pid).unwrap().push_back(PathEvent::FailedValidation(
                 p.local_addr,
                 p.peer_addr,
             ));
@@ -938,13 +963,13 @@ impl PathMap {
 
     pub fn notify_closed_paths(&mut self) {
         let paths = &mut self.paths;
-        let events = &mut self.events;
         for (_, p) in paths
             .iter_mut()
             .filter(|(_, p)| p.closed() && !p.failure_notified)
         {
+            let pid = self.addrs_to_paths.get(&(p.local_addr, p.peer_addr)).unwrap();
             if let PathState::Closed(e, r) = &p.state {
-                events.push_back(PathEvent::Closed(
+                self.per_path_events.get_mut(pid).unwrap().push_back(PathEvent::Closed(
                     p.local_addr,
                     p.peer_addr,
                     *e,
@@ -1177,7 +1202,7 @@ impl PathMap {
             if seq_num >= p.expected_path_status_seq_num {
                 p.expected_path_status_seq_num = seq_num.saturating_add(1);
                 let addr = (p.local_addr(), p.peer_addr());
-                self.events
+                self.per_path_events.get_mut(&path_id).unwrap()
                     .push_back(PathEvent::PeerPathStatus(addr, available.into()));
             }
         }
@@ -1346,7 +1371,7 @@ mod tests {
             path_mgr.get_mut(pid).unwrap().validation_state,
             PathValidationState::Validating
         );
-        assert_eq!(path_mgr.pop_event(), None);
+        assert_eq!(path_mgr.pop_event(client_addr_2, server_addr), None);
 
         // Receives the response. The path is reachable, but the MTU is not
         // validated yet.
@@ -1360,7 +1385,7 @@ mod tests {
             path_mgr.get_mut(pid).unwrap().validation_state,
             PathValidationState::ValidatingMTU
         );
-        assert_eq!(path_mgr.pop_event(), None);
+        assert_eq!(path_mgr.pop_event(client_addr_2, server_addr), None);
 
         // Fake sending of PathChallenge in a packet of MIN_CLIENT_INITIAL_LEN
         // bytes.
@@ -1382,7 +1407,7 @@ mod tests {
             PathValidationState::Validated
         );
         assert_eq!(
-            path_mgr.pop_event(),
+            path_mgr.pop_event(client_addr_2, server_addr),
             Some(PathEvent::Validated(client_addr_2, server_addr))
         );
     }

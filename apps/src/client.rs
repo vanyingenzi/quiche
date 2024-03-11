@@ -410,51 +410,59 @@ pub fn connect(
         }
 
         // Handle path events.
-        while let Some(qe) = conn.path_event_next(&mut conn_paths) {
-            match qe {
-                quiche::PathEvent::New(..) => unreachable!(),
-
-                quiche::PathEvent::Validated(local_addr, peer_addr) => {
-                    info!(
-                        "Path ({}, {}) is now validated",
-                        local_addr, peer_addr
-                    );
-                    if conn.is_multipath_enabled(&mut conn_paths) {
-                        conn.set_active(&mut conn_paths,local_addr, peer_addr, true).ok();
-                    } else if args.perform_migration {
-                        conn.migrate(&mut conn_paths, local_addr, peer_addr).unwrap();
-                        migrated = true;
-                    }
-                },
-
-                quiche::PathEvent::FailedValidation(local_addr, peer_addr) => {
-                    info!(
-                        "Path ({}, {}) failed validation",
-                        local_addr, peer_addr
-                    );
-                },
-
-                quiche::PathEvent::Closed(local_addr, peer_addr, e, reason) => {
-                    info!(
-                        "Path ({}, {}) is now closed and unusable; err = {}, reason = {:?}",
-                        local_addr, peer_addr, e, reason
-                    );
-                },
-
-                quiche::PathEvent::ReusedSourceConnectionId(
-                    cid_seq,
-                    old,
-                    new,
-                ) => {
-                    info!(
-                        "Peer reused cid seq {} (initially {:?}) on {:?}",
-                        cid_seq, old, new
-                    );
-                },
-
-                quiche::PathEvent::PeerMigrated(..) => unreachable!(),
-
-                quiche::PathEvent::PeerPathStatus(..) => {},
+        let paths_sockets_addrs: Vec<(std::net::SocketAddr, std::net::SocketAddr)> = conn_paths.iter().map(|(_, p)| (p.local_addr(), p.peer_addr())).collect();
+        for (local_addr, peer_addr) in paths_sockets_addrs{
+            loop {
+                match conn_paths.pop_event(local_addr, peer_addr) {
+                    Some(qe) => {
+                        match qe {
+                            quiche::PathEvent::New(..) => unreachable!(),
+            
+                            quiche::PathEvent::Validated(local_addr, peer_addr) => {
+                                info!(
+                                    "Path ({}, {}) is now validated",
+                                    local_addr, peer_addr
+                                );
+                                if conn_paths.multipath() {
+                                    conn.set_active(&mut conn_paths,local_addr, peer_addr, true).ok();
+                                } else if args.perform_migration {
+                                    conn.migrate(&mut conn_paths, local_addr, peer_addr).unwrap();
+                                    migrated = true;
+                                }
+                            },
+            
+                            quiche::PathEvent::FailedValidation(local_addr, peer_addr) => {
+                                info!(
+                                    "Path ({}, {}) failed validation",
+                                    local_addr, peer_addr
+                                );
+                            },
+            
+                            quiche::PathEvent::Closed(local_addr, peer_addr, e, reason) => {
+                                info!(
+                                    "Path ({}, {}) is now closed and unusable; err = {}, reason = {:?}",
+                                    local_addr, peer_addr, e, reason
+                                );
+                            },
+            
+                            quiche::PathEvent::ReusedSourceConnectionId(
+                                cid_seq,
+                                old,
+                                new,
+                            ) => {
+                                info!(
+                                    "Peer reused cid seq {} (initially {:?}) on {:?}",
+                                    cid_seq, old, new
+                                );
+                            },
+            
+                            quiche::PathEvent::PeerMigrated(..) => unreachable!(),
+            
+                            quiche::PathEvent::PeerPathStatus(..) => {},
+                        }
+                    }, 
+                    None => break
+                }
             }
         }
 
@@ -495,7 +503,7 @@ pub fn connect(
             new_path_probed = true;
         }
 
-        if conn.is_multipath_enabled(&mut conn_paths) {
+        if conn_paths.multipath() {
             rm_addrs.retain(|(d, addr)| {
                 if app_data_start.elapsed() >= *d {
                     info!("Abandoning path {:?}", addr);

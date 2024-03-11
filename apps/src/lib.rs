@@ -31,4 +31,6 @@ pub mod args;
 pub mod client;
 pub mod common;
 pub mod sendto;
-pub mod multicore;
+pub mod multicore_client;
+pub mod server;
+pub mod multicore_server;
