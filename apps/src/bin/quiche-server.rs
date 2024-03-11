@@ -186,7 +186,6 @@ fn main() {
         // TODO: use event loop that properly supports timers
         let timeout = match continue_write {
             true => Some(std::time::Duration::from_secs(0)),
-
             false => clients.values_mut().filter_map(|c| c.conn.timeout(&mut c.conn_paths)).min(),
         };
 

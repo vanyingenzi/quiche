@@ -264,6 +264,7 @@ fn client_thread(
 
     let mut can_send = initiate_connection; // Initial path can send
     let mut local_timeout = Duration::from_nanos(1);
+    
     loop {
         poll.poll(&mut events, Some(local_timeout)).unwrap();
 
@@ -287,6 +288,9 @@ fn client_thread(
         if can_send {
             let (ref mut conn, ref mut conn_paths) = *quiche_conn.lock().unwrap();
             write_packets_on_path(&local_addr, &peer_addr, &socket, conn, conn_paths, &mut out).ok();
+            if conn.is_closed() {
+                break;
+            }
         } else {
             let (_, ref conn_paths) = *quiche_conn.lock().unwrap();
             can_send = can_send_on_path(conn_paths, local_addr, peer_addr)
@@ -523,6 +527,7 @@ pub fn multicore_connect(
             let (ref mut conn, ref mut conn_paths) = *conn_guard.lock().unwrap();
             conn_timeout = conn.timeout(conn_paths).unwrap_or(Duration::ZERO);
         }
+
         if !rwlock_exp_backoff(&main_thread_advance, conn_timeout){
             let (ref mut conn, ref mut conn_paths) = *conn_guard.lock().unwrap();
             trace!("timed out");
@@ -746,39 +751,6 @@ pub fn multicore_connect(
                         true
                     }
                 });
-            }
-        }
-
-        {
-            let (ref mut conn, ref mut conn_paths) = *conn_guard.lock().unwrap();
-            if conn.is_closed() {
-                info!(
-                    "connection closed, {:?} {:?}",
-                    conn.stats(conn_paths,),
-                    conn_paths.iter().map(|(_, p)| p.stats()).collect::<Vec<quiche::PathStats>>()
-                );
-
-                if !conn.is_established() {
-                    error!(
-                        "connection timed out after {:?}",
-                        app_data_start.elapsed(),
-                    );
-
-                    return Err(ClientError::HandshakeFail);
-                }
-
-                if let Some(session_file) = &args.session_file {
-                    if let Some(session) = conn.session() {
-                        std::fs::write(session_file, session).ok();
-                    }
-                }
-
-                if let Some(h_conn) = http_conn {
-                    if h_conn.report_incomplete(&app_data_start) {
-                        return Err(ClientError::HttpFail);
-                    }
-                }
-                break;
             }
         }
     }
