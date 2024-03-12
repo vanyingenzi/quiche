@@ -467,7 +467,7 @@ pub fn multicore_connect(
 
     if let Some(session_file) = &args.session_file {
         if let Ok(session) = std::fs::read(session_file) {
-            conn.set_session(&mut conn_paths, &session).ok();
+            conn.set_session(&mut conn_paths.get_active_mut().unwrap(), &session).ok();
         }
     }
 
@@ -681,6 +681,11 @@ pub fn multicore_connect(
                                 quiche::PathEvent::PeerMigrated(..) => unreachable!(),
                 
                                 quiche::PathEvent::PeerPathStatus(..) => {},
+                                
+                                quiche::PathEvent::PacketNumSpaceDiscarded((local, peer), epoch, handshake_status, now) => {
+                                    let p = conn_paths.get_mut_from_addr(local, peer).unwrap();
+                                    p.recovery.on_pkt_num_space_discarded(epoch, handshake_status, now);
+                                },
                             }
                         }, 
                         None => break

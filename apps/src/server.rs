@@ -766,6 +766,11 @@ fn handle_path_events(client: &mut Client, scheduler: &mut Scheduler) {
                                 .map_err(|e| error!("cannot follow status request: {}", e))
                                 .ok();
                         },
+
+                        quiche::PathEvent::PacketNumSpaceDiscarded((local, peer), epoch, handshake_status, now) => {
+                            let p = client.conn_paths.get_mut_from_addr(local, peer).unwrap();
+                            p.recovery.on_pkt_num_space_discarded(epoch, handshake_status, now);
+                        },
                     }
                 }, 
                 None => break,

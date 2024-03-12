@@ -1385,7 +1385,7 @@ pub struct Acked {
     pub lost: u64,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HandshakeStatus {
     pub has_handshake_keys: bool,
 

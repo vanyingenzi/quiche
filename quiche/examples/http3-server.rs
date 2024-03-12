@@ -518,7 +518,7 @@ fn handle_request(
     // We decide the response based on headers alone, so stop reading the
     // request stream so that any body is ignored and pointless Data events
     // are not generated.
-    conn.stream_shutdown(client.conn_paths.get_cwin_available(), stream_id, quiche::Shutdown::Read, 0)
+    conn.stream_shutdown( stream_id, quiche::Shutdown::Read, 0)
         .unwrap();
 
     let (headers, body) = build_response(root, headers);

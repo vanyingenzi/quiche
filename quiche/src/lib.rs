@@ -403,6 +403,7 @@ use qlog::events::RawInfo;
 use stream::StreamPriorityKey;
 
 use std::cmp;
+use std::collections::HashMap;
 use std::convert::TryInto;
 use std::time;
 
@@ -481,7 +482,7 @@ const CONNECTION_WINDOW_FACTOR: f64 = 1.5;
 
 // How many probing packet timeouts do we tolerate before considering the path
 // validation as failed.
-const MAX_PROBING_TIMEOUTS: usize = 3; // TODO push back to 3
+const MAX_PROBING_TIMEOUTS: usize = 5; // TODO push back to 3
 
 // The default initial congestion window size in terms of packet count.
 const DEFAULT_INITIAL_CONGESTION_WINDOW_PACKETS: usize = 10;
@@ -1446,6 +1447,12 @@ pub struct Connection {
 
     /// Structure used when coping with abandoned paths in multipath.
     dcid_seq_to_abandon: VecDeque<u64>,
+
+    /// Pending Path Events that needs to be passed on paths when they call
+    pending_per_path_events: HashMap<(SocketAddr, SocketAddr), VecDeque<path::PathEvent>>,
+
+    /// Per path approximative stats
+    approximative_stats: HashMap<(SocketAddr, SocketAddr), PathStats>
 }
 
 /// Creates a new server-side connection.
@@ -1750,6 +1757,11 @@ impl Connection {
             reset_token,
         );
 
+        let mut pending_per_path_events = HashMap::new();
+        pending_per_path_events.insert((local, peer), VecDeque::new());
+        let mut approximative_stats = HashMap::new();
+        approximative_stats.insert((local, peer), paths.get(active_path_id)?.stats());
+
         let mut conn = Connection {
             version: config.version,
 
@@ -1877,6 +1889,10 @@ impl Connection {
             newly_acked: Vec::new(),
 
             dcid_seq_to_abandon: VecDeque::new(),
+
+            pending_per_path_events: pending_per_path_events, 
+
+            approximative_stats: approximative_stats
         };
 
         // Don't support multipath with zero-length CIDs.
@@ -1917,10 +1933,9 @@ impl Connection {
 
             let reset_token = conn.peer_transport_params.stateless_reset_token;
             conn.set_initial_dcid(
-                &mut paths,
+                paths.get_active_mut().unwrap(),
                 dcid.to_vec().into(),
-                reset_token,
-                active_path_id,
+                reset_token
             )?;
 
             conn.pkt_num_spaces
@@ -2048,7 +2063,7 @@ impl Connection {
     ///
     /// [`session()`]: struct.Connection.html#method.session
     #[inline]
-    pub fn set_session(&mut self, paths: &mut path::PathMap, session: &[u8]) -> Result<()> {
+    pub fn set_session(&mut self, path: &mut path::Path, session: &[u8]) -> Result<()> {
         let mut b = octets::Octets::with_slice(session);
 
         let session_len = b.get_u64()? as usize;
@@ -2062,7 +2077,7 @@ impl Connection {
         let peer_params =
             TransportParams::decode(raw_params_bytes.as_ref(), self.is_server)?;
 
-        self.process_peer_transport_params(paths, peer_params)?;
+        self.process_peer_transport_params(path, peer_params)?;
 
         Ok(())
     }
@@ -2273,7 +2288,7 @@ impl Connection {
 
         let mut b = octets::OctetsMut::with_slice(buf);
 
-        let mut hdr = Header::from_bytes(&mut b, self.source_id(paths).len())
+        let mut hdr = Header::from_bytes(&mut b, self.source_id(paths.get_active().ok()).len())
             .map_err(|e| {
                 drop_pkt_on_err(
                     e,
@@ -2300,11 +2315,11 @@ impl Connection {
                 return Err(Error::Done);
             }
 
-            if hdr.dcid != self.source_id(paths) {
+            if hdr.dcid != self.source_id(paths.get_active().ok()) {
                 return Err(Error::Done);
             }
 
-            if hdr.scid != self.destination_id(paths) {
+            if hdr.scid != self.destination_id(paths.get_active().ok()) {
                 return Err(Error::Done);
             }
 
@@ -2350,13 +2365,13 @@ impl Connection {
 
             // Derive Initial secrets based on the new version.
             let (aead_open, aead_seal) = crypto::derive_initial_key_material(
-                &self.destination_id(paths),
+                &self.destination_id(paths.get_active().ok()),
                 self.version,
                 self.is_server,
             )?;
 
             // Reset connection state to force sending another Initial packet.
-            self.drop_epoch_state(paths, packet::Epoch::Initial, now);
+            self.drop_epoch_state(paths.get_active_mut().unwrap(), packet::Epoch::Initial, now);
             self.got_peer_conn_id = false;
             self.handshake.clear()?;
 
@@ -2393,7 +2408,7 @@ impl Connection {
             // Check if Retry packet is valid.
             if packet::verify_retry_integrity(
                 &b,
-                &self.destination_id(paths),
+                &self.destination_id(paths.get_active().ok()),
                 self.version,
             )
             .is_err()
@@ -2407,16 +2422,15 @@ impl Connection {
             self.did_retry = true;
 
             // Remember peer's new connection ID.
-            self.odcid = Some(self.destination_id(paths).into_owned());
+            self.odcid = Some(self.destination_id(paths.get_active().ok()).into_owned());
 
             self.set_initial_dcid(
-                paths,
+                paths.get_active_mut().unwrap(),
                 hdr.scid.clone(),
                 None,
-                paths.get_active_path_id()?,
             )?;
 
-            self.rscid = Some(self.destination_id(paths).into_owned());
+            self.rscid = Some(self.destination_id(paths.get_active().ok()).into_owned());
 
             // Derive Initial secrets using the new connection ID.
             let (aead_open, aead_seal) = crypto::derive_initial_key_material(
@@ -2426,7 +2440,7 @@ impl Connection {
             )?;
 
             // Reset connection state to force sending another Initial packet.
-            self.drop_epoch_state(paths, packet::Epoch::Initial, now);
+            self.drop_epoch_state(paths.get_active_mut().unwrap(), packet::Epoch::Initial, now);
             self.got_peer_conn_id = false;
             self.handshake.clear()?;
 
@@ -2765,23 +2779,22 @@ impl Connection {
 
         if !self.is_server && !self.got_peer_conn_id {
             if self.odcid.is_none() {
-                self.odcid = Some(self.destination_id(paths).into_owned());
+                self.odcid = Some(self.destination_id(paths.get_active().ok()).into_owned());
             }
 
             // Replace the randomly generated destination connection ID with
             // the one supplied by the server.
             self.set_initial_dcid(
-                paths,
+                paths.get_mut(recv_pid).unwrap(),
                 hdr.scid.clone(),
                 self.peer_transport_params.stateless_reset_token,
-                recv_pid,
             )?;
 
             self.got_peer_conn_id = true;
         }
 
         if self.is_server && !self.got_peer_conn_id {
-            self.set_initial_dcid(paths, hdr.scid.clone(), None, recv_pid)?;
+            self.set_initial_dcid(paths.get_mut(recv_pid).unwrap(), hdr.scid.clone(), None)?;
 
             if !self.did_retry {
                 self.local_transport_params
@@ -3026,8 +3039,7 @@ impl Connection {
                     let (lost_packets, lost_bytes) = close_path(
                         &mut self.ids,
                         &mut self.pkt_num_spaces,
-                        paths,
-                        pid,
+                        paths.get_mut(pid).unwrap(),
                         now,
                         &self.trace_id,
                     )?;
@@ -3104,7 +3116,8 @@ impl Connection {
         }
 
         // Update send capacity.
-        self.update_tx_cap(paths.get_cwin_available());
+        self.update_path_stats_from_path(paths.get_mut(recv_pid)?);
+        self.update_tx_cap();
 
         self.recv_count += 1;
         paths.get_mut(recv_pid)?.recv_count += 1;
@@ -3118,7 +3131,7 @@ impl Connection {
         // successfully processed, so we can drop the initial state and consider
         // the client's address to be verified.
         if self.is_server && hdr.ty == packet::Type::Handshake {
-            self.drop_epoch_state(paths, packet::Epoch::Initial, now);
+            self.drop_epoch_state(paths.get_active_mut().unwrap(), packet::Epoch::Initial, now);
             paths.get_mut(recv_pid)?.verified_peer_address = true;
         }
 
@@ -3189,7 +3202,12 @@ impl Connection {
     /// # Ok::<(), quiche::Error>(())
     /// ```
     pub fn send(&mut self, paths: &mut path::PathMap, out: &mut [u8]) -> Result<(usize, SendInfo)> {
-        self.send_on_path(paths, out, None, None)
+        let ret = self.send_on_path(paths, out, None, None);
+        for (_,  path) in paths.iter(){
+            self.update_path_stats_from_path(path);
+        }
+        self.update_tx_cap();
+        ret
     }
 
     /// Writes a single QUIC packet to be sent to the peer from the specified
@@ -3290,7 +3308,7 @@ impl Connection {
         let now = time::Instant::now();
 
         if self.local_error.is_none() {
-            self.do_handshake(paths, now)?;
+            self.do_handshake(paths.get_active_mut().unwrap(), now)?;
         }
 
         // Forwarding the error value here could confuse
@@ -3434,7 +3452,7 @@ impl Connection {
         let epoch = pkt_type.to_epoch()?;
 
         let multiple_application_data_pkt_num_spaces =
-            self.use_path_pkt_num_space(paths, epoch);
+            self.use_path_pkt_num_space(paths.multipath(), epoch);
         // Process lost frames. There might be several paths having lost frames.
         for (_, p) in paths.iter_mut() {
             for lost in p.recovery.lost[epoch].drain(..) {
@@ -3554,7 +3572,7 @@ impl Connection {
         }
 
         let consider_standby_paths = paths.consider_standby_paths();
-        let is_app_limited = self.delivery_rate_check_if_app_limited(paths, send_pid);
+        let is_app_limited = self.delivery_rate_check_if_app_limited(paths.get_mut(send_pid).unwrap());
         let n_paths = paths.len();
         let flow_control = &mut self.flow_control;
         let crypto_space = self.pkt_num_spaces.crypto.get_mut(epoch);
@@ -4691,7 +4709,7 @@ impl Connection {
 
         // On the client, drop initial state after sending an Handshake packet.
         if !self.is_server && hdr_ty == packet::Type::Handshake {
-            self.drop_epoch_state(paths, packet::Epoch::Initial, now);
+            self.drop_epoch_state(paths.get_active_mut().unwrap(), packet::Epoch::Initial, now);
         }
 
         // (Re)start the idle timer if we are sending the first ack-eliciting
@@ -5124,7 +5142,7 @@ impl Connection {
     /// [`stream_send()`]: struct.Connection.html#method.stream_send
     /// [`InvalidStreamState`]: enum.Error.html#variant.InvalidStreamState
     pub fn stream_shutdown(
-        &mut self, cwin_available: usize, stream_id: u64, direction: Shutdown, err: u64,
+        &mut self, stream_id: u64, direction: Shutdown, err: u64,
     ) -> Result<()> {
         // Don't try to stop a local unidirectional stream.
         if direction == Shutdown::Read &&
@@ -5169,7 +5187,7 @@ impl Connection {
                 self.tx_buffered = self.tx_buffered.saturating_sub(unsent as usize);
 
                 // Update send capacity.
-                self.update_tx_cap(cwin_available);
+                self.update_tx_cap();
 
                 self.streams.insert_reset(stream_id, err, final_size);
 
@@ -5793,7 +5811,7 @@ impl Connection {
         match self.peer_transport_params.max_datagram_frame_size {
             None => None,
             Some(peer_frame_len) => {
-                let dcid = self.destination_id(paths);
+                let dcid = self.destination_id(paths.get_active().ok());
                 // Start from the maximum packet size...
                 let mut max_len = self.max_send_udp_payload_size(paths.get_max_datagram_size());
                 // ...subtract the Short packet header overhead...
@@ -6601,8 +6619,8 @@ impl Connection {
     /// Note that the value returned can change throughout the connection's
     /// lifetime.
     #[inline]
-    pub fn source_id(&self, paths: &mut path::PathMap) -> ConnectionId {
-        if let Ok(path) = paths.get_active() {
+    pub fn source_id(&self, optional_path: Option<&path::Path>) -> ConnectionId {
+        if let Some(path) = optional_path {
             if let Some(active_scid_seq) = path.active_scid_seq {
                 if let Ok(e) = self.ids.get_scid(active_scid_seq) {
                     return ConnectionId::from_ref(e.cid.as_ref());
@@ -6628,8 +6646,8 @@ impl Connection {
     /// Note that the value returned can change throughout the connection's
     /// lifetime.
     #[inline]
-    pub fn destination_id(&self, paths: &mut path::PathMap) -> ConnectionId {
-        if let Ok(path) = paths.get_active() {
+    pub fn destination_id(&self, optional_path: Option<&path::Path>) -> ConnectionId {
+        if let Some(path) = optional_path {
             if let Some(active_dcid_seq) = path.active_dcid_seq {
                 if let Ok(e) = self.ids.get_dcid(active_dcid_seq) {
                     return ConnectionId::from_ref(e.cid.as_ref());
@@ -6796,11 +6814,11 @@ impl Connection {
     }
 
     fn parse_peer_transport_params(
-        &mut self, paths: &mut path::PathMap, peer_params: TransportParams,
+        &mut self, path: &mut path::Path, peer_params: TransportParams,
     ) -> Result<()> {
         // Validate initial_source_connection_id.
         match &peer_params.initial_source_connection_id {
-            Some(v) if v != &self.destination_id(paths) =>
+            Some(v) if v != &self.destination_id(Some(path)) =>
                 return Err(Error::InvalidTransportParam),
 
             Some(_) => (),
@@ -6841,7 +6859,7 @@ impl Connection {
             }
         }
 
-        self.process_peer_transport_params(paths, peer_params)?;
+        self.process_peer_transport_params(path, peer_params)?;
 
         self.parsed_peer_transport_params = true;
 
@@ -6849,13 +6867,13 @@ impl Connection {
     }
 
     fn process_peer_transport_params(
-        &mut self, paths: &mut path::PathMap, peer_params: TransportParams,
+        &mut self, path: &mut path::Path, peer_params: TransportParams,
     ) -> Result<()> {
         self.max_tx_data = peer_params.initial_max_data;
 
         // Update send capacity.
-        
-        self.update_tx_cap(paths.get_cwin_available());
+        self.update_path_stats_from_path(path);
+        self.update_tx_cap();
 
         self.streams
             .update_peer_max_streams_bidi(peer_params.initial_max_streams_bidi);
@@ -6867,11 +6885,9 @@ impl Connection {
 
         self.recovery_config.max_ack_delay = max_ack_delay;
 
-        let active_path = paths.get_active_mut()?;
+        path.recovery.max_ack_delay = max_ack_delay;
 
-        active_path.recovery.max_ack_delay = max_ack_delay;
-
-        active_path
+        path
             .recovery
             .update_max_datagram_size(peer_params.max_udp_payload_size as usize);
 
@@ -6882,7 +6898,7 @@ impl Connection {
         if self.local_transport_params.enable_multipath &&
             peer_params.enable_multipath
         {
-            paths.set_multipath(true);
+            path.set_multipath(true);
         }
 
         self.peer_transport_params = peer_params;
@@ -6893,7 +6909,7 @@ impl Connection {
     /// Continues the handshake.
     ///
     /// If the connection is already established, it does nothing.
-    fn do_handshake(&mut self, paths: & mut path::PathMap, now: time::Instant) -> Result<()> {
+    fn do_handshake(&mut self, path: & mut path::Path, now: time::Instant) -> Result<()> {
         let mut ex_data = tls::ExData {
             application_protos: &self.application_protos,
 
@@ -6930,7 +6946,7 @@ impl Connection {
                     let peer_params =
                         TransportParams::decode(raw_params, self.is_server)?;
 
-                    self.parse_peer_transport_params(paths, peer_params)?;
+                    self.parse_peer_transport_params(path, peer_params)?;
                 }
 
                 return Ok(());
@@ -6949,7 +6965,7 @@ impl Connection {
             let peer_params =
                 TransportParams::decode(raw_params, self.is_server)?;
 
-            self.parse_peer_transport_params(paths, peer_params)?;
+            self.parse_peer_transport_params(path, peer_params)?;
         }
 
         if self.handshake_completed {
@@ -6959,7 +6975,7 @@ impl Connection {
             if self.is_server {
                 self.handshake_confirmed = true;
 
-                self.drop_epoch_state(paths, packet::Epoch::Handshake, now);
+                self.drop_epoch_state(path, packet::Epoch::Handshake, now);
             }
 
             // Once the handshake is completed there's no point in processing
@@ -7127,12 +7143,12 @@ impl Connection {
 
                 let handshake_status = self.handshake_status();
 
-                if self.use_path_pkt_num_space(paths, epoch) {
+                if self.use_path_pkt_num_space(paths.multipath(), epoch) {
                     if let Some(path_id) =
                         self.ids.get_scid(0).ok().and_then(|e| e.path_id)
                     {
                         let is_app_limited =
-                            self.delivery_rate_check_if_app_limited(paths, path_id);
+                            self.delivery_rate_check_if_app_limited(paths.get_mut(path_id).unwrap());
                         let p = paths.get_mut(path_id)?;
                         if is_app_limited {
                             p.recovery.delivery_rate_update_app_limited(true);
@@ -7159,8 +7175,7 @@ impl Connection {
                         .map(|(pid, _)| pid)
                         .collect::<Vec<usize>>()
                     {
-                        let is_app_limited =
-                            self.delivery_rate_check_if_app_limited(paths, pid);
+                        let is_app_limited = self.delivery_rate_check_if_app_limited(paths.get_mut(pid).unwrap() );
                         let p = paths.get_mut(pid)?;
                         if is_app_limited {
                             p.recovery.delivery_rate_update_app_limited(true);
@@ -7309,7 +7324,7 @@ impl Connection {
                     self.handshake.provide_data(level, recv_buf)?;
                 }
 
-                self.do_handshake(paths, now)?;
+                self.do_handshake(paths.get_active_mut().unwrap(), now)?;
             },
 
             frame::Frame::CryptoHeader { .. } => unreachable!(),
@@ -7521,8 +7536,7 @@ impl Connection {
                         let (lost_packets, lost_bytes) = close_path(
                             &mut self.ids,
                             &mut self.pkt_num_spaces,
-                            paths,
-                            pid,
+                            path,
                             now,
                             &self.trace_id,
                         )?;
@@ -7587,7 +7601,7 @@ impl Connection {
                 self.handshake_confirmed = true;
 
                 // Once the handshake is confirmed, we can drop Handshake keys.
-                self.drop_epoch_state(paths, packet::Epoch::Handshake, now);
+                self.drop_epoch_state(paths.get_active_mut().unwrap(), packet::Epoch::Handshake, now);
             },
 
             frame::Frame::Datagram { data } => {
@@ -7615,7 +7629,7 @@ impl Connection {
                 ack_delay,
                 ..
             } => {
-                if !self.use_path_pkt_num_space(paths, epoch) {
+                if !self.use_path_pkt_num_space(paths.multipath(), epoch) {
                     return Err(Error::MultiPathViolation);
                 }
                 let ack_delay = ack_delay
@@ -7651,7 +7665,7 @@ impl Connection {
                 if let Ok(e) = self.ids.get_dcid(space_identifier) {
                     if let Some(path_id) = e.path_id {
                         let is_app_limited =
-                            self.delivery_rate_check_if_app_limited(paths, path_id);
+                            self.delivery_rate_check_if_app_limited(paths.get_mut(path_id).unwrap());
                         let p = paths.get_mut(path_id)?;
                         if is_app_limited {
                             p.recovery.delivery_rate_update_app_limited(true);
@@ -7674,7 +7688,7 @@ impl Connection {
 
                 // Once the handshake is confirmed, we can drop Handshake keys.
                 if self.handshake_confirmed {
-                    self.drop_epoch_state(paths, packet::Epoch::Handshake, now);
+                    self.drop_epoch_state(paths.get_active_mut().unwrap(), packet::Epoch::Handshake, now);
                 }
             },
 
@@ -7684,7 +7698,7 @@ impl Connection {
                 reason,
                 ..
             } => {
-                if !self.use_path_pkt_num_space(paths, epoch) {
+                if !self.use_path_pkt_num_space(paths.multipath(), epoch) {
                     return Err(Error::MultiPathViolation);
                 }
                 let abandon_pid = match self
@@ -7707,7 +7721,7 @@ impl Connection {
                 dcid_seq_num,
                 seq_num,
             } => {
-                if !self.use_path_pkt_num_space(paths, epoch) {
+                if !self.use_path_pkt_num_space(paths.multipath(), epoch) {
                     return Err(Error::MultiPathViolation);
                 }
                 let pid = self
@@ -7722,7 +7736,7 @@ impl Connection {
                 dcid_seq_num,
                 seq_num,
             } => {
-                if !self.use_path_pkt_num_space(paths, epoch) {
+                if !self.use_path_pkt_num_space(paths.multipath(), epoch) {
                     return Err(Error::MultiPathViolation);
                 }
                 let pid = self
@@ -7737,7 +7751,7 @@ impl Connection {
     }
 
     /// Drops the keys and recovery state for the given epoch.
-    fn drop_epoch_state(&mut self, paths: &mut path::PathMap, epoch: packet::Epoch, now: time::Instant) {
+    fn drop_epoch_state(&mut self, path: &mut path::Path, epoch: packet::Epoch, now: time::Instant) {
         if self.pkt_num_spaces.crypto.get(epoch).crypto_open.is_none() {
             return;
         }
@@ -7747,10 +7761,16 @@ impl Connection {
         self.pkt_num_spaces.clear(epoch);
 
         let handshake_status = self.handshake_status();
-        for (_, p) in paths.iter_mut() {
-            p.recovery.on_pkt_num_space_discarded(epoch, handshake_status, now);
+        let addrs_tuples: Vec<(SocketAddr, SocketAddr)> = self.pending_per_path_events.keys().map(|(local, peer)| (*local, *peer)).collect();
+        for (local, peer) in addrs_tuples{
+            if local == path.local_addr() && peer == path.peer_addr() {
+                path.recovery.on_pkt_num_space_discarded(epoch, handshake_status, now);
+            } else {
+                self.pending_per_path_events.get_mut(&(local, peer)).unwrap().push_back(
+                    PathEvent::PacketNumSpaceDiscarded((local, peer), epoch, handshake_status, now)  
+                );   
+            }
         }
-
         trace!("{} dropped epoch {} state", self.trace_id, epoch);
     }
 
@@ -7824,17 +7844,21 @@ impl Connection {
         }
     }
 
+    fn update_path_stats_from_path(&mut self, path: &path::Path){
+        self.approximative_stats.insert((path.local_addr(), path.peer_addr()), path.stats());
+    }
+
     /// Updates send capacity.
-    fn update_tx_cap(&mut self, cwin_available: usize) {
+    fn update_tx_cap(&mut self) {
         self.tx_cap = cmp::min(
-            cwin_available,
+            self.approximative_stats.values().filter(|s| s.active).map(|s| s.cwnd_available).filter(|cwnd| *cwnd != std::usize::MAX).sum(),
             (self.max_tx_data - self.tx_data)
                 .try_into()
                 .unwrap_or(usize::MAX),
         );
     }
 
-    fn delivery_rate_check_if_app_limited(&self, paths: &mut path::PathMap, path_id: usize) -> bool {
+    fn delivery_rate_check_if_app_limited(&self, path: &mut path::Path) -> bool {
         // Enter the app-limited phase of delivery rate when these conditions
         // are met:
         //
@@ -7850,11 +7874,7 @@ impl Connection {
         // Note that this is equivalent to CheckIfApplicationLimited() from the
         // delivery rate draft. This is also separate from `recovery.app_limited`
         // and only applies to delivery rate calculation.
-        let cwin_available = paths
-            .get(path_id)
-            .map(|p| p.recovery.cwnd_available())
-            .unwrap_or(0);
-
+        let cwin_available = path.recovery.cwnd_available();
         ((self.tx_buffered + self.dgram_send_queue_byte_size()) < cwin_available) &&
             (self.tx_data.saturating_sub(self.last_tx_data)) <
                 cwin_available as u64 &&
@@ -7862,12 +7882,10 @@ impl Connection {
     }
 
     fn set_initial_dcid(
-        &mut self, paths: &mut path::PathMap, cid: ConnectionId<'static>, reset_token: Option<u128>,
-        path_id: usize,
+        &mut self, path: &mut path::Path, cid: ConnectionId<'static>, reset_token: Option<u128>
     ) -> Result<()> {
-        self.ids.set_initial_dcid(cid, reset_token, Some(path_id));
-        paths.get_mut(path_id)?.active_dcid_seq = Some(0);
-
+        self.ids.set_initial_dcid(cid, reset_token, path.get_path_id());
+        path.active_dcid_seq = Some(0);
         Ok(())
     }
 
@@ -8155,8 +8173,8 @@ impl Connection {
     /// Returns whether the path-specific packet number space should be used for
     /// sending packets.
     #[inline]
-    fn use_path_pkt_num_space(&self, paths: &mut path::PathMap, epoch: packet::Epoch) -> bool {
-        paths.multipath() && epoch == packet::Epoch::Application
+    fn use_path_pkt_num_space(&self, multipath: bool, epoch: packet::Epoch) -> bool {
+        multipath && epoch == packet::Epoch::Application
     }
 }
 
@@ -8230,25 +8248,24 @@ fn update_scid(
 /// Closes the path with the corresponding path identifier.
 fn close_path(
     ids: &mut cid::ConnectionIdentifiers,
-    pkt_num_spaces: &mut packet::PktNumSpaceMap, paths: &mut path::PathMap,
-    pid: usize, now: time::Instant, trace_id: &str,
+    pkt_num_spaces: &mut packet::PktNumSpaceMap, path: &mut path::Path,
+    now: time::Instant, trace_id: &str,
 ) -> Result<(usize, usize)> {
     // If the path had a active DCID, remove it.
-    if let Ok(p) = paths.get(pid) {
-        if let Some(dcid_seq) = p.active_dcid_seq {
-            let _ = ids.retire_dcid(dcid_seq);
-        }
-        pkt_num_spaces
-            .spaces
-            .update_lowest_active_rx_id(ids.min_scid_seq());
-        pkt_num_spaces
-            .spaces
-            .update_lowest_active_tx_id(ids.min_dcid_seq());
+    
+    if let Some(dcid_seq) = path.active_dcid_seq {
+        let _ = ids.retire_dcid(dcid_seq);
     }
-    paths.on_path_abandon_acknowledged(pid);
-    debug!("Closing path with pid {}; cleaning recovery", pid);
-    let abandon_path = paths.get_mut(pid)?;
-    Ok(abandon_path
+    pkt_num_spaces
+        .spaces
+        .update_lowest_active_rx_id(ids.min_scid_seq());
+    pkt_num_spaces
+        .spaces
+        .update_lowest_active_tx_id(ids.min_dcid_seq());
+    
+    path.on_path_abandon_acknowledged();
+    debug!("Closing path with pid {}; cleaning recovery", path.get_path_id().unwrap());
+    Ok(path
         .recovery
         .mark_all_inflight_as_lost(now, trace_id))
 }
@@ -8762,6 +8779,7 @@ impl TransportParams {
     }
 }
 
+
 #[doc(hidden)]
 pub mod testing {
     use super::*;
@@ -8772,6 +8790,7 @@ pub mod testing {
         pub server: Connection,
         pub server_paths: path::PathMap,
     }
+    
 
     impl Pipe {
         pub fn new() -> Result<Pipe> {
@@ -8834,6 +8853,7 @@ pub mod testing {
                 server_paths,
             })
         }
+
 
         pub fn with_config_and_scid_lengths(
             config: &mut Config, client_scid_len: usize, server_scid_len: usize,
@@ -9129,6 +9149,62 @@ pub mod testing {
         Ok(off)
     }
 
+    pub fn handle_path_events(conn: &mut Connection, conn_paths: &mut path::PathMap, perform_migration: bool){
+        let paths_sockets_addrs: Vec<(std::net::SocketAddr, std::net::SocketAddr)> = conn_paths.iter().map(|(_, p)| (p.local_addr(), p.peer_addr())).collect();
+        for (local_addr, peer_addr) in paths_sockets_addrs{
+            loop {
+                match conn_paths.pop_event(local_addr, peer_addr) {
+                    Some(qe) => {
+                        match qe {
+                            path::PathEvent::New(..) => unreachable!(),
+            
+                            path::PathEvent::Validated(local_addr, peer_addr) => {
+                                info!(
+                                    "Path ({}, {}) is now validated",
+                                    local_addr, peer_addr
+                                );
+                                if conn_paths.multipath() {
+                                    conn_paths.set_active(local_addr, peer_addr, true).ok();
+                                } else if perform_migration {
+                                    conn.migrate(conn_paths, local_addr, peer_addr).unwrap();
+                                }
+                            },
+                            path::PathEvent::FailedValidation(local_addr, peer_addr) => {
+                                info!(
+                                    "Path ({}, {}) failed validation",
+                                    local_addr, peer_addr
+                                );
+                            },
+                            path::PathEvent::Closed(local_addr, peer_addr, e, reason) => {
+                                info!(
+                                    "Path ({}, {}) is now closed and unusable; err = {}, reason = {:?}",
+                                    local_addr, peer_addr, e, reason
+                                );
+                            },
+                            path::PathEvent::ReusedSourceConnectionId(
+                                cid_seq,
+                                old,
+                                new,
+                            ) => {
+                                info!(
+                                    "Peer reused cid seq {} (initially {:?}) on {:?}",
+                                    cid_seq, old, new
+                                );
+                            },
+                            path::PathEvent::PeerMigrated(..) => unreachable!(),
+                            path::PathEvent::PeerPathStatus(..) => {},
+                            path::PathEvent::PacketNumSpaceDiscarded((local, peer), epoch, handshake_status, now) => {
+                                let p = conn_paths.get_mut_from_addr(local, peer).unwrap();
+                                p.recovery.on_pkt_num_space_discarded(epoch, handshake_status, now);
+                            },
+                        }
+                    }, 
+                    None => break
+                }
+            }
+        }
+    }
+
     pub fn process_flight(
         conn: &mut Connection, paths: &mut path::PathMap, flight: Vec<(Vec<u8>, SendInfo)>,
     ) -> Result<()> {
@@ -9279,7 +9355,7 @@ pub mod testing {
     ) -> Result<Vec<frame::Frame>> {
         let mut b = octets::OctetsMut::with_slice(buf);
 
-        let mut hdr = Header::from_bytes(&mut b, conn.source_id(paths).len()).unwrap();
+        let mut hdr = Header::from_bytes(&mut b, conn.source_id(paths.get_active().ok()).len()).unwrap();
 
         let epoch = hdr.ty.to_epoch()?;
 
@@ -9777,7 +9853,7 @@ mod tests {
 
         let mut pipe = testing::Pipe::with_server_config(&mut config).unwrap();
 
-        assert_eq!(pipe.client.set_session(&mut pipe.client_paths, session), Ok(()));
+        assert_eq!(pipe.client.set_session(&mut pipe.client_paths.get_active_mut().unwrap(), session), Ok(()));
         assert_eq!(pipe.handshake(), Ok(()));
 
         assert!(pipe.client.is_established());
@@ -9841,7 +9917,7 @@ mod tests {
 
         // Configure session on new connection.
         let mut pipe = testing::Pipe::with_config(&mut config).unwrap();
-        assert_eq!(pipe.client.set_session(&mut pipe.client_paths, session), Ok(()));
+        assert_eq!(pipe.client.set_session(&mut pipe.client_paths.get_active_mut().unwrap(), session), Ok(()));
 
         // Client sends initial flight.
         let (len, _) = pipe.client.send(&mut pipe.client_paths, &mut buf).unwrap();
@@ -9902,7 +9978,7 @@ mod tests {
 
         // Configure session on new connection.
         let mut pipe = testing::Pipe::with_config(&mut config).unwrap();
-        assert_eq!(pipe.client.set_session(&mut pipe.client_paths, session), Ok(()));
+        assert_eq!(pipe.client.set_session(&mut pipe.client_paths.get_active_mut().unwrap(), session), Ok(()));
 
         // Client sends initial flight.
         let (len, _) = pipe.client.send(&mut pipe.client_paths,  &mut buf).unwrap();
@@ -9973,7 +10049,7 @@ mod tests {
 
         // Configure session on new connection.
         let mut pipe = testing::Pipe::with_config(&mut config).unwrap();
-        assert_eq!(pipe.client.set_session(&mut pipe.client_paths, session), Ok(()));
+        assert_eq!(pipe.client.set_session(&mut pipe.client_paths.get_active_mut().unwrap(), session), Ok(()));
 
         // Client sends initial flight.
         pipe.client.send(&mut pipe.client_paths, &mut buf).unwrap();
@@ -10077,7 +10153,7 @@ mod tests {
 
         // Configure session on new connection.
         let mut pipe = testing::Pipe::with_config(&mut config).unwrap();
-        assert_eq!(pipe.client.set_session(&mut pipe.client_paths, session), Ok(()));
+        assert_eq!(pipe.client.set_session(&mut pipe.client_paths.get_active_mut().unwrap(), session), Ok(()));
 
         // Client sends initial flight.
         let (len, _) = pipe.client.send(&mut pipe.client_paths, &mut buf).unwrap();
@@ -10487,7 +10563,7 @@ mod tests {
         assert_eq!(pipe.client.stream_send(8, b"aaaaa", true), Ok(5));
 
         // Server shuts down one stream.
-        assert_eq!(pipe.server.stream_shutdown(pipe.server_paths.get_cwin_available(), 4, Shutdown::Read, 42), Ok(()));
+        assert_eq!(pipe.server.stream_shutdown(4, Shutdown::Read, 42), Ok(()));
 
         let mut r = pipe.server.readable();
         assert_eq!(r.next(), None);
@@ -10786,7 +10862,7 @@ mod tests {
 
         // Client resets the stream.
         pipe.client
-            .stream_shutdown(pipe.client_paths.get_cwin_available(), 0, Shutdown::Write, 1001)
+            .stream_shutdown( 0, Shutdown::Write, 1001)
             .unwrap();
         pipe.advance().unwrap();
 
@@ -10809,7 +10885,7 @@ mod tests {
 
         // Server resets the stream in reaction.
         pipe.server
-            .stream_shutdown(pipe.server_paths.get_cwin_available(), 0, Shutdown::Write, 1001)
+            .stream_shutdown( 0, Shutdown::Write, 1001)
             .unwrap();
         pipe.advance().unwrap();
 
@@ -10817,10 +10893,10 @@ mod tests {
 
         // Repeat for the other 2 streams
         pipe.client
-            .stream_shutdown(pipe.client_paths.get_cwin_available(), 4, Shutdown::Write, 1001)
+            .stream_shutdown( 4, Shutdown::Write, 1001)
             .unwrap();
         pipe.client
-            .stream_shutdown(pipe.client_paths.get_cwin_available(), 8, Shutdown::Write, 1001)
+            .stream_shutdown( 8, Shutdown::Write, 1001)
             .unwrap();
         pipe.advance().unwrap();
 
@@ -10843,10 +10919,10 @@ mod tests {
         assert_eq!(None, r.next());
 
         pipe.server
-            .stream_shutdown(pipe.server_paths.get_cwin_available(), 4, Shutdown::Write, 1001)
+            .stream_shutdown( 4, Shutdown::Write, 1001)
             .unwrap();
         pipe.server
-            .stream_shutdown(pipe.server_paths.get_cwin_available(), 8, Shutdown::Write, 1001)
+            .stream_shutdown( 8, Shutdown::Write, 1001)
             .unwrap();
         pipe.advance().unwrap();
 
@@ -11550,7 +11626,7 @@ mod tests {
         assert_eq!(pipe.server.streams.len(), 1);
 
         // Server shuts down stream.
-        assert_eq!(pipe.server.stream_shutdown(pipe.server_paths.get_cwin_available(), 4, Shutdown::Read, 42), Ok(()));
+        assert_eq!(pipe.server.stream_shutdown( 4, Shutdown::Read, 42), Ok(()));
 
         let mut r = pipe.server.readable();
         assert_eq!(r.next(), None);
@@ -11602,7 +11678,7 @@ mod tests {
         assert_eq!(pipe.server.streams.len(), 0);
 
         assert_eq!(
-            pipe.server.stream_shutdown(pipe.server_paths.get_cwin_available(), 4, Shutdown::Read, 0),
+            pipe.server.stream_shutdown(4, Shutdown::Read, 0),
             Err(Error::Done)
         );
     }
@@ -11626,7 +11702,7 @@ mod tests {
         assert_eq!(pipe.server.streams.len(), 1);
 
         // Server shuts down stream.
-        assert_eq!(pipe.server.stream_shutdown(pipe.server_paths.get_cwin_available(), 4, Shutdown::Read, 42), Ok(()));
+        assert_eq!(pipe.server.stream_shutdown( 4, Shutdown::Read, 42), Ok(()));
 
         let mut r = pipe.server.readable();
         assert_eq!(r.next(), None);
@@ -11653,7 +11729,7 @@ mod tests {
         assert_eq!(pipe.server.streams.len(), 0);
 
         assert_eq!(
-            pipe.server.stream_shutdown(pipe.server_paths.get_cwin_available(), 4, Shutdown::Read, 0),
+            pipe.server.stream_shutdown( 4, Shutdown::Read, 0),
             Err(Error::Done)
         );
     }
@@ -11685,7 +11761,7 @@ mod tests {
         assert_eq!(pipe.advance(), Ok(()));
 
         assert_eq!(pipe.server.stream_recv(0, &mut buf), Ok((1, false)));
-        assert_eq!(pipe.server.stream_shutdown(pipe.server_paths.get_cwin_available(), 0, Shutdown::Read, 123), Ok(()));
+        assert_eq!(pipe.server.stream_shutdown( 0, Shutdown::Read, 123), Ok(()));
 
         assert_eq!(pipe.server.rx_data, 1);
         assert_eq!(pipe.client.tx_data, 1);
@@ -11718,17 +11794,17 @@ mod tests {
         assert_eq!(pipe.advance(), Ok(()));
 
         // Test local and remote shutdown.
-        assert_eq!(pipe.client.stream_shutdown(pipe.client_paths.get_cwin_available(), 2, Shutdown::Write, 42), Ok(()));
+        assert_eq!(pipe.client.stream_shutdown( 2, Shutdown::Write, 42), Ok(()));
         assert_eq!(
-            pipe.client.stream_shutdown(pipe.client_paths.get_cwin_available(), 2, Shutdown::Read, 42),
+            pipe.client.stream_shutdown( 2, Shutdown::Read, 42),
             Err(Error::InvalidStreamState(2))
         );
 
         assert_eq!(
-            pipe.client.stream_shutdown(pipe.client_paths.get_cwin_available(), 3, Shutdown::Write, 42),
+            pipe.client.stream_shutdown(3, Shutdown::Write, 42),
             Err(Error::InvalidStreamState(3))
         );
-        assert_eq!(pipe.client.stream_shutdown(pipe.client_paths.get_cwin_available(), 3, Shutdown::Read, 42), Ok(()));
+        assert_eq!(pipe.client.stream_shutdown( 3, Shutdown::Read, 42), Ok(()));
     }
 
     #[test]
@@ -11758,7 +11834,7 @@ mod tests {
         assert_eq!(pipe.advance(), Ok(()));
 
         // Server shuts down stream.
-        assert_eq!(pipe.server.stream_shutdown(pipe.server_paths.get_cwin_available(),4, Shutdown::Write, 42), Ok(()));
+        assert_eq!(pipe.server.stream_shutdown(4, Shutdown::Write, 42), Ok(()));
 
         let mut r = pipe.server.writable();
         assert_eq!(r.next(), None);
@@ -11816,7 +11892,7 @@ mod tests {
         assert_eq!(pipe.server.streams.len(), 0);
 
         assert_eq!(
-            pipe.server.stream_shutdown(pipe.server_paths.get_cwin_available(), 4, Shutdown::Write, 0),
+            pipe.server.stream_shutdown( 4, Shutdown::Write, 0),
             Err(Error::Done)
         );
     }
@@ -11872,7 +11948,7 @@ mod tests {
         assert!(!pipe.client.should_update_max_data());
 
         // Server shuts down stream.
-        assert_eq!(pipe.server.stream_shutdown(pipe.server_paths.get_cwin_available(), 4, Shutdown::Write, 42), Ok(()));
+        assert_eq!(pipe.server.stream_shutdown( 4, Shutdown::Write, 42), Ok(()));
         assert_eq!(pipe.advance(), Ok(()));
 
         // Server can now send more data (on a different stream).
@@ -11994,7 +12070,7 @@ mod tests {
         assert_eq!(r.next(), Some(0));
         assert_eq!(r.next(), None);
 
-        assert_eq!(pipe.server.stream_shutdown( pipe.server_paths.get_cwin_available(),0, Shutdown::Read, 0), Ok(()));
+        assert_eq!(pipe.server.stream_shutdown( 0, Shutdown::Read, 0), Ok(()));
 
         let mut r = pipe.server.readable();
         assert_eq!(r.next(), None);
@@ -12062,7 +12138,7 @@ mod tests {
         assert_eq!(w.next(), None);
 
         // Server shuts down stream.
-        assert_eq!(pipe.server.stream_shutdown( pipe.server_paths.get_cwin_available(),0, Shutdown::Write, 0), Ok(()));
+        assert_eq!(pipe.server.stream_shutdown(0, Shutdown::Write, 0), Ok(()));
 
         let mut w = pipe.server.writable();
         assert_eq!(w.next(), None);
@@ -12256,8 +12332,8 @@ mod tests {
         let pn = 0;
         let pn_len = packet::pkt_num_len(pn).unwrap();
 
-        let dcid = pipe.client.destination_id(&mut pipe.client_paths);
-        let scid = pipe.client.source_id(&mut pipe.client_paths);
+        let dcid = pipe.client.destination_id(pipe.client_paths.get_active().ok());
+        let scid = pipe.client.source_id(pipe.client_paths.get_active().ok());
 
         let hdr = Header {
             ty: packet::Type::Initial,
@@ -14069,7 +14145,9 @@ mod tests {
 
         pipe.client.on_timeout(&mut pipe.client_paths);
 
-        let epoch = packet::Epoch::Application;
+        testing::handle_path_events(&mut pipe.client, &mut pipe.client_paths, false);
+
+        let epoch = packet::Epoch::Application;        
         assert_eq!(
             pipe.client_paths
                 .get_active()
@@ -14707,7 +14785,7 @@ mod tests {
         assert!(pipe.server.is_readable());
 
         // Server shuts down stream.
-        assert_eq!(pipe.server.stream_shutdown( pipe.server_paths.get_cwin_available(),4, Shutdown::Read, 0), Ok(()));
+        assert_eq!(pipe.server.stream_shutdown(4, Shutdown::Read, 0), Ok(()));
         assert!(!pipe.server.is_readable());
 
         // Server received dgram.
@@ -15375,7 +15453,7 @@ mod tests {
         assert_eq!(pipe.server_paths.pop_event(pipe.server_paths.get_active().unwrap().local_addr(), pipe.server_paths.get_active().unwrap().peer_addr()), None);
         assert_eq!(pipe.client.source_cids_left(), 1);
 
-        let scid = pipe.client.source_id(&mut pipe.client_paths).into_owned();
+        let scid = pipe.client.source_id(pipe.client_paths.get_active().ok()).into_owned();
 
         let (scid_1, reset_token_1) = testing::create_cid_and_reset_token(16);
         assert_eq!(
@@ -15419,7 +15497,7 @@ mod tests {
 
         // The active Destination Connection ID of the server should now be the
         // one with sequence number 1.
-        assert_eq!(pipe.server.destination_id(&mut pipe.server_paths), scid_1);
+        assert_eq!(pipe.server.destination_id(pipe.server_paths.get_active().ok()), scid_1);
 
         // Now tries to experience CID retirement. If the server tries to remove
         // non-existing DCIDs, it fails.
@@ -15442,7 +15520,7 @@ mod tests {
         assert_eq!(pipe.client.retired_scid_next(), Some(scid_1));
         assert_eq!(pipe.client.retired_scid_next(), None);
 
-        assert_eq!(pipe.server.destination_id(&mut pipe.server_paths), scid_2);
+        assert_eq!(pipe.server.destination_id(pipe.server_paths.get_active().ok()), scid_2);
         assert_eq!(pipe.server.available_dcids(), 0);
 
         // Trying to remove the last DCID triggers an error.
@@ -15470,7 +15548,7 @@ mod tests {
         let mut pipe = testing::Pipe::with_config(&mut config).unwrap();
         assert_eq!(pipe.handshake(), Ok(()));
 
-        let scid = pipe.client.source_id(&mut pipe.client_paths).into_owned();
+        let scid = pipe.client.source_id(pipe.client_paths.get_active().ok()).into_owned();
 
         let (scid_1, reset_token_1) = testing::create_cid_and_reset_token(16);
         assert_eq!(
@@ -17093,8 +17171,8 @@ mod tests {
         let server_addr = testing::Pipe::server_addr();
         let client_addr_2 = "127.0.0.1:5678".parse().unwrap();
 
-        let cid_c2s_0 = pipe.client.destination_id(&mut pipe.client_paths).into_owned();
-        let cid_s2c_0 = pipe.server.destination_id(&mut pipe.server_paths).into_owned();
+        let cid_c2s_0 = pipe.client.destination_id(pipe.client_paths.get_active().ok()).into_owned();
+        let cid_s2c_0 = pipe.server.destination_id(pipe.server_paths.get_active().ok()).into_owned();
 
         assert_eq!(pipe.client.probe_path(&mut pipe.client_paths, client_addr_2, server_addr), Ok(1));
         assert_eq!(pipe.advance(), Ok(()));

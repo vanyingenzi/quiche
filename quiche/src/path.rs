@@ -24,7 +24,6 @@
 // NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
 // SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-use std::collections::HashMap;
 use std::time;
 
 use std::collections::BTreeMap;
@@ -174,6 +173,10 @@ pub enum PathEvent {
 
     /// The peer advertised the path status for the mentioned 4-tuple.
     PeerPathStatus((SocketAddr, SocketAddr), PathStatus),
+
+
+    /// The following path events are none RFC MPQUIC events there are added for other purposes
+    PacketNumSpaceDiscarded((SocketAddr, SocketAddr), packet::Epoch, HandshakeStatus, time::Instant),
 }
 
 fn get_addrs_from_event(event: &PathEvent) -> Result<(SocketAddr, SocketAddr)> {
@@ -185,6 +188,7 @@ fn get_addrs_from_event(event: &PathEvent) -> Result<(SocketAddr, SocketAddr)> {
         PathEvent::ReusedSourceConnectionId(_, (local, peer), _) => Ok((*local, *peer)),
         PathEvent::PeerMigrated(local, peer) => Ok((*local, *peer)),
         PathEvent::PeerPathStatus((local, peer), _) => Ok((*local, *peer)),
+        PathEvent::PacketNumSpaceDiscarded((local, peer), ..) => Ok((*local, *peer)),
     }
 }
 
@@ -278,6 +282,12 @@ pub struct Path {
 
     /// The expected sequence number of the PATH_STATUS to be received.
     expected_path_status_seq_num: u64,
+
+    events: VecDeque<PathEvent>,
+
+    path_id: Option<usize>,
+
+    multipath: bool
 }
 
 impl Path {
@@ -323,7 +333,18 @@ impl Path {
             migrating: false,
             needs_ack_eliciting: false,
             expected_path_status_seq_num: 0,
+            events: VecDeque::new(),
+            path_id: None, 
+            multipath: false
         }
+    }
+
+    pub fn set_path_id(&mut self, path_id: usize) {
+        self.path_id = Some(path_id)
+    }
+
+    pub fn get_path_id(&self) -> Option<usize>{
+        self.path_id
     }
 
     /// Returns the local address on which this path operates.
@@ -540,6 +561,16 @@ impl Path {
         self.received_challenges.pop_front()
     }
 
+    #[inline]
+    pub fn notify_event(&mut self, ev: PathEvent) {
+        self.events.push_back(ev);
+    }
+
+    #[inline]
+    pub fn pop_event(&mut self) -> Option<PathEvent>{
+        self.events.pop_front()
+    }
+
     /// Returns the time at which a timeout will occur on the path.
     #[inline]
     pub fn path_timer(&self) -> Option<time::Instant> {
@@ -614,6 +645,29 @@ impl Path {
         matches!(self.status, PathStatus::Standby)
     }
 
+    pub fn set_multipath(&mut self, b: bool) {
+        self.multipath = b;
+    }
+
+    pub fn multipath(&self) -> bool {
+        self.multipath
+    }
+
+    pub fn on_path_abandon_acknowledged(&mut self) {
+        let local_addr = self.local_addr;
+        let peer_addr = self.peer_addr;
+        let to_notify = if let PathState::Closing(e, r) = &mut self.state {
+            let to_notify = Some((*e, r.clone()));
+            self.state = PathState::Closed(*e, std::mem::take(r));
+            to_notify
+        } else {
+            None
+        };
+        if let Some((e, r)) = to_notify {
+            self.notify_event(PathEvent::Closed(local_addr, peer_addr, e, r));
+        }
+    }
+
     pub fn stats(&self) -> PathStats {
         PathStats {
             local_addr: self.local_addr,
@@ -624,6 +678,7 @@ impl Path {
             recv: self.recv_count,
             sent: self.sent_count,
             lost: self.recovery.lost_count,
+            lost_bytes: self.recovery.bytes_lost,
             lost_spurious: self.recovery.lost_spurious_count,
             retrans: self.retrans_count,
             rtt: self.recovery.rtt(),
@@ -631,9 +686,9 @@ impl Path {
             rttvar: self.recovery.rttvar(),
             rtt_update: self.recovery.rtt_update_count,
             cwnd: self.recovery.cwnd(),
+            cwnd_available: self.recovery.cwnd_available(),
             sent_bytes: self.sent_bytes,
             recv_bytes: self.recv_bytes,
-            lost_bytes: self.recovery.bytes_lost,
             stream_retrans_bytes: self.stream_retrans_bytes,
             pmtu: self.recovery.max_datagram_size(),
             delivery_rate: self.recovery.delivery_rate(),
@@ -686,7 +741,7 @@ pub struct PathMap {
     is_server: bool,
 
     /// Whether the multipath extensions are enabled.
-    multipath: bool,
+    // multipath: bool,
 
     /// Path identifiers requiring sending PATH_ABANDON frames.
     path_abandon: VecDeque<usize>,
@@ -696,9 +751,6 @@ pub struct PathMap {
     path_status_to_advertise: VecDeque<(usize, u64, bool)>,
     /// The sequence number for the next PATH_STATUS.
     next_path_status_seq_num: u64,
-
-    /// Similar to events but this is done per thread
-    per_path_events: HashMap<usize, VecDeque<PathEvent>>
 }
 
 impl PathMap {
@@ -709,7 +761,6 @@ impl PathMap {
     ) -> Self {
         let mut paths = Slab::with_capacity(1); // most connections only have one path
         let mut addrs_to_paths = BTreeMap::new();
-        let mut per_path_events = HashMap::new();
         
         let local_addr = initial_path.local_addr;
         let peer_addr = initial_path.peer_addr;
@@ -719,7 +770,8 @@ impl PathMap {
         
         let active_path_id = paths.insert(initial_path);
         addrs_to_paths.insert((local_addr, peer_addr), active_path_id);
-        per_path_events.insert(active_path_id, VecDeque::new());
+
+        paths.get_mut(active_path_id).unwrap().set_path_id(active_path_id);
 
         Self {
             paths,
@@ -727,11 +779,10 @@ impl PathMap {
             addrs_to_paths,
             // events: VecDeque::new(),
             is_server,
-            multipath: false,
+            // multipath: false,
             path_abandon: VecDeque::new(),
             path_status_to_advertise: VecDeque::new(),
             next_path_status_seq_num: 0,
-            per_path_events: per_path_events
         }
     }
 
@@ -753,6 +804,11 @@ impl PathMap {
     #[inline]
     pub fn get_mut(&mut self, path_id: usize) -> Result<&mut Path> {
         self.paths.get_mut(path_id).ok_or(Error::InvalidState)
+    }
+
+    pub fn get_mut_from_addr(&mut self, local: SocketAddr, peer: SocketAddr) ->  Result<&mut Path> {
+        let pid = self.addrs_to_paths.get(&(local, peer)).unwrap();
+        self.get_mut(*pid)
     }
 
     #[inline]
@@ -919,7 +975,7 @@ impl PathMap {
 
         let pid = self.paths.insert(path);
         self.addrs_to_paths.insert((local_addr, peer_addr), pid);
-        self.per_path_events.insert(pid, VecDeque::new());
+        self.paths.get_mut(pid).unwrap().set_path_id(pid);
 
         // Notifies the application if we are in server mode.
         if is_server {
@@ -933,26 +989,25 @@ impl PathMap {
     pub fn notify_event(&mut self, ev: PathEvent) {
         let addresses = get_addrs_from_event(&ev).unwrap();
         let pid = self.addrs_to_paths.get(&addresses).unwrap();
-        self.per_path_events.get_mut(pid).unwrap().push_back(ev);
+        self.paths.get_mut(*pid).ok_or(Error::InvalidState).unwrap().notify_event(ev);
         // self.events.push_back(ev);
     }
 
     /// Gets the first path event to be notified to the application on the given path
     pub fn pop_event(&mut self, local_addr: SocketAddr, peer_addr: SocketAddr) -> Option<PathEvent> {
         let pid = self.addrs_to_paths.get(&(local_addr, peer_addr)).unwrap();
-        self.per_path_events.get_mut(pid).unwrap().pop_front()
+        self.paths.get_mut(*pid).ok_or(Error::InvalidState).unwrap().pop_event()
     }
 
     /// Notifies all failed validations to the application.
     pub fn notify_failed_validations(&mut self) {
-        let validation_failed = self
+        let validation_failed: Vec<(usize, &mut Path)> = self
             .paths
             .iter_mut()
-            .filter(|(_, p)| p.validation_failed() && !p.failure_notified);
+            .filter(|(_, p)| p.validation_failed() && !p.failure_notified).collect();
 
         for (_, p) in validation_failed {
-            let pid = self.addrs_to_paths.get(&(p.local_addr, p.peer_addr)).unwrap();
-            self.per_path_events.get_mut(pid).unwrap().push_back(PathEvent::FailedValidation(
+            p.notify_event(PathEvent::FailedValidation(
                 p.local_addr,
                 p.peer_addr,
             ));
@@ -967,9 +1022,8 @@ impl PathMap {
             .iter_mut()
             .filter(|(_, p)| p.closed() && !p.failure_notified)
         {
-            let pid = self.addrs_to_paths.get(&(p.local_addr, p.peer_addr)).unwrap();
             if let PathState::Closed(e, r) = &p.state {
-                self.per_path_events.get_mut(pid).unwrap().push_back(PathEvent::Closed(
+                p.notify_event(PathEvent::Closed(
                     p.local_addr,
                     p.peer_addr,
                     *e,
@@ -1079,15 +1133,14 @@ impl PathMap {
 
     /// Returns whether multipath extension has been enabled.
     pub fn multipath(&self) -> bool {
-        self.multipath
+        self.paths.iter().any(|(_, p)| p.multipath())
     }
 
+    /* 
     /// Sets whether multipath extension is enabled.
     pub fn set_multipath(&mut self, v: bool) {
         self.multipath = v;
-    }
-
-    
+    }*/
 
     /// Changes the state of the path with the identifier `path_id` according to
     /// the provided `PathRequest`.
@@ -1101,7 +1154,7 @@ impl PathMap {
     pub fn request(
         &mut self, path_id: usize, request: PathRequest,
     ) -> Result<()> {
-        if !self.multipath {
+        if !self.multipath() {
             return Err(Error::InvalidState);
         }
         let path = self.get_mut(path_id)?;
@@ -1154,7 +1207,7 @@ impl PathMap {
     /// [`request()`]: struct.PathManager.html#method.request
     pub fn set_active_path_from_pid(&mut self, path_id: usize) -> Result<()> {
         let is_server = self.is_server;
-        let multipath = self.multipath;
+        let multipath = self.multipath();
         if !multipath {
             if let Ok(old_active_path) = self.get_active_mut() {
                 old_active_path.set_state(PathState::Unused)?;
@@ -1337,14 +1390,10 @@ impl PathMap {
             if seq_num >= p.expected_path_status_seq_num {
                 p.expected_path_status_seq_num = seq_num.saturating_add(1);
                 let addr = (p.local_addr(), p.peer_addr());
-                self.per_path_events.get_mut(&path_id).unwrap()
-                    .push_back(PathEvent::PeerPathStatus(addr, available.into()));
+                self.paths.get_mut(path_id).ok_or(Error::InvalidState).unwrap().notify_event(PathEvent::PeerPathStatus(addr, available.into()));
             }
         }
     }
-
-
-
 }
 
 /// Statistics about the path of a connection.
@@ -1399,6 +1448,9 @@ pub struct PathStats {
 
     /// The size of the connection's congestion window in bytes.
     pub cwnd: usize,
+
+    /// The size of the connection's congestion window available in bytes.
+    pub cwnd_available: usize,
 
     /// The number of sent bytes.
     pub sent_bytes: u64,
