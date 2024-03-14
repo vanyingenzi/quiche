@@ -3202,12 +3202,7 @@ impl Connection {
     /// # Ok::<(), quiche::Error>(())
     /// ```
     pub fn send(&mut self, paths: &mut path::PathMap, out: &mut [u8]) -> Result<(usize, SendInfo)> {
-        let ret = self.send_on_path(paths, out, None, None);
-        for (_,  path) in paths.iter(){
-            self.update_path_stats_from_path(path);
-        }
-        self.update_tx_cap();
-        ret
+        self.send_on_path(paths, out, None, None)
     }
 
     /// Writes a single QUIC packet to be sent to the peer from the specified
@@ -5893,6 +5888,15 @@ impl Connection {
                 timeout.duration_since(now)
             }
         })
+    }
+
+    /// Returns pending per path events for a path known by the connection
+    pub fn get_pending_path_events(&mut self , path: &mut path::Path){
+        if let Some(queue) = self.pending_per_path_events.get_mut(&(path.local_addr(), path.peer_addr())){
+            while let Some(e) = queue.pop_front(){
+                path.notify_event(e);
+            } 
+        }
     }
 
     /// [!Added by Vany Ingenzi].

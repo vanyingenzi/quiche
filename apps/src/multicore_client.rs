@@ -64,10 +64,10 @@ fn rwlock_exp_backoff(rwlock: &Arc<RwLock<bool>>, max_duration: Duration) -> boo
     while !*rwlock.read().unwrap() {
         std::thread::sleep(wait_duration);
         wait_duration = if wait_duration < max_duration {
+            wait_duration * 2
+        } else {
             *rwlock.write().unwrap() = false;
             return false;
-        } else {
-            Duration::from_nanos(1)
         };
     }
     *rwlock.write().unwrap() = false;
@@ -76,8 +76,9 @@ fn rwlock_exp_backoff(rwlock: &Arc<RwLock<bool>>, max_duration: Duration) -> boo
 
 #[inline]
 pub fn read_packets_on_socket(
-    socket: &UdpSocket, events: &Events, quiche_conn: &Arc<Mutex<(Connection, quiche::path::PathMap)>>,
-    pkt_count: &mut u64, dump_packet_path: &Option<String>, buf: &mut [u8], local_addr: SocketAddr, peer_addr: SocketAddr
+    socket: &UdpSocket, events: &Events, quiche_conn: &Arc<Mutex<Connection>>,
+    paths_guard: &Arc<Mutex<quiche::path::PathMap>>, pkt_count: &mut u64, dump_packet_path: &Option<String>, 
+    buf: &mut [u8], local_addr: SocketAddr, peer_addr: SocketAddr
 ) -> Result<(), ClientError> {
     let mut offset_buf = vec![(0, 0); MAX_OFFSET];
     let mut count = 0;
@@ -127,10 +128,11 @@ pub fn read_packets_on_socket(
         }
     }
 
-    let (ref mut conn, ref mut conn_paths) = *quiche_conn.lock().unwrap();
+    let mut conn_paths = paths_guard.lock().unwrap();
+    let mut conn = quiche_conn.lock().unwrap();
     for i in 0..count {
         let (offset, len) = offset_buf[i];
-        let read = match conn.recv(conn_paths, &mut buf[offset..(offset+len)], quiche::RecvInfo {
+        let read = match conn.recv(&mut conn_paths, &mut buf[offset..(offset+len)], quiche::RecvInfo {
             to: local_addr,
             from: peer_addr,
         }) {
@@ -151,8 +153,7 @@ pub fn write_packets_on_path(
     conn: &mut Connection, paths: &mut quiche::path::PathMap, out: &mut [u8],
 ) -> Result<(), ClientError> {
     loop {
-        let (write, send_info) =
-            match conn.send_on_path(paths, out, Some(*local_addr), Some(*peer_addr)) {
+        let (write, send_info) = match conn.send_on_path(paths, out, Some(*local_addr), Some(*peer_addr)) {
                 Ok(v) => v,
 
                 Err(quiche::Error::Done) => {
@@ -232,7 +233,8 @@ fn can_send_on_path(paths: &quiche::path::PathMap, local_addr: SocketAddr, peer_
 }
 
 fn client_thread(
-    quiche_conn: Arc<Mutex<(Connection, quiche::path::PathMap)>>,
+    quiche_conn: Arc<Mutex<Connection>>,
+    paths_guard: Arc<Mutex<quiche::path::PathMap>>,
     dump_packet_path: Option<String>,
     addrs: (SocketAddr, SocketAddr), 
     initiate_connection: bool,
@@ -248,8 +250,9 @@ fn client_thread(
     let (local_addr, peer_addr) = addrs;
     let mut socket = multicore_create_socket((&local_addr, &peer_addr), &mut poll);
     if initiate_connection {
-        let (ref mut conn, ref mut conn_paths) = *quiche_conn.lock().unwrap();
-        multicore_initiate_connection(&peer_addr, &local_addr, &mut out, &scid, conn, conn_paths, &mut socket)?;
+        let mut conn_paths = paths_guard.lock().unwrap();
+        let mut conn = quiche_conn.lock().unwrap();
+        multicore_initiate_connection(&peer_addr, &local_addr, &mut out, &scid, &mut conn, &mut conn_paths, &mut socket)?;
         *sent_conn_init_pkt.write().unwrap() = true;
     } else {
         while !*sent_conn_init_pkt.read().unwrap() {}
@@ -263,22 +266,23 @@ fn client_thread(
     );
 
     let mut can_send = initiate_connection; // Initial path can send
-    let mut local_timeout = Duration::from_nanos(1);
+    let mut path_timeout;
     
     loop {
-        poll.poll(&mut events, Some(local_timeout)).unwrap();
 
-        if events.is_empty() {
-            local_timeout = if local_timeout < Duration::from_millis(1) {
-                local_timeout * 2
-            } else {
-                Duration::from_nanos(1)
+        {
+            let mut conn_paths = paths_guard.lock().unwrap();
+            path_timeout = match conn_paths.get_mut_from_addr(local_addr, peer_addr){
+                Ok(path) => path.path_timeout(), 
+                Err(_) => Some(Duration::from_nanos(1))
             };
         }
 
+        poll.poll(&mut events, path_timeout).unwrap();
+
         // Reading from socket critical section
         if !events.is_empty() {
-            read_packets_on_socket(&socket, &events,&quiche_conn, &mut pkt_count, &dump_packet_path, &mut buf, local_addr, peer_addr)?;
+            read_packets_on_socket(&socket, &events, &quiche_conn, &paths_guard, &mut pkt_count, &dump_packet_path, &mut buf, local_addr, peer_addr)?;
             if !*main_thread_advance_lock.read().unwrap(){
                 *main_thread_advance_lock.write().unwrap() = true;
             }
@@ -286,27 +290,30 @@ fn client_thread(
 
         // Writing to socket critical section
         if can_send {
-            let (ref mut conn, ref mut conn_paths) = *quiche_conn.lock().unwrap();
-            write_packets_on_path(&local_addr, &peer_addr, &socket, conn, conn_paths, &mut out).ok();
+            let mut conn_paths = paths_guard.lock().unwrap();
+            let mut conn = quiche_conn.lock().unwrap();
+            write_packets_on_path(&local_addr, &peer_addr, &socket, &mut conn, &mut conn_paths, &mut out).ok();
             if conn.is_closed() {
                 break;
             }
         } else {
-            let (_, ref conn_paths) = *quiche_conn.lock().unwrap();
-            can_send = can_send_on_path(conn_paths, local_addr, peer_addr)
+            let mut conn_paths = paths_guard.lock().unwrap();
+            can_send = can_send_on_path(&mut conn_paths, local_addr, peer_addr)
         }
 
         {
-            let (ref mut conn, _) = *quiche_conn.lock().unwrap();
+            let conn = quiche_conn.lock().unwrap();
             if conn.is_closed() {
                 break;
             }
         }
     }
+    
     if !*main_thread_advance_lock.read().unwrap(){
         *main_thread_advance_lock.write().unwrap() = true;
     }
-    debug!("[Path Thread]: Thread {:?}, Done", thread::current().id());
+
+    info!("[Path Thread]: Thread {:?}, Done", thread::current().id());
     Ok(())
 }
 
@@ -332,8 +339,7 @@ pub fn multicore_connect(
         connect_url.to_socket_addrs().unwrap().next().unwrap()
     };
 
-    let (sockets_addrs, local_addr) =
-        multicore_prepare_addresses(&peer_addr, &args);
+    let (sockets_addrs, local_addr) = multicore_prepare_addresses(&peer_addr, &args);
 
     let mut addrs = Vec::with_capacity(sockets_addrs.len());
     addrs.push(local_addr);
@@ -471,7 +477,8 @@ pub fn multicore_connect(
         }
     }
 
-    let conn_guard = Arc::new(Mutex::new((conn, conn_paths)));
+    let conn_guard = Arc::new(Mutex::new(conn));
+    let paths_guard = Arc::new(Mutex::new(conn_paths));
     let sent_connection_initial_packet = Arc::new(RwLock::new(false));
     
     let main_thread_advance = Arc::new(RwLock::new(false));
@@ -481,6 +488,7 @@ pub fn multicore_connect(
 
     for (local, peer) in sockets_addrs.clone() {
         let conn_cloned = conn_guard.clone();
+        let paths_cloned = paths_guard.clone();
         // HTTPConn doesn't implement Send therefore can't be used in a Mutex
         let dump_packet_path = conn_args.dump_packet_path.clone();
         let clone_scid = scid.clone();
@@ -497,8 +505,10 @@ pub fn multicore_connect(
                 local,
                 peer
             );
+            
             client_thread(
                 conn_cloned,
+                paths_cloned,
                 dump_packet_path,
                 (local, peer),
                 local == local_addr,
@@ -524,22 +534,27 @@ pub fn multicore_connect(
     
     loop {
         {
-            let (ref mut conn, ref mut conn_paths) = *conn_guard.lock().unwrap();
-            conn_timeout = conn.timeout(conn_paths).unwrap_or(Duration::ZERO);
-        }
-
-        if !rwlock_exp_backoff(&main_thread_advance, conn_timeout){
-            let (ref mut conn, ref mut conn_paths) = *conn_guard.lock().unwrap();
-            trace!("timed out");
-            conn.on_timeout(conn_paths);
+            let mut conn_paths = paths_guard.lock().unwrap();
+            let conn = conn_guard.lock().unwrap();
+            conn_timeout = conn.timeout(&mut conn_paths); // Default timeout
         }
         
+        if let Some(timeout) = conn_timeout {
+            if !rwlock_exp_backoff(&main_thread_advance, timeout){
+                let mut conn_paths = paths_guard.lock().unwrap();
+                let mut conn = conn_guard.lock().unwrap();
+                trace!("timed out");
+                conn.on_timeout(&mut conn_paths);
+            }
+        }
+
         {
-            let (ref mut conn, ref mut conn_paths) = *conn_guard.lock().unwrap();
+            let mut conn_paths = paths_guard.lock().unwrap();
+            let mut conn = conn_guard.lock().unwrap();
             if conn.is_closed() {
                 info!(
                     "connection closed, {:?} {:?}",
-                    conn.stats(conn_paths),
+                    conn.stats(&mut conn_paths),
                     conn_paths.iter().map(|(_, p)| p.stats()).collect::<Vec<quiche::PathStats>>()
                 );
 
@@ -603,7 +618,7 @@ pub fn multicore_connect(
                     };
 
                     http_conn = Some(Http3Conn::with_urls(
-                        conn,
+                        &mut conn,
                         &args.urls,
                         args.reqs_cardinal,
                         &args.req_headers,
@@ -627,8 +642,12 @@ pub fn multicore_connect(
             // process received data.
 
             if let Some(h_conn) = http_conn.as_mut() {
-                h_conn.send_requests(conn, conn_paths, &args.dump_response_path);
-                h_conn.handle_responses(conn, conn_paths, &mut buf, &app_data_start);
+                h_conn.send_requests(&mut conn, &mut conn_paths, &args.dump_response_path);
+                h_conn.handle_responses(&mut conn, &mut conn_paths, &mut buf, &app_data_start);
+            }
+
+            for (_, path) in conn_paths.iter_mut(){
+                conn.get_pending_path_events(path);
             }
 
             // Handle path events.
@@ -648,7 +667,7 @@ pub fn multicore_connect(
                                     if conn_paths.multipath() {
                                         conn_paths.set_active(local_addr, peer_addr, true).ok();
                                     } else if args.perform_migration {
-                                        conn.migrate(conn_paths, local_addr, peer_addr).unwrap();
+                                        conn.migrate(&mut conn_paths, local_addr, peer_addr).unwrap();
                                         migrated = true;
                                     }
                                 },
@@ -712,7 +731,7 @@ pub fn multicore_connect(
             if conn_args.multipath
                 && probed_paths < addrs.len()
                 && conn.available_dcids() > 0
-                && conn.probe_path(conn_paths, addrs[probed_paths], peer_addr).is_ok()
+                && conn.probe_path(&mut conn_paths, addrs[probed_paths], peer_addr).is_ok()
             {
                 probed_paths += 1;
             }
@@ -724,7 +743,7 @@ pub fn multicore_connect(
                 && conn.available_dcids() > 0
             {
                 let additional_local_addr = sockets_addrs[1].0;
-                conn.probe_path(conn_paths,additional_local_addr, peer_addr).unwrap();
+                conn.probe_path(&mut conn_paths,additional_local_addr, peer_addr).unwrap();
                 new_path_probed = true;
             }
 
@@ -756,10 +775,40 @@ pub fn multicore_connect(
                     }
                 });
             }
+            if conn.is_closed() {
+                info!(
+                    "connection closed, {:?} {:?}",
+                    conn.stats(&mut conn_paths),
+                    conn_paths.iter().map(|(_, p)| p.stats()).collect::<Vec<quiche::PathStats>>()
+                );
+
+                if !conn.is_established() {
+                    error!(
+                        "connection timed out after {:?}",
+                        app_data_start.elapsed(),
+                    );
+
+                    return Err(ClientError::HandshakeFail);
+                }
+
+                if let Some(session_file) = &args.session_file {
+                    if let Some(session) = conn.session() {
+                        std::fs::write(session_file, session).ok();
+                    }
+                }
+
+                if let Some(h_conn) = http_conn {
+                    if h_conn.report_incomplete(&app_data_start) {
+                        return Err(ClientError::HttpFail);
+                    }
+                }
+
+                break;
+            }
         }
     }
 
-    trace!("[Connection thread] Done");
+    info!("[Connection thread] Done");
 
     Ok(())
 }

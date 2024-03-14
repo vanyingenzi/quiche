@@ -580,6 +580,17 @@ impl Path {
             .min()
     }
 
+    pub fn path_timeout(&self) -> Option<time::Duration> {
+        let now = time::Instant::now();
+        let timeout = self.path_timer();
+
+        if timeout <= Some(now) {
+            Some(time::Duration::ZERO)
+        } else {
+            Some(timeout?.duration_since(now))
+        }
+    }
+
     #[inline]
     pub fn closing_timer(&self) -> Option<time::Instant> {
         self.closing_timer
@@ -806,9 +817,11 @@ impl PathMap {
         self.paths.get_mut(path_id).ok_or(Error::InvalidState)
     }
 
-    pub fn get_mut_from_addr(&mut self, local: SocketAddr, peer: SocketAddr) ->  Result<&mut Path> {
-        let pid = self.addrs_to_paths.get(&(local, peer)).unwrap();
-        self.get_mut(*pid)
+    pub fn get_mut_from_addr(&mut self, local: SocketAddr, peer: SocketAddr) ->  Result<&mut Path> {        
+        match self.addrs_to_paths.get(&(local, peer)) {
+            Some(pid) => self.get_mut(*pid), 
+            None => Err(Error::InvalidState)
+        }
     }
 
     #[inline]
