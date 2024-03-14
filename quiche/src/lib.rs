@@ -482,7 +482,7 @@ const CONNECTION_WINDOW_FACTOR: f64 = 1.5;
 
 // How many probing packet timeouts do we tolerate before considering the path
 // validation as failed.
-const MAX_PROBING_TIMEOUTS: usize = 5; // TODO push back to 3
+const MAX_PROBING_TIMEOUTS: usize = 3;
 
 // The default initial congestion window size in terms of packet count.
 const DEFAULT_INITIAL_CONGESTION_WINDOW_PACKETS: usize = 10;
