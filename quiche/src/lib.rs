@@ -3764,9 +3764,15 @@ impl Connection {
                                            * this time */
                     };
 
-                    if push_frame_to_pkt!(b, frames, frame, left) {
-                        pns.ack_elicited = false;
-                        wrote_ack_mp = true;
+                    // When a PING frame needs to be sent, avoid sending the ACK_MP if
+                    // there is not enough cwnd available for both (note that PING
+                    // frames are always 1 byte, so we just need to check that the
+                    // ACK_MP's length is lower than cwnd).
+                    if pns.ack_elicited || (left_before_packing_ack_frame - left) + frame.wire_len() < cwnd_available {
+                        if push_frame_to_pkt!(b, frames, frame, left) {
+                            pns.ack_elicited = false;
+                            wrote_ack_mp = true;
+                        }
                     }
                 }
                 if wrote_ack_mp {
@@ -3810,16 +3816,18 @@ impl Connection {
                                                    * this time */
                             };
 
-                            if push_frame_to_pkt!(b, frames, frame, left) {
-                                // Continue advertising until we send the ACK_MP
-                                // on
-                                // its own path, unless the path is not active.
-                                if let Some(path_id) = pns_path_id {
-                                    if !self.paths.get(path_id)?.active() {
+                            if !ack_elicit_required || (left_before_packing_ack_frame - left) + frame.wire_len() < cwnd_available {
+                                if push_frame_to_pkt!(b, frames, frame, left) {
+                                    // Continue advertising until we send the ACK_MP
+                                    // on
+                                    // its own path, unless the path is not active.
+                                    if let Some(path_id) = pns_path_id {
+                                        if !self.paths.get(path_id)?.active() {
+                                            pns.ack_elicited = false;
+                                        }
+                                    } else {
                                         pns.ack_elicited = false;
                                     }
-                                } else {
-                                    pns.ack_elicited = false;
                                 }
                             }
                         }
@@ -6965,7 +6973,7 @@ impl Connection {
 
             return Ok(packet::Type::from_epoch(epoch));
         }
-
+        let send_path = self.paths.get(send_pid)?;
         for &epoch in packet::Epoch::epochs(
             packet::Epoch::Initial..=packet::Epoch::Application,
         ) {
@@ -6974,7 +6982,7 @@ impl Connection {
                 continue;
             }
 
-            if self.pkt_num_spaces.is_ready(epoch, None) {
+            if self.pkt_num_spaces.is_ready(epoch, send_path.active_dcid_seq) {
                 return Ok(packet::Type::from_epoch(epoch));
             }
 
@@ -6993,10 +7001,9 @@ impl Connection {
 
         // If there are flushable, almost full or blocked streams, use the
         // Application epoch.
-        let send_path = self.paths.get(send_pid)?;
         if (self.is_established() || self.is_in_early_data()) &&
             (self.should_send_handshake_done() ||
-                self.almost_full ||
+                (self.almost_full && self.flow_control.max_data() < self.flow_control.max_data_next()) ||
                 self.blocked_limit.is_some() ||
                 self.dgram_send_queue.has_pending() ||
                 self.local_error
