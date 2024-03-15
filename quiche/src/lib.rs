@@ -482,7 +482,7 @@ const CONNECTION_WINDOW_FACTOR: f64 = 1.5;
 
 // How many probing packet timeouts do we tolerate before considering the path
 // validation as failed.
-const MAX_PROBING_TIMEOUTS: usize = 3;
+const MAX_PROBING_TIMEOUTS: usize = 10;
 
 // The default initial congestion window size in terms of packet count.
 const DEFAULT_INITIAL_CONGESTION_WINDOW_PACKETS: usize = 10;
@@ -7733,7 +7733,9 @@ impl Connection {
                     .get_dcid(dcid_seq_num)?
                     .path_id
                     .ok_or(Error::InvalidFrame)?;
-                paths.on_path_status_received(pid, seq_num, false);
+                if let Ok(path) = paths.get_mut(pid){
+                    path.on_path_status_received(seq_num, false);
+                }
             },
 
             frame::Frame::PathAvailable {
@@ -7748,7 +7750,9 @@ impl Connection {
                     .get_dcid(dcid_seq_num)?
                     .path_id
                     .ok_or(Error::InvalidFrame)?;
-                paths.on_path_status_received(pid, seq_num, true);
+                if let Ok(path) = paths.get_mut(pid){
+                    path.on_path_status_received(seq_num, true);
+                }
             },
         };
         Ok(())
@@ -7970,7 +7974,7 @@ impl Connection {
             );
 
             // Notify the application.
-            paths
+            paths.get_mut_from_addr(old_local_addr, old_peer_addr).unwrap()
                 .notify_event(path::PathEvent::ReusedSourceConnectionId(
                     in_scid_seq,
                     (old_local_addr, old_peer_addr),

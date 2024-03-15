@@ -179,19 +179,6 @@ pub enum PathEvent {
     PacketNumSpaceDiscarded((SocketAddr, SocketAddr), packet::Epoch, HandshakeStatus, time::Instant),
 }
 
-fn get_addrs_from_event(event: &PathEvent) -> Result<(SocketAddr, SocketAddr)> {
-    match event {
-        PathEvent::New(local, peer) => Ok((*local, *peer)), 
-        PathEvent::Validated(local, peer) => Ok((*local, *peer)), 
-        PathEvent::FailedValidation(local, peer) => Ok((*local, *peer)), 
-        PathEvent::Closed(local, peer, ..) => Ok((*local, *peer)),
-        PathEvent::ReusedSourceConnectionId(_, (local, peer), _) => Ok((*local, *peer)),
-        PathEvent::PeerMigrated(local, peer) => Ok((*local, *peer)),
-        PathEvent::PeerPathStatus((local, peer), _) => Ok((*local, *peer)),
-        PathEvent::PacketNumSpaceDiscarded((local, peer), ..) => Ok((*local, *peer)),
-    }
-}
-
 /// A network path on which QUIC packets can be sent.
 pub struct Path {
     /// The local address.
@@ -664,6 +651,17 @@ impl Path {
         self.multipath
     }
 
+    /// Handles the reception of PATH_STANDBY/PATH_AVAILABLE.
+    pub fn on_path_status_received(
+        &mut self, seq_num: u64, available: bool,
+    ) {
+        if seq_num >= self.expected_path_status_seq_num {
+            self.expected_path_status_seq_num = seq_num.saturating_add(1);
+            let addr = (self.local_addr(), self.peer_addr());
+            self.notify_event(PathEvent::PeerPathStatus(addr, available.into()));
+        }
+    }
+
     pub fn on_path_abandon_acknowledged(&mut self) {
         let local_addr = self.local_addr;
         let peer_addr = self.peer_addr;
@@ -934,11 +932,11 @@ impl PathMap {
             .find(|(_, p)| p.unused())
             .ok_or(Error::Done)?;
 
-        let path = self.paths.remove(pid_to_remove);
+        let mut path = self.paths.remove(pid_to_remove);
         self.addrs_to_paths
             .remove(&(path.local_addr, path.peer_addr));
 
-        self.notify_event(PathEvent::Closed(
+        path.notify_event(PathEvent::Closed(
             path.local_addr,
             path.peer_addr,
             0,
@@ -992,19 +990,20 @@ impl PathMap {
 
         // Notifies the application if we are in server mode.
         if is_server {
-            self.notify_event(PathEvent::New(local_addr, peer_addr));
+            self.paths.get_mut(pid).unwrap().notify_event(PathEvent::New(local_addr, peer_addr));
         }
 
         Ok(pid)
     }
 
+    /*
     /// Notifies a path event to the application served by the connection.
     pub fn notify_event(&mut self, ev: PathEvent) {
         let addresses = get_addrs_from_event(&ev).unwrap();
         let pid = self.addrs_to_paths.get(&addresses).unwrap();
         self.paths.get_mut(*pid).ok_or(Error::InvalidState).unwrap().notify_event(ev);
         // self.events.push_back(ev);
-    }
+    } */
 
     /// Gets the first path event to be notified to the application on the given path
     pub fn pop_event(&mut self, local_addr: SocketAddr, peer_addr: SocketAddr) -> Option<PathEvent> {
@@ -1077,12 +1076,12 @@ impl PathMap {
                 p.migrating = false;
 
                 // Notifies the application.
-                self.notify_event(PathEvent::Validated(local_addr, peer_addr));
+                p.notify_event(PathEvent::Validated(local_addr, peer_addr));
 
                 // If this path was the candidate for migration, notifies the
                 // application.
                 if pid == active_pid && was_migrating {
-                    self.notify_event(PathEvent::PeerMigrated(
+                    p.notify_event(PathEvent::PeerMigrated(
                         local_addr, peer_addr,
                     ));
                 }
@@ -1104,7 +1103,7 @@ impl PathMap {
                 None
             };
             if let Some((e, r)) = to_notify {
-                self.notify_event(PathEvent::Closed(local_addr, peer_addr, e, r));
+                path.notify_event(PathEvent::Closed(local_addr, peer_addr, e, r));
             }
         }
     }
@@ -1195,7 +1194,7 @@ impl PathMap {
         }
     }
 
-    /// Attenion not to be called if the connection is draining or closed
+    /// Attention not to be called if the connection is draining or closed
     pub fn send_ack_eliciting(&mut self) -> Result<()> {
         self.get_active_mut()?.needs_ack_eliciting = true;
         Ok(())
@@ -1234,7 +1233,7 @@ impl PathMap {
             if new_active_path.validated() && !multipath {
                 let local_addr = new_active_path.local_addr();
                 let peer_addr = new_active_path.peer_addr();
-                self.notify_event(PathEvent::PeerMigrated(local_addr, peer_addr));
+                new_active_path.notify_event(PathEvent::PeerMigrated(local_addr, peer_addr));
             } else if !new_active_path.validated() {
                 new_active_path.migrating = !multipath;
                 // Requests path validation if needed.
@@ -1395,18 +1394,7 @@ impl PathMap {
         self.path_status_to_advertise.pop_front();
     }
 
-    /// Handles the reception of PATH_STANDBY/PATH_AVAILABLE.
-    pub fn on_path_status_received(
-        &mut self, path_id: usize, seq_num: u64, available: bool,
-    ) {
-        if let Ok(p) = self.get_mut(path_id) {
-            if seq_num >= p.expected_path_status_seq_num {
-                p.expected_path_status_seq_num = seq_num.saturating_add(1);
-                let addr = (p.local_addr(), p.peer_addr());
-                self.paths.get_mut(path_id).ok_or(Error::InvalidState).unwrap().notify_event(PathEvent::PeerPathStatus(addr, available.into()));
-            }
-        }
-    }
+    
 }
 
 /// Statistics about the path of a connection.

@@ -43,6 +43,7 @@ use std::rc::Rc;
 use std::cell::RefCell;
 
 use std::path;
+use std::thread::JoinHandle;
 
 use ring::rand::SecureRandom;
 
@@ -1714,5 +1715,40 @@ impl Scheduler {
 
     pub fn len(&mut self) -> usize{
         self.paths.len()
+    }
+}
+
+use std::sync::Arc;
+use mio::Waker;
+
+pub struct MulticoreClient {
+    pub conn: quiche::Connection,
+
+    pub conn_paths: quiche::path::PathMap,
+
+    pub http_conn: Option<Box<Http3Conn>>,
+
+    pub app_proto_selected: bool,
+
+    pub partial_requests: std::collections::HashMap<u64, PartialRequest>,
+
+    pub partial_responses: std::collections::HashMap<u64, PartialResponse>,
+
+    pub max_datagram_size: usize,
+
+    pub loss_rate: f64,
+
+    pub max_send_burst: usize,
+
+    pub paths_thread: Vec<JoinHandle<()>>,
+
+    pub on_connection_done: Arc<Waker>, 
+}
+
+use std::fmt;
+
+impl fmt::Debug for MulticoreClient{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "connection trace id {:?}", self.conn.trace_id())
     }
 }

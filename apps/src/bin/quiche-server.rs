@@ -24,11 +24,11 @@
 // NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
 // SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-#[macro_use]
 extern crate log;
 
 use quiche_apps::args::*;
 use quiche_apps::server::*;
+use quiche_apps::multicore_server::*;
 
 fn main() {
     // Parse CLI parameters.
@@ -37,7 +37,7 @@ fn main() {
     let args = ServerArgs::with_docopt(&docopt);
 
     if conn_args.multicore {
-        info!("Run the multicore");
+        multicore_start_server(args, conn_args);
     } else {
         start_server(args, conn_args);
     }
