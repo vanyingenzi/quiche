@@ -12,9 +12,9 @@ RUST_LOG=info ../target/release/quiche-server --root /tmp/www --multipath --mult
 
 client 
 ```bash
-RUST_LOG=info ../target/release/quiche-client https:127.0.0.1:4433/testfile --no-verify --dump-responses ./responses -A 127.0.0.1:6788 -A 127.0.0.1:6789 --multipath --multicore
+RUST_LOG=info ../target/release/quiche-client https:127.0.0.1:4433/testfile --no-verify -A 127.0.0.1:6788 -A 127.0.0.1:6789 --multipath --multicore >/dev/null
 ```
 
 ```bash
-sudo perf record -e cycles -F 999 -g --call-graph lbr -- ../target/release/quiche-client https:127.0.0.1:4433/testfile --no-verify --dump-responses ./responses -A 127.0.0.1:6788 -A 127.0.0.1:6789 --multipath --multicore
+sudo perf record -e cycles -F 999 -g --call-graph lbr -- ../target/release/quiche-client https:127.0.0.1:4433/testfile --no-verify -A 127.0.0.1:6788 -A 127.0.0.1:6789 --multipath --multicore >/dev/null
 ```
