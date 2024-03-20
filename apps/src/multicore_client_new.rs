@@ -32,6 +32,7 @@ use crate::client::*;
 use crate::common::*;
 extern crate core_affinity;
 
+use shared_arena::ArenaBox;
 use static_assertions;
 use std::collections::BTreeMap;
 use std::net::Ipv4Addr;
@@ -45,6 +46,7 @@ use std::rc::Rc;
 
 use std::cell::RefCell;
 use std::str::FromStr;
+use std::time::Instant;
 use lockfree::channel::{mpsc, spsc};
 use std::thread;
 use std::time::Duration;
@@ -53,21 +55,25 @@ use mio::net::UdpSocket;
 use quiche::Connection;
 use ring::rand::*;
 
-const MAX_BUF_SIZE: usize = 65507;
+// const MAX_BUF_SIZE: usize = 65507;
 const MAX_DATAGRAM_SIZE: usize = 1350;
 
 use shared_arena::SharedArena;
 use std::sync::Arc;
 
+type Packet = [u8; MAX_DATAGRAM_SIZE];
+
 pub struct MRcvPacketInfo {
     pub local_addr: SocketAddr,
+    pub len: usize,
     pub rcv_info: quiche::RecvInfo, 
-    pub pckt: Vec<u8>,
+    pub pckt: ArenaBox<Packet>,
 }
 
 pub struct MSndPacketInfo {
     pub peer_addr: SocketAddr,
-    pub pkt: Vec<u8>
+    pub len: usize,
+    pub pkt: ArenaBox<Packet>
 }
 
 fn multicore_create_socket(
@@ -85,8 +91,8 @@ fn client_thread(
     conn_channel: mpsc::Sender<MRcvPacketInfo>,
     mut path_channel: spsc::Receiver<MSndPacketInfo>,
     addrs: (SocketAddr, SocketAddr),
+    arena: Arc<SharedArena<Packet>>
 ) -> Result<(), ClientError> {
-    let mut buf = [0; MAX_BUF_SIZE];
     let mut poll = mio::Poll::new().unwrap();
     let mut events = mio::Events::with_capacity(1024);
     let (local_addr, peer_addr) = addrs;
@@ -103,7 +109,8 @@ fn client_thread(
         poll.poll(&mut events, Some(Duration::ZERO)).unwrap();
         for _event in &events {
             'read: loop {
-                let (len, from) = match socket.recv_from(&mut buf) {
+                let mut packet: Packet = [0u8; MAX_DATAGRAM_SIZE];
+                let (len, from) = match socket.recv_from(&mut packet) {
                     Ok(v) => v,
 
                     Err(e) => {
@@ -119,17 +126,19 @@ fn client_thread(
                     },
                 };
 
+                let packet_box = arena.alloc(packet);
+
                 let rcv_info = quiche::RecvInfo {
                     to: local_addr, 
                     from
                 };
-                conn_channel.send(MRcvPacketInfo { local_addr, rcv_info, pckt: Vec::from(&buf[..len]) }).ok();
+                conn_channel.send(MRcvPacketInfo { local_addr, len, rcv_info, pckt: packet_box }).ok();
             }
         }
         
         match path_channel.recv(){
-            Ok(pkt) => {
-                if let Err(e) = socket.send_to(&pkt.pkt, pkt.peer_addr) {
+            Ok(mut pkt) => {
+                if let Err(e) = socket.send_to(&mut (pkt.pkt[..pkt.len]), pkt.peer_addr) {
                     if e.kind() == std::io::ErrorKind::WouldBlock {
                         trace!(
                             "{} -> {}: send() would block",
@@ -155,7 +164,6 @@ pub fn multicore_connect(
     output_sink: impl FnMut(String) + 'static,
 ) -> Result<(), ClientError> {
     static_assertions::assert_impl_all!(Connection: Send);
-    let mut out = [0; MAX_DATAGRAM_SIZE];
 
     // ** [Connection thread]
 
@@ -284,6 +292,7 @@ pub fn multicore_connect(
         &mut config,
     ).unwrap();
 
+    
     if let Some(keylog) = &mut keylog {
         if let Ok(keylog) = keylog.try_clone() {
             conn.set_keylog(Box::new(keylog));
@@ -312,6 +321,7 @@ pub fn multicore_connect(
 
     let core_ids = core_affinity::get_core_ids().unwrap();
     let mut current_path_thread_idx = 0;
+    let arena = Arc::new(SharedArena::new());
 
     let (conn_tx, mut conn_rx) = mpsc::create();
     let mut path_to_channel = BTreeMap::new();
@@ -322,6 +332,7 @@ pub fn multicore_connect(
         let clone_tx = conn_tx.clone();
         // HTTPConn doesn't implement Send therefore can't be used in a Mutex
         let core_id = core_ids[current_path_thread_idx];
+        let arena_clone = arena.clone();
         thread::spawn(move || {
             if core_affinity::set_for_current(core_id) {
                 info!("Set core affinity for {:?}", thread::current().id());
@@ -336,6 +347,7 @@ pub fn multicore_connect(
                 clone_tx,
                 path_rx,
                 (local, peer),
+                arena_clone
             )
             .unwrap();
         });
@@ -347,12 +359,12 @@ pub fn multicore_connect(
         peer_addr, local_addr, scid,
     );
 
-    let (write, send_info) = conn.send(&mut conn_paths, &mut out).expect("initial send failed");
-    let pkt = Vec::from(&out[..write]);
+    let mut pkt: Packet = [0u8; MAX_DATAGRAM_SIZE];
+    let (len, send_info) = conn.send(&mut conn_paths, &mut pkt).expect("initial send failed");
     let channel = path_to_channel.get_mut(&(send_info.from, send_info.to)).unwrap();
-    channel.send(MSndPacketInfo { peer_addr: send_info.to, pkt }).ok();
+    channel.send(MSndPacketInfo { peer_addr: send_info.to, len, pkt: arena.alloc(pkt) }).ok();
 
-    trace!("written {}", write);
+    trace!("written {}", len);
 
     let mut new_path_probed = false;
     let mut probed_paths = 0;
@@ -363,6 +375,7 @@ pub fn multicore_connect(
     let mut pkt_count = 0;
 
     let mut optional_from_queue = None;
+    
     loop {
 
         if !conn.is_in_early_data() || app_proto_selected {
@@ -393,7 +406,7 @@ pub fn multicore_connect(
                 pkt_count += 1;
                 
                 // Process potentially coalesced packets.
-                let read = match conn.recv(&mut conn_paths, &mut rcv_pkt.pckt, rcv_pkt.rcv_info) {
+                let read = match conn.recv(&mut conn_paths, &mut rcv_pkt.pckt[..rcv_pkt.len], rcv_pkt.rcv_info) {
                     Ok(v) => v,
         
                     Err(e) => {
@@ -408,7 +421,7 @@ pub fn multicore_connect(
                 // If the event loop reported no events, it means that the timeout
                 // has expired, so handle it without attempting to read packets. We
                 // will then proceed with the send loop.
-                trace!("timed out");
+                // trace!("timed out");
                 conn.on_timeout(&mut conn_paths);
             }
         };
@@ -640,7 +653,6 @@ pub fn multicore_connect(
             });
         }
 
-
         // Determine in which order we are going to iterate over paths.
         let scheduled_tuples = lowest_latency_scheduler(&conn_paths);
 
@@ -649,16 +661,17 @@ pub fn multicore_connect(
         for (local_addr, peer_addr) in scheduled_tuples {
             let channel = path_to_channel.get_mut(&(local_addr, peer_addr)).unwrap();
             loop {
-                let (write, send_info) = match conn.send_on_path(
+                let mut packet: Packet = [0u8; MAX_DATAGRAM_SIZE];
+                let (len, send_info) = match conn.send_on_path(
                     &mut conn_paths,
-                    &mut out,
+                    &mut packet,
                     Some(local_addr),
                     Some(peer_addr),
                 ) {
                     Ok(v) => v,
 
                     Err(quiche::Error::Done) => {
-                        trace!("{} -> {}: done writing", local_addr, peer_addr);
+                        // trace!("{} -> {}: done writing", local_addr, peer_addr);
                         break;
                     },
 
@@ -673,9 +686,8 @@ pub fn multicore_connect(
                     },
                 };
 
-                let pkt = Vec::from(&out[..write]);
-                channel.send(MSndPacketInfo { peer_addr: peer_addr, pkt: pkt }).ok();
-                trace!("{} -> {}: written {}", local_addr, send_info.to, write);
+                channel.send(MSndPacketInfo { peer_addr: peer_addr, pkt: arena.alloc(packet), len}).ok();
+                trace!("{} -> {}: written {}", local_addr, send_info.to, len);
             }
         }
 
