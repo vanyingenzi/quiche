@@ -36,6 +36,9 @@ itertools = "0.10"
 static_assertions = "1.1.0"
 core_affinity = "0.8.1"
 spin = "0.9.8"
+ringbuf = "0.3.3"
+lockfree = "0.5.1"
+shared_arena = "0.8.4"
 
 [lib]
 crate-type = ["lib"]

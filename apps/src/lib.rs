@@ -34,3 +34,4 @@ pub mod sendto;
 pub mod multicore_client;
 pub mod server;
 pub mod multicore_server;
+pub mod multicore_client_new;

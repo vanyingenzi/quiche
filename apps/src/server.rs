@@ -9,10 +9,6 @@ use std::collections::HashMap;
 
 use std::convert::TryFrom;
 
-use std::rc::Rc;
-
-use std::cell::RefCell;
-
 use ring::rand::*;
 
 use crate::args::*;
@@ -21,6 +17,7 @@ use crate::sendto::*;
 
 const MAX_BUF_SIZE: usize = 65507;
 const MAX_DATAGRAM_SIZE: usize = 1350;
+
 
 pub fn start_server(
     args: ServerArgs, conn_args: CommonArgs

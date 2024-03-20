@@ -13,15 +13,13 @@ use crate::args::*;
 use crate::common::*;
 use crate::sendto::*;
 
-use std::time::{Duration, Instant};
-
 const MAX_BUF_SIZE: usize = 65507;
 const MAX_DATAGRAM_SIZE: usize = 1350;
 
 pub fn server_thread(
-    client_guard: Arc<MulticoreClient>, 
-    addr: (std::net::SocketAddr, std::net::SocketAddr)
-) {
+    _client_guard: Arc<MulticoreClient>, 
+    _addr: (std::net::SocketAddr, std::net::SocketAddr)
+) { /* 
     let mut buf = [0; MAX_BUF_SIZE];
     let mut out = [0; MAX_BUF_SIZE];
     let mut pacing = false;
@@ -233,10 +231,10 @@ pub fn server_thread(
                 clients_ids.insert(scid, client.client_id);
             }
         } */
-    }
+    }*/
 }
 
-
+/* 
 fn handle_path_events(client: &mut Client, scheduler: &mut Scheduler) {
     let paths_sockets_addrs: Vec<(std::net::SocketAddr, std::net::SocketAddr)> = client.conn_paths.iter().map(|(_, p)| (p.local_addr(), p.peer_addr())).collect();
     for (local_addr, peer_addr) in paths_sockets_addrs{
@@ -359,6 +357,7 @@ fn set_so_reuseport_sockopt(sock: &mio::net::UdpSocket) -> io::Result<()> {
     
     Ok(())
 }
+*/
 
 pub fn multicore_start_server(args: ServerArgs, conn_args: CommonArgs) {
     env_logger::builder()
@@ -464,7 +463,7 @@ pub fn multicore_start_server(args: ServerArgs, conn_args: CommonArgs) {
     drop(socket); // Garbage collect the initial socket
 
     loop {
-        let mut client = wait_for_new_connection(&mut config, &args, &conn_args, waker.clone(), &mut keylog, local_addr);
+        let client = wait_for_new_connection(&mut config, &args,  waker.clone(), &mut keylog, local_addr);
         info!("Going to wait for threads connection is established");
         let peer_addr = client.conn_paths.lock().get_active_mut().unwrap().peer_addr().into();
         let guarded_client = Arc::new(client);
@@ -478,7 +477,7 @@ pub fn multicore_start_server(args: ServerArgs, conn_args: CommonArgs) {
 
 
 fn wait_for_new_connection(
-    config: &mut Config, args: &ServerArgs, conn_args: &CommonArgs, waker: Arc<Waker>,
+    config: &mut Config, args: &ServerArgs, waker: Arc<Waker>,
     keylog: &mut Option<File>, local_addr: std::net::SocketAddr
 ) -> MulticoreClient {
     let rng = SystemRandom::new();

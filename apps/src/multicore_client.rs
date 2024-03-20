@@ -529,6 +529,7 @@ pub fn multicore_connect(
     let mut app_proto_selected = false;
     let mut conn_timeout;
     let mut is_in_early_data;
+    
     loop {
         {
             let mut conn_paths = paths_guard.lock();
@@ -557,7 +558,7 @@ pub fn multicore_connect(
             trace!("[PARSE_EVENT] [topic: locking] [type: duration] [event: Acquire HTTP Lock] [metadata: {:?}] [value: {:?}]", thread::current().id(), timestamp.elapsed().as_nanos());
             let timestamp = Instant::now();
             if conn.is_closed() {
-                trace!(
+                info!(
                     "connection closed, {:?} {:?}",
                     conn.stats(&mut conn_paths),
                     conn_paths.iter().map(|(_, p)| p.stats()).collect::<Vec<quiche::PathStats>>()
