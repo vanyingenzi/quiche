@@ -27,7 +27,7 @@
 use quiche_apps::args::*;
 use quiche_apps::common::*;
 use quiche_apps::client::*;
-use quiche_apps::multicore_client_new::*;
+use quiche_apps::multicore_client::*;
 
 fn main() {
     env_logger::builder()

@@ -41,9 +41,8 @@ use std::net::{IpAddr, SocketAddr};
 
 use std::io::prelude::*;
 
-use std::rc::Rc;
-
-use std::cell::RefCell;
+// use std::rc::Rc;
+// use std::cell::RefCell;
 use std::str::FromStr;
 use std::sync::RwLock;
 use std::thread;
@@ -54,8 +53,8 @@ use mio::net::UdpSocket;
 use quiche::Connection;
 use quiche::ConnectionId;
 use ring::rand::*;
-use std::sync::Arc;
-use spin::Mutex;
+use std::sync::{Arc, Mutex};
+//use spin::Mutex;
 
 const MAX_BUF_SIZE: usize = 65507;
 const MAX_DATAGRAM_SIZE: usize = 1350;
@@ -119,8 +118,8 @@ pub fn read_packets_on_socket(
     if offset != 0 {
         trace!("[PARSE_EVENT] [topic: locking] [type: duration] [event: UDP Rcv Packets] [metadata: {:?}] [value: {:?}]", thread::current().id(), timestamp.elapsed().as_nanos());
         let instant = Instant::now();
-        let mut conn_paths = paths_guard.lock();
-        let mut conn = quiche_conn.lock();
+        let mut conn_paths = paths_guard.lock().unwrap();
+        let mut conn = quiche_conn.lock().unwrap();
         trace!("[PARSE_EVENT] [topic: locking] [type: duration] [event: Acquire Rcv Lock] [metadata: {:?}] [value: {:?}]", thread::current().id(), instant.elapsed().as_nanos());
         let instant = Instant::now();
         for i in 0..count {
@@ -248,8 +247,8 @@ fn client_thread(
     let (local_addr, peer_addr) = addrs;
     let mut socket = multicore_create_socket((&local_addr, &peer_addr), &mut poll);
     if initiate_connection {
-        let mut conn_paths = paths_guard.lock();
-        let mut conn = quiche_conn.lock();
+        let mut conn_paths = paths_guard.lock().unwrap();
+        let mut conn = quiche_conn.lock().unwrap();
         multicore_initiate_connection(&peer_addr, &local_addr, &mut out, &scid, &mut conn, &mut conn_paths, &mut socket)?;
         *sent_conn_init_pkt.write().unwrap() = true;
     } else {
@@ -268,7 +267,7 @@ fn client_thread(
     
     loop {
         {
-            let mut conn_paths = paths_guard.lock();
+            let mut conn_paths = paths_guard.lock().unwrap();
             path_timeout = match conn_paths.get_mut_from_addr(local_addr, peer_addr){
                 Ok(path) => path.path_timeout(), 
                 Err(_) => Some(Duration::from_nanos(1)) // Path may not be active or registered yet
@@ -285,19 +284,21 @@ fn client_thread(
 
         // Writing to socket critical section
         if can_send {
-            let mut conn_paths = paths_guard.lock();
-            let mut conn = quiche_conn.lock();
+            let mut conn_paths = paths_guard.lock().unwrap();
+            let mut conn = quiche_conn.lock().unwrap();
             if let Ok(v) = write_packets_on_path(&local_addr, &peer_addr, &socket, &mut conn, &mut conn_paths, &mut out){
                 if v > 0 {
                     main_thread_advance_lock.wake().expect("Unable to wake");
                 }
             }
+
             if conn.is_closed() {
                 break;
             }
+
         } else {
-            let mut conn_paths = paths_guard.lock();
-            let conn = quiche_conn.lock();
+            let mut conn_paths = paths_guard.lock().unwrap();
+            let conn = quiche_conn.lock().unwrap();
             can_send = can_send_on_path(&mut conn_paths, local_addr, peer_addr);
             if conn.is_closed() {
                 break;
@@ -313,7 +314,7 @@ fn client_thread(
 
 pub fn multicore_connect(
     args: ClientArgs, conn_args: CommonArgs,
-    output_sink: impl FnMut(String) + 'static,
+    _output_sink: impl FnMut(String) + 'static,
 ) -> Result<(), ClientError> {
     static_assertions::assert_impl_all!(Connection: Send);
 
@@ -321,7 +322,7 @@ pub fn multicore_connect(
 
     let mut buf = [0; 65535];
 
-    let output_sink = Rc::new(RefCell::new(output_sink)) as Rc<RefCell<dyn FnMut(_)>>;
+    // let output_sink = Rc::new(RefCell::new(output_sink)) as Rc<RefCell<dyn FnMut(_)>>;
 
     // We'll only connect to the first server provided in URL list.
     let connect_url = &args.urls[0];
@@ -532,8 +533,8 @@ pub fn multicore_connect(
     
     loop {
         {
-            let mut conn_paths = paths_guard.lock();
-            let conn = conn_guard.lock();
+            let mut conn_paths = paths_guard.lock().unwrap();
+            let conn = conn_guard.lock().unwrap();
             conn_timeout = conn.timeout(&mut conn_paths); // Default timeout
             is_in_early_data = conn.is_in_early_data();
         }
@@ -543,8 +544,8 @@ pub fn multicore_connect(
         }
 
         if events.is_empty() {
-            let mut conn_paths = paths_guard.lock();
-            let mut conn = conn_guard.lock();
+            let mut conn_paths = paths_guard.lock().unwrap();
+            let mut conn = conn_guard.lock().unwrap();
             if !conn.is_in_early_data() || app_proto_selected {
                 trace!("timed out");
                 conn.on_timeout(&mut conn_paths);
@@ -553,8 +554,8 @@ pub fn multicore_connect(
 
         {
             let timestamp = Instant::now();
-            let mut conn_paths = paths_guard.lock();
-            let mut conn = conn_guard.lock();
+            let mut conn_paths = paths_guard.lock().unwrap();
+            let mut conn = conn_guard.lock().unwrap();
             trace!("[PARSE_EVENT] [topic: locking] [type: duration] [event: Acquire HTTP Lock] [metadata: {:?}] [value: {:?}]", thread::current().id(), timestamp.elapsed().as_nanos());
             let timestamp = Instant::now();
             if conn.is_closed() {
@@ -604,15 +605,7 @@ pub fn multicore_connect(
 
                 let app_proto = conn.application_proto();
 
-                if alpns::HTTP_09.contains(&app_proto) {
-                    http_conn = Some(Http09Conn::with_urls(
-                        &args.urls,
-                        args.reqs_cardinal,
-                        Rc::clone(&output_sink),
-                    ));
-
-                    app_proto_selected = true;
-                } else if alpns::HTTP_3.contains(&app_proto) {
+                if alpns::HTTP_3.contains(&app_proto) {
                     let dgram_sender = if conn_args.dgrams_enabled {
                         Some(Http3DgramSender::new(
                             conn_args.dgram_count,
@@ -623,7 +616,7 @@ pub fn multicore_connect(
                         None
                     };
 
-                    http_conn = Some(Http3Conn::with_urls(
+                    http_conn = Some(MulticoreHttp3Conn::with_urls(
                         &mut conn,
                         &args.urls,
                         args.reqs_cardinal,
@@ -636,10 +629,11 @@ pub fn multicore_connect(
                         conn_args.qpack_blocked_streams,
                         args.dump_json,
                         dgram_sender,
-                        Rc::clone(&output_sink),
                     ));
 
                     app_proto_selected = true;
+                } else {
+                    return Err(ClientError::HttpFail);
                 }
             }
 

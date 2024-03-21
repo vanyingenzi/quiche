@@ -33,8 +33,10 @@ use crate::common::*;
 extern crate core_affinity;
 
 use shared_arena::ArenaBox;
+use spin::Mutex;
 use static_assertions;
 use std::collections::BTreeMap;
+use std::collections::VecDeque;
 use std::net::Ipv4Addr;
 use std::net::Ipv6Addr;
 use std::net::ToSocketAddrs;
@@ -46,8 +48,7 @@ use std::rc::Rc;
 
 use std::cell::RefCell;
 use std::str::FromStr;
-use std::time::Instant;
-use lockfree::channel::{mpsc, spsc};
+
 use std::thread;
 use std::time::Duration;
 
@@ -88,8 +89,8 @@ fn multicore_create_socket(
 }
 
 fn client_thread(
-    conn_channel: mpsc::Sender<MRcvPacketInfo>,
-    mut path_channel: spsc::Receiver<MSndPacketInfo>,
+    conn_channel: Arc<Mutex<VecDeque<MRcvPacketInfo>>>,
+    path_channel: Arc<Mutex<VecDeque<MSndPacketInfo>>>,
     addrs: (SocketAddr, SocketAddr),
     arena: Arc<SharedArena<Packet>>
 ) -> Result<(), ClientError> {
@@ -132,12 +133,12 @@ fn client_thread(
                     to: local_addr, 
                     from
                 };
-                conn_channel.send(MRcvPacketInfo { local_addr, len, rcv_info, pckt: packet_box }).ok();
+                conn_channel.lock().push_back(MRcvPacketInfo { local_addr, len, rcv_info, pckt: packet_box });
             }
         }
         
-        match path_channel.recv(){
-            Ok(mut pkt) => {
+        match path_channel.lock().pop_front(){
+            Some(mut pkt) => {
                 if let Err(e) = socket.send_to(&mut (pkt.pkt[..pkt.len]), pkt.peer_addr) {
                     if e.kind() == std::io::ErrorKind::WouldBlock {
                         trace!(
@@ -154,7 +155,7 @@ fn client_thread(
 
                 trace!("{} -> {}: written {}", local_addr, peer_addr, pkt.pkt.len());
             }, 
-            Err(_) => {}
+            None => {}
         }
     }
 }
@@ -323,13 +324,13 @@ pub fn multicore_connect(
     let mut current_path_thread_idx = 0;
     let arena = Arc::new(SharedArena::new());
 
-    let (conn_tx, mut conn_rx) = mpsc::create();
+    let conn_queue = Arc::new(Mutex::new(VecDeque::new()));
     let mut path_to_channel = BTreeMap::new();
 
     for (local, peer) in sockets_addrs.clone() {
-        let (path_tx, path_rx) = spsc::create();
-        path_to_channel.insert((local, peer), path_tx);
-        let clone_tx = conn_tx.clone();
+        let path_queue = Arc::new(Mutex::new(VecDeque::new()));
+        path_to_channel.insert((local, peer), path_queue.clone());
+        let clone_tx = conn_queue.clone();
         // HTTPConn doesn't implement Send therefore can't be used in a Mutex
         let core_id = core_ids[current_path_thread_idx];
         let arena_clone = arena.clone();
@@ -345,7 +346,7 @@ pub fn multicore_connect(
             );
             client_thread(
                 clone_tx,
-                path_rx,
+                path_queue,
                 (local, peer),
                 arena_clone
             )
@@ -362,7 +363,7 @@ pub fn multicore_connect(
     let mut pkt: Packet = [0u8; MAX_DATAGRAM_SIZE];
     let (len, send_info) = conn.send(&mut conn_paths, &mut pkt).expect("initial send failed");
     let channel = path_to_channel.get_mut(&(send_info.from, send_info.to)).unwrap();
-    channel.send(MSndPacketInfo { peer_addr: send_info.to, len, pkt: arena.alloc(pkt) }).ok();
+    channel.lock().push_back(MSndPacketInfo { peer_addr: send_info.to, len, pkt: arena.alloc(pkt) });
 
     trace!("written {}", len);
 
@@ -380,9 +381,9 @@ pub fn multicore_connect(
 
         if !conn.is_in_early_data() || app_proto_selected {
             // poll.poll(&mut events, conn.timeout(&mut conn_paths)).unwrap();
-            match conn_rx.recv() {
-                Ok(v) => optional_from_queue = Some(v), 
-                Err(_) => {
+            match conn_queue.lock().pop_front() {
+                Some(v) => optional_from_queue = Some(v), 
+                None => {
                     optional_from_queue = None;
                 }
             }
@@ -686,7 +687,7 @@ pub fn multicore_connect(
                     },
                 };
 
-                channel.send(MSndPacketInfo { peer_addr: peer_addr, pkt: arena.alloc(packet), len}).ok();
+                channel.lock().push_back(MSndPacketInfo { peer_addr: peer_addr, pkt: arena.alloc(packet), len});
                 trace!("{} -> {}: written {}", local_addr, send_info.to, len);
             }
         }
