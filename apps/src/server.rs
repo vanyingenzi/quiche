@@ -468,7 +468,7 @@ pub fn start_server(
                 }
             }
 
-            handle_path_events(client);
+            handle_path_events(client, schedulers.get_mut(&client.client_id).unwrap());
 
             // See whether source Connection IDs have been retired.
             while let Some(retired_scid) = client.conn.retired_scid_next() {
@@ -495,7 +495,7 @@ pub fn start_server(
         // them on the UDP socket, until quiche reports that there are no more
         // packets to be sent.
         continue_write = false;
-        for client in clients.values_mut() {
+        for (k, client) in clients.iter_mut() {
             // Reduce max_send_burst by 25% if loss is increasing more than 0.1%.
             let loss_rate =
                 client.conn.stats(&mut client.conn_paths).lost as f64 / client.conn.stats(&mut client.conn_paths).sent as f64;
@@ -513,19 +513,18 @@ pub fn start_server(
                     client.max_datagram_size;
             let mut total_write = 0;
             let mut dst_info: Option<quiche::SendInfo> = None;
+            let path_scheduled = schedulers.get_mut(k).unwrap().next_path();
 
             while total_write < max_send_burst {
 
-                let res = match dst_info {
-                    Some(info) => client.conn.send_on_path(
-                        &mut client.conn_paths, 
-                        &mut out[total_write..max_send_burst],
-                        Some(info.from),
-                        Some(info.to),
-                    ),
-                    None =>
-                        client.conn.send(&mut client.conn_paths, &mut out[total_write..max_send_burst]),
+                let res = if let Some(info) = dst_info {
+                    client.conn.send_on_path(&mut client.conn_paths, &mut out[total_write..max_send_burst], Some(info.from), Some(info.to))
+                } else if let Some((local, peer)) = path_scheduled {
+                    client.conn.send_on_path(&mut client.conn_paths, &mut out[total_write..max_send_burst], Some(local), Some(peer))
+                } else {
+                    client.conn.send(&mut client.conn_paths,&mut out[total_write..max_send_burst])
                 };
+
                 let (write, send_info) = match res {
                     Ok(v) => v,
 
@@ -610,6 +609,7 @@ pub fn start_server(
 
             !c.conn.is_closed()
         });
+        schedulers.retain(|k, _| clients.contains_key(k));
     }
 }
 
@@ -669,7 +669,7 @@ fn validate_token<'a>(
     Some(quiche::ConnectionId::from_ref(&token[addr.len()..]))
 }
 
-fn handle_path_events(client: &mut Client) {
+fn handle_path_events(client: &mut Client, scheduler: &mut Scheduler) {
     let paths_sockets_addrs: Vec<(std::net::SocketAddr, std::net::SocketAddr)> = client.conn_paths.iter().map(|(_, p)| (p.local_addr(), p.peer_addr())).collect();
     for (local_addr, peer_addr) in paths_sockets_addrs{
         loop {
@@ -683,6 +683,8 @@ fn handle_path_events(client: &mut Client) {
                                 local_addr,
                                 peer_addr
                             );
+            
+                            scheduler.add_path((local_addr, peer_addr));
             
                             // Directly probe the new path.
                             client
@@ -700,10 +702,14 @@ fn handle_path_events(client: &mut Client) {
                                 peer_addr
                             );
                             if client.conn_paths.multipath() {
-                                client.conn_paths
+                                match client.conn_paths
                                     .set_active( local_addr, peer_addr, true)
                                     .map_err(|e| error!("cannot set path active: {}", e))
-                                    .ok();
+                                    .ok()
+                                {
+                                    Some(()) => scheduler.add_path((local_addr, peer_addr)),
+                                    None => (),
+                                }
                             }
                         },
             
@@ -725,6 +731,7 @@ fn handle_path_events(client: &mut Client) {
                                 err,
                                 reason,
                             );
+                            scheduler.remove_path((local_addr, peer_addr))
                         },
             
                         quiche::PathEvent::ReusedSourceConnectionId(cid_seq, old, new) => {
@@ -744,6 +751,7 @@ fn handle_path_events(client: &mut Client) {
                                 local_addr,
                                 peer_addr
                             );
+                            scheduler.add_path((local_addr, peer_addr)) // TODO check if valid
                         },
             
                         quiche::PathEvent::PeerPathStatus(addr, path_status) => {

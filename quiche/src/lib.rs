@@ -482,7 +482,7 @@ const CONNECTION_WINDOW_FACTOR: f64 = 1.5;
 
 // How many probing packet timeouts do we tolerate before considering the path
 // validation as failed.
-const MAX_PROBING_TIMEOUTS: usize = 10;
+const MAX_PROBING_TIMEOUTS: usize = 5; // Push back down to 3
 
 // The default initial congestion window size in terms of packet count.
 const DEFAULT_INITIAL_CONGESTION_WINDOW_PACKETS: usize = 10;
@@ -7072,6 +7072,7 @@ impl Connection {
         // Application epoch.
         if (self.is_established() || self.is_in_early_data()) &&
             (self.should_send_handshake_done() ||
+                (self.almost_full && self.flow_control.max_data() < self.flow_control.max_data_next()) ||
                 (self.almost_full && self.flow_control.max_data() < self.flow_control.max_data_next()) ||
                 self.blocked_limit.is_some() ||
                 self.dgram_send_queue.has_pending() ||
