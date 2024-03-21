@@ -692,6 +692,6 @@ pub fn lowest_latency_scheduler(
     use itertools::Itertools;
     conn_paths.iter().map(|(_, p)| p.stats())
         .filter(|p| !matches!(p.state, quiche::PathState::Closed(_, _)))
-        .sorted_by_key(|p| p.rtt)
+        .sorted_by_key(|p| p.recv) // Lowest RTT causes timeout issues and here it's fine as paths are symmetric
         .map(|p| (p.local_addr, p.peer_addr))
 }
