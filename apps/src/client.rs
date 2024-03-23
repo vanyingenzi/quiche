@@ -460,10 +460,22 @@ pub fn connect(
             
                             quiche::PathEvent::PeerPathStatus(..) => {},
 
-                            quiche::PathEvent::PacketNumSpaceDiscarded((local, peer), epoch, handshake_status, now) => {
-                                let p = conn_paths.get_mut_from_addr(local, peer).unwrap();
+                            quiche::PathEvent::PacketNumSpaceDiscarded(path_id, epoch, handshake_status, now) => {
+                                let p = conn_paths.get_mut(path_id).unwrap();
                                 p.recovery.on_pkt_num_space_discarded(epoch, handshake_status, now);
                             },
+                            quiche::PathEvent::PacketOnACKReceived(path_id, space_id, ranges, ack_delay, epoch, handshake_status, now, trace_id) => {
+                                let p = conn_paths.get_mut(path_id).unwrap();
+                                p.on_ack_received(
+                                    space_id,
+                                    ranges,
+                                    ack_delay,
+                                    epoch,
+                                    handshake_status,
+                                    now,
+                                    trace_id,
+                                );
+                            }
                         }
                     }, 
                     None => break

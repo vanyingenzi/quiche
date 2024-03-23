@@ -513,10 +513,10 @@ pub fn start_server(
                     client.max_datagram_size;
             let mut total_write = 0;
             let mut dst_info: Option<quiche::SendInfo> = None;
-            let path_scheduled = schedulers.get_mut(k).unwrap().next_path();
 
+            
             while total_write < max_send_burst {
-
+                let path_scheduled = schedulers.get_mut(k).unwrap().next_path();
                 let res = if let Some(info) = dst_info {
                     client.conn.send_on_path(&mut client.conn_paths, &mut out[total_write..max_send_burst], Some(info.from), Some(info.to))
                 } else if let Some((local, peer)) = path_scheduled {
@@ -763,10 +763,23 @@ fn handle_path_events(client: &mut Client, scheduler: &mut Scheduler) {
                                 .ok();
                         },
 
-                        quiche::PathEvent::PacketNumSpaceDiscarded((local, peer), epoch, handshake_status, now) => {
-                            let p = client.conn_paths.get_mut_from_addr(local, peer).unwrap();
+                        quiche::PathEvent::PacketNumSpaceDiscarded(path_id, epoch, handshake_status, now) => {
+                            let p = client.conn_paths.get_mut(path_id).unwrap();
                             p.recovery.on_pkt_num_space_discarded(epoch, handshake_status, now);
                         },
+
+                        quiche::PathEvent::PacketOnACKReceived(path_id, space_id, ranges, ack_delay, epoch, handshake_status, now, trace_id) => {
+                            let p = client.conn_paths.get_mut(path_id).unwrap();
+                            p.on_ack_received(
+                                space_id,
+                                ranges,
+                                ack_delay,
+                                epoch,
+                                handshake_status,
+                                now,
+                                trace_id,
+                            );
+                        }
                     }
                 }, 
                 None => break,

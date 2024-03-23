@@ -34,6 +34,9 @@ use smallvec::SmallVec;
 
 use slab::Slab;
 use crate::packet;
+use crate::packet::Epoch;
+use crate::ranges::RangeSet;
+use crate::recovery::SpaceId;
 use crate::Error;
 use crate::Result;
 
@@ -176,7 +179,9 @@ pub enum PathEvent {
 
 
     /// The following path events are none RFC MPQUIC events there are added for other purposes
-    PacketNumSpaceDiscarded((SocketAddr, SocketAddr), packet::Epoch, HandshakeStatus, time::Instant),
+    PacketNumSpaceDiscarded(usize, packet::Epoch, HandshakeStatus, time::Instant),
+
+    PacketOnACKReceived(usize, SpaceId, RangeSet, u64, Epoch, HandshakeStatus, time::Instant, String)
 }
 
 /// A network path on which QUIC packets can be sent.
@@ -274,7 +279,13 @@ pub struct Path {
 
     path_id: Option<usize>,
 
-    multipath: bool
+    multipath: bool,
+
+    /// A resusable buffer used by Recovery
+    newly_acked: Vec<recovery::Acked>,
+
+    /// pid of the "active path"
+    active_pid: Option<usize>
 }
 
 impl Path {
@@ -322,7 +333,9 @@ impl Path {
             expected_path_status_seq_num: 0,
             events: VecDeque::new(),
             path_id: None, 
-            multipath: false
+            multipath: false, 
+            newly_acked: Vec::new(), 
+            active_pid: None
         }
     }
 
@@ -332,6 +345,14 @@ impl Path {
 
     pub fn get_path_id(&self) -> Option<usize>{
         self.path_id
+    }
+
+    pub fn set_active_pid(&mut self, path_id: usize){
+        self.active_pid = Some(path_id);
+    }
+
+    pub fn get_active_pid(&self) -> Option<usize>{
+        self.active_pid
     }
 
     /// Returns the local address on which this path operates.
@@ -461,11 +482,10 @@ impl Path {
         self.peer_abandoned = true;
     }
 
-    /// Returns whether the path is now validated.
-    pub fn on_response_received(&mut self, data: [u8; 8]) -> bool {
+    fn inner_on_response_received(&mut self, data: [u8; 8]) -> bool {
         self.verified_peer_address = true;
         self.probing_lost = 0;
-
+    
         let mut challenge_size = 0;
         self.in_flight_challenges.retain(|(d, s, _)| {
             if *d == data {
@@ -475,25 +495,47 @@ impl Path {
                 true
             }
         });
-
+    
         // The 4-tuple is reachable, but we didn't check Path MTU yet.
         self.promote_to(PathValidationState::ValidatingMTU);
-
+    
         self.max_challenge_size =
             std::cmp::max(self.max_challenge_size, challenge_size);
-
+    
         if self.validation_state == PathValidationState::ValidatingMTU {
             if self.max_challenge_size >= crate::MIN_CLIENT_INITIAL_LEN {
                 // Path MTU is sufficient for QUIC traffic.
                 self.promote_to(PathValidationState::Validated);
                 return true;
             }
-
+    
             // If the MTU was not validated, probe again.
             self.request_validation();
         }
-
+    
         false
+    }
+
+    /// Returns whether the path is now validated.
+    pub fn on_response_received(&mut self, data: [u8; 8]) -> Result<()>  {
+        if self.has_pending_challenge(data){
+            if self.inner_on_response_received(data) {
+                let was_migrating = self.migrating;
+                self.migrating = false;
+                // Notifies the application.
+                self.notify_event(PathEvent::Validated(self.local_addr, self.peer_addr));
+                // If this path was the candidate for migration, notifies the
+                // application.
+                let pid = self.get_path_id().unwrap();
+                let active_pid = self.get_path_id().unwrap();
+                if pid == active_pid && was_migrating {
+                    self.notify_event(PathEvent::PeerMigrated(
+                        self.local_addr, self.peer_addr,
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 
     fn on_failed_validation(&mut self) {
@@ -651,6 +693,20 @@ impl Path {
         self.multipath
     }
 
+    /*pub fn on_path_abandon_received(&self, error_code: u64, reason: Vec<u8>) -> Result<()> {
+        // If the path was already closed, just close it.
+        if self.closed() {
+            return Ok(());
+        }
+        let was_closing = abandon_path.is_closing();
+        abandon_path.set_state(PathState::Closing(error_code, reason))?;
+        abandon_path.on_abandon_received();
+        if !was_closing {
+            self.mark_path_abandon(abandon_path_id, true);
+        }
+        Ok(())
+    }*/
+
     /// Handles the reception of PATH_STANDBY/PATH_AVAILABLE.
     pub fn on_path_status_received(
         &mut self, seq_num: u64, available: bool,
@@ -675,6 +731,21 @@ impl Path {
         if let Some((e, r)) = to_notify {
             self.notify_event(PathEvent::Closed(local_addr, peer_addr, e, r));
         }
+    }
+
+    pub fn on_ack_received(&mut self, space_id: SpaceId, ranges: RangeSet, ack_delay: u64, epoch: Epoch,
+        handshake_status: HandshakeStatus, now: time::Instant, trace_id: String
+    ) {
+        let _ = self.recovery.on_ack_received(
+            space_id,
+            &ranges,
+            ack_delay,
+            epoch,
+            handshake_status,
+            now,
+            &trace_id,
+            &mut self.newly_acked,
+        );
     }
 
     pub fn stats(&self) -> PathStats {
@@ -781,6 +852,7 @@ impl PathMap {
         addrs_to_paths.insert((local_addr, peer_addr), active_path_id);
 
         paths.get_mut(active_path_id).unwrap().set_path_id(active_path_id);
+        paths.get_mut(active_path_id).unwrap().set_active_pid(active_path_id);
 
         Self {
             paths,
@@ -983,10 +1055,12 @@ impl PathMap {
 
         let local_addr = path.local_addr;
         let peer_addr = path.peer_addr;
-
+        let active_pid = self.get_active_path_id()?;
+        
         let pid = self.paths.insert(path);
         self.addrs_to_paths.insert((local_addr, peer_addr), pid);
         self.paths.get_mut(pid).unwrap().set_path_id(pid);
+        self.paths.get_mut(pid).unwrap().set_active_pid(active_pid);
 
         // Notifies the application if we are in server mode.
         if is_server {
@@ -1060,6 +1134,7 @@ impl PathMap {
         self.iter().filter(|(_, p)| !p.is_standby()).count() == 0
     }
 
+    /*
     /// Handles incoming PATH_RESPONSE data.
     pub fn on_response_received(&mut self, data: [u8; 8]) -> Result<()> {
         let active_pid = self.get_active_path_id()?;
@@ -1088,7 +1163,7 @@ impl PathMap {
             }
         }
         Ok(())
-    }
+    } */
 
     /// Handles acknowledged PATH_ABANDONs.
     pub fn on_path_abandon_acknowledged(&mut self, abandon_path_id: usize) {
@@ -1566,8 +1641,9 @@ mod tests {
 
         // Receives the response. The path is reachable, but the MTU is not
         // validated yet.
-        path_mgr.on_response_received(data).unwrap();
-
+        for (_, path) in path_mgr.iter_mut(){
+            path.on_response_received(data).unwrap();
+        }
         assert!(path_mgr.get_mut(pid).unwrap().validation_requested());
         assert!(path_mgr.get_mut(pid).unwrap().probing_required());
         assert!(path_mgr.get_mut(pid).unwrap().under_validation());
@@ -1587,7 +1663,9 @@ mod tests {
             time::Instant::now(),
         );
 
-        path_mgr.on_response_received(data).unwrap();
+        for (_, path) in path_mgr.iter_mut(){
+            path.on_response_received(data).unwrap();
+        }
 
         assert!(!path_mgr.get_mut(pid).unwrap().validation_requested());
         assert!(!path_mgr.get_mut(pid).unwrap().probing_required());
@@ -1659,7 +1737,9 @@ mod tests {
         assert_eq!(server_path.received_challenges.len(), 2);
 
         // Response for first probe.
-        client_path_mgr.on_response_received(data).unwrap();
+        for (_, path) in client_path_mgr.iter_mut(){
+            path.on_response_received(data).unwrap();
+        }
         assert_eq!(
             client_path_mgr
                 .get(client_pid)
@@ -1670,7 +1750,9 @@ mod tests {
         );
 
         // Response for second probe.
-        client_path_mgr.on_response_received(data_2).unwrap();
+        for (_, path) in client_path_mgr.iter_mut(){
+            path.on_response_received(data_2).unwrap();
+        }
         assert_eq!(
             client_path_mgr
                 .get(client_pid)

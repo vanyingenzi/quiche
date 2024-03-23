@@ -1449,10 +1449,10 @@ pub struct Connection {
     dcid_seq_to_abandon: VecDeque<u64>,
 
     /// Pending Path Events that needs to be passed on paths when they call
-    pending_per_path_events: HashMap<(SocketAddr, SocketAddr), VecDeque<path::PathEvent>>,
+    pending_per_path_events: HashMap<usize, VecDeque<path::PathEvent>>,
 
     /// Per path approximative stats
-    approximative_stats: HashMap<(SocketAddr, SocketAddr), PathStats>
+    approximative_stats: HashMap<usize, PathStats>
 }
 
 /// Creates a new server-side connection.
@@ -1758,9 +1758,9 @@ impl Connection {
         );
 
         let mut pending_per_path_events = HashMap::new();
-        pending_per_path_events.insert((local, peer), VecDeque::new());
+        pending_per_path_events.insert(active_path_id, VecDeque::new());
         let mut approximative_stats = HashMap::new();
-        approximative_stats.insert((local, peer), paths.get(active_path_id)?.stats());
+        approximative_stats.insert(active_path_id, paths.get(active_path_id)?.stats());
 
         let mut conn = Connection {
             version: config.version,
@@ -5892,7 +5892,7 @@ impl Connection {
 
     /// Returns pending per path events for a path known by the connection
     pub fn get_pending_path_events(&mut self , path: &mut path::Path){
-        if let Some(queue) = self.pending_per_path_events.get_mut(&(path.local_addr(), path.peer_addr())){
+        if let Some(queue) = self.pending_per_path_events.get_mut(&path.get_path_id().unwrap()){
             while let Some(e) = queue.pop_front(){
                 path.notify_event(e);
             } 
@@ -7104,6 +7104,31 @@ impl Connection {
         Err(Error::Done)
     }
 
+    /*fn on_path_abandon_received(
+        &mut self, abandon_path_id: usize, recv: &mut path::Path, error_code: u64, reason: Vec<u8>,
+    ) -> Result<()> {
+        let is_server = self.is_server;
+        let nb_paths = self.pending_per_path_events.len();
+        // If we are the server, and receiving a PATH_ABANDON for the only
+        // active path, request a connection closure.
+        if is_server && nb_paths == 1 {
+            return Err(Error::UnavailablePath);
+        }
+        
+        let abandon_path = self.get_mut(abandon_path_id)?;
+        // If the path was already closed, just close it.
+        if abandon_path.closed() {
+            return Ok(());
+        }
+        let was_closing = abandon_path.is_closing();
+        abandon_path.set_state(PathState::Closing(error_code, reason))?;
+        abandon_path.on_abandon_received();
+        if !was_closing {
+            self.mark_path_abandon(abandon_path_id, true);
+        }
+        Ok(())
+    }*/
+
     /// Returns the mutable stream with the given ID if it exists, or creates
     /// a new one otherwise.
     fn get_or_create_stream(
@@ -7175,30 +7200,43 @@ impl Connection {
                 } else {
                     // This ACK may acknowledge several packets on different
                     // paths.
-                    for pid in paths
-                        .iter()
-                        .map(|(pid, _)| pid)
-                        .collect::<Vec<usize>>()
-                    {
-                        let is_app_limited = self.delivery_rate_check_if_app_limited(paths.get_mut(pid).unwrap() );
-                        let p = paths.get_mut(pid)?;
-                        if is_app_limited {
-                            p.recovery.delivery_rate_update_app_limited(true);
+                    let pids: Vec<usize> = self.pending_per_path_events.keys().map(|pd| *pd).collect();
+                    for pid in pids{
+                        if pid == recv_path_id {
+                            let is_app_limited = self.delivery_rate_check_if_app_limited(paths.get_mut(pid).unwrap() );
+                            let p = paths.get_mut(pid)?;
+                            if is_app_limited {
+                                p.recovery.delivery_rate_update_app_limited(true);
+                            }
+                            let (lost_packets, lost_bytes) =
+                                p.recovery.on_ack_received(
+                                    0,
+                                    &ranges,
+                                    ack_delay,
+                                    epoch,
+                                    handshake_status,
+                                    now,
+                                    &self.trace_id,
+                                    &mut self.newly_acked,
+                                )?;
+                            
+                            // TODO these should updated differently
+                            self.lost_count += lost_packets;
+                            self.lost_bytes += lost_bytes as u64;
+                        } else {
+                            self.pending_per_path_events.get_mut(&pid).unwrap().push_back(
+                                PathEvent::PacketOnACKReceived(
+                                    pid,
+                                    0,
+                                    ranges.clone(), 
+                                    ack_delay,
+                                    epoch, 
+                                    handshake_status,
+                                    now, 
+                                    self.trace_id.clone(), 
+                                )
+                            )
                         }
-                        let (lost_packets, lost_bytes) =
-                            p.recovery.on_ack_received(
-                                0,
-                                &ranges,
-                                ack_delay,
-                                epoch,
-                                handshake_status,
-                                now,
-                                &self.trace_id,
-                                &mut self.newly_acked,
-                            )?;
-
-                        self.lost_count += lost_packets;
-                        self.lost_bytes += lost_bytes as u64;
                     }
                 }
             },
@@ -7569,7 +7607,9 @@ impl Connection {
             },
 
             frame::Frame::PathResponse { data } => {
-                paths.on_response_received(data)?;
+                for (_, path) in paths.iter_mut(){
+                    path.on_response_received(data)?;
+                }
             },
 
             frame::Frame::ConnectionClose {
@@ -7770,14 +7810,14 @@ impl Connection {
         self.pkt_num_spaces.clear(epoch);
 
         let handshake_status = self.handshake_status();
-        let addrs_tuples: Vec<(SocketAddr, SocketAddr)> = self.pending_per_path_events.keys().map(|(local, peer)| (*local, *peer)).collect();
-        for (local, peer) in addrs_tuples{
-            if local == path.local_addr() && peer == path.peer_addr() {
+        let pid: Vec<usize> = self.pending_per_path_events.keys().map(|pd| *pd).collect();
+        for pid in pid {
+            if pid == path.get_path_id().unwrap() {
                 path.recovery.on_pkt_num_space_discarded(epoch, handshake_status, now);
             } else {
-                self.pending_per_path_events.get_mut(&(local, peer)).unwrap().push_back(
-                    PathEvent::PacketNumSpaceDiscarded((local, peer), epoch, handshake_status, now)  
-                );   
+                self.pending_per_path_events.get_mut(&pid).unwrap().push_back(
+                    PathEvent::PacketNumSpaceDiscarded(pid, epoch, handshake_status, now)  
+                );
             }
         }
         trace!("{} dropped epoch {} state", self.trace_id, epoch);
@@ -7854,7 +7894,9 @@ impl Connection {
     }
 
     fn update_path_stats_from_path(&mut self, path: &path::Path){
-        self.approximative_stats.insert((path.local_addr(), path.peer_addr()), path.stats());
+        if let Some(pid) = path.get_path_id(){
+            self.approximative_stats.insert(pid, path.stats());
+        }
     }
 
     /// Updates send capacity.
@@ -9202,10 +9244,22 @@ pub mod testing {
                             },
                             path::PathEvent::PeerMigrated(..) => unreachable!(),
                             path::PathEvent::PeerPathStatus(..) => {},
-                            path::PathEvent::PacketNumSpaceDiscarded((local, peer), epoch, handshake_status, now) => {
-                                let p = conn_paths.get_mut_from_addr(local, peer).unwrap();
+                            path::PathEvent::PacketNumSpaceDiscarded(path_id, epoch, handshake_status, now) => {
+                                let p = conn_paths.get_mut(path_id).unwrap();
                                 p.recovery.on_pkt_num_space_discarded(epoch, handshake_status, now);
                             },
+                            path::PathEvent::PacketOnACKReceived(path_id, space_id, ranges, ack_delay, epoch, handshake_status, now, trace_id) => {
+                                let p = conn_paths.get_mut(path_id).unwrap();
+                                p.on_ack_received(
+                                    space_id,
+                                    ranges,
+                                    ack_delay,
+                                    epoch,
+                                    handshake_status,
+                                    now,
+                                    trace_id,
+                                );
+                            }
                         }
                     }, 
                     None => break
@@ -16407,6 +16461,11 @@ mod tests {
                 .peer_addr(),
             server_addr
         );
+
+        for (_, path) in pipe.server_paths.iter_mut(){
+            pipe.server.get_pending_path_events(path);
+        }
+
         assert_eq!(
             pipe.server_paths.pop_event(pipe.server_paths.get_active().unwrap().local_addr(), pipe.server_paths.get_active().unwrap().peer_addr()),
             Some(PathEvent::New(server_addr, client_addr_3))
