@@ -29,6 +29,7 @@ include = [
 
 [features]
 default = ["boringssl-vendored"]
+multicore = []
 
 # Build the vendored BoringSSL library.
 boringssl-vendored = []
@@ -75,6 +76,7 @@ winapi = { version = "0.3", features = ["wincrypt", "ws2def", "ws2ipdef", "ws2tc
 [dev-dependencies]
 mio = { version = "0.8", features = ["net", "os-poll"] }
 url = "1"
+test-log = "0.2.15"
 
 [lib]
 crate-type = ["lib", "staticlib", "cdylib"]

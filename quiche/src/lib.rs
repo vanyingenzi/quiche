@@ -1516,6 +1516,7 @@ pub fn connect(
     Ok((conn, path_map))
 }
 
+
 /// Writes a version negotiation packet.
 ///
 /// The `scid` and `dcid` parameters are the source connection ID and the
@@ -2082,6 +2083,736 @@ impl Connection {
         Ok(())
     }
 
+    /// Checks if we can decrypt outside of the recv function
+    /// The header not decrypted
+    pub fn can_decrypt_outside_conn(&self, hdr: &Header, epoch: packet::Epoch) -> bool {
+        if !self.handshake_completed {
+            return false;
+        }
+        if  hdr.ty == packet::Type::Retry || 
+            hdr.ty == packet::Type::VersionNegotiation || 
+            hdr.ty == packet::Type::Short ||
+            (hdr.ty != packet::Type::Short && hdr.version != self.version)
+        {
+            return false;
+        }
+        if self.handshake_confirmed &&
+            hdr.ty != Type::ZeroRTT &&
+            hdr.key_phase != self.key_phase
+        {
+            return false;
+        }
+        let aead = if hdr.ty == packet::Type::ZeroRTT {
+            // Only use 0-RTT key if incoming packet is 0-RTT.
+            self.pkt_num_spaces
+                .crypto
+                .get(epoch)
+                .crypto_0rtt_open
+                .as_ref()
+        } else {
+            // Otherwise use the packet number space's main key.
+            self.pkt_num_spaces.crypto.get(epoch).crypto_open.as_ref()
+        };
+        aead.is_some()
+    }
+
+    /// Another recv single function that parses decrupted packets already
+    pub fn recv_single_decrypted(
+        &mut self, paths: &mut path::PathMap, hdr: Header, frames: Vec<frame::Frame>, 
+        payload_len: usize, buf_len: usize, info: &RecvInfo, recv_pid: Option<usize>,
+    ) -> Result<()> {
+        let now = time::Instant::now();
+
+        if self.is_closed() || self.is_draining() {
+            return Err(Error::Done);
+        }
+
+        let is_closing = self.local_error.is_some();
+
+        if is_closing {
+            return Err(Error::Done);
+        }
+
+        if hdr.ty == packet::Type::VersionNegotiation {
+            // Version negotiation packets can only be sent by the server.
+            if self.is_server {
+                return Err(Error::Done);
+            }
+
+            // Ignore duplicate version negotiation.
+            if self.did_version_negotiation {
+                return Err(Error::Done);
+            }
+
+            // Ignore version negotiation if any other packet has already been
+            // successfully processed.
+            if self.recv_count > 0 {
+                return Err(Error::Done);
+            }
+
+            if hdr.dcid != self.source_id(paths.get_active().ok()) {
+                return Err(Error::Done);
+            }
+
+            if hdr.scid != self.destination_id(paths.get_active().ok()) {
+                return Err(Error::Done);
+            }
+
+            trace!("{} rx pkt {:?}", self.trace_id, hdr);
+
+            let versions = hdr.versions.ok_or(Error::Done)?;
+
+            // Ignore version negotiation if the version already selected is
+            // listed.
+            if versions.iter().any(|&v| v == self.version) {
+                return Err(Error::Done);
+            }
+
+            let supported_versions =
+                versions.iter().filter(|&&v| version_is_supported(v));
+
+            let mut found_version = false;
+
+            for &v in supported_versions {
+                found_version = true;
+
+                // The final version takes precedence over draft ones.
+                if v == PROTOCOL_VERSION_V1 {
+                    self.version = v;
+                    break;
+                }
+
+                self.version = cmp::max(self.version, v);
+            }
+
+            if !found_version {
+                // We don't support any of the versions offered.
+                //
+                // While a man-in-the-middle attacker might be able to
+                // inject a version negotiation packet that triggers this
+                // failure, the window of opportunity is very small and
+                // this error is quite useful for debugging, so don't just
+                // ignore the packet.
+                return Err(Error::UnknownVersion);
+            }
+
+            self.did_version_negotiation = true;
+
+            // Derive Initial secrets based on the new version.
+            let (aead_open, aead_seal) = crypto::derive_initial_key_material(
+                &self.destination_id(paths.get_active().ok()),
+                self.version,
+                self.is_server,
+            )?;
+
+            // Reset connection state to force sending another Initial packet.
+            self.drop_epoch_state(paths.get_active_mut().unwrap(), packet::Epoch::Initial, now);
+            self.got_peer_conn_id = false;
+            self.handshake.clear()?;
+
+            self.pkt_num_spaces
+                .crypto
+                .get_mut(packet::Epoch::Initial)
+                .crypto_open = Some(aead_open);
+            self.pkt_num_spaces
+                .crypto
+                .get_mut(packet::Epoch::Initial)
+                .crypto_seal = Some(aead_seal);
+
+            self.handshake
+                .use_legacy_codepoint(self.version != PROTOCOL_VERSION_V1);
+
+            // Encode transport parameters again, as the new version might be
+            // using a different format.
+            self.encode_transport_params()?;
+
+            return Err(Error::Done);
+        }
+
+        if hdr.ty == packet::Type::Retry {
+            // Retry packets can only be sent by the server.
+            if self.is_server {
+                return Err(Error::Done);
+            }
+
+            // Ignore duplicate retry.
+            if self.did_retry {
+                return Err(Error::Done);
+            }
+
+            // Check if Retry packet is valid.
+            // TODO calculate the 
+            /*if packet::verify_retry_integrity(
+                &b,
+                &self.destination_id(paths.get_active().ok()),
+                self.version,
+            )
+            .is_err()
+            {
+                return Err(Error::Done);
+            }*/
+
+            trace!("{} rx pkt {:?}", self.trace_id, hdr);
+
+            self.token = hdr.token;
+            self.did_retry = true;
+
+            // Remember peer's new connection ID.
+            self.odcid = Some(self.destination_id(paths.get_active().ok()).into_owned());
+
+            self.set_initial_dcid(
+                paths.get_active_mut().unwrap(),
+                ConnectionId::from_vec(hdr.scid.to_vec()),
+                None,
+            )?;
+
+            self.rscid = Some(self.destination_id(paths.get_active().ok()).into_owned());
+
+            // Derive Initial secrets using the new connection ID.
+            let (aead_open, aead_seal) = crypto::derive_initial_key_material(
+                &hdr.scid,
+                self.version,
+                self.is_server,
+            )?;
+
+            // Reset connection state to force sending another Initial packet.
+            self.drop_epoch_state(paths.get_active_mut().unwrap(), packet::Epoch::Initial, now);
+            self.got_peer_conn_id = false;
+            self.handshake.clear()?;
+
+            self.pkt_num_spaces
+                .crypto
+                .get_mut(packet::Epoch::Initial)
+                .crypto_open = Some(aead_open);
+            self.pkt_num_spaces
+                .crypto
+                .get_mut(packet::Epoch::Initial)
+                .crypto_seal = Some(aead_seal);
+
+            return Err(Error::Done);
+        }
+
+        if self.is_server && !self.did_version_negotiation {
+            if !version_is_supported(hdr.version) {
+                return Err(Error::UnknownVersion);
+            }
+
+            self.version = hdr.version;
+            self.did_version_negotiation = true;
+
+            self.handshake
+                .use_legacy_codepoint(self.version != PROTOCOL_VERSION_V1);
+
+            // Encode transport parameters again, as the new version might be
+            // using a different format.
+            self.encode_transport_params()?;
+        }
+
+        if hdr.ty != packet::Type::Short && hdr.version != self.version {
+            // At this point version negotiation was already performed, so
+            // ignore packets that don't match the connection's version.
+            return Err(Error::Done);
+        }
+
+        // Derive initial secrets on the server.
+        if !self.derived_initial_secrets {
+            let (aead_open, aead_seal) = crypto::derive_initial_key_material(
+                &hdr.dcid,
+                self.version,
+                self.is_server,
+            )?;
+
+            self.pkt_num_spaces
+                .crypto
+                .get_mut(packet::Epoch::Initial)
+                .crypto_open = Some(aead_open);
+            self.pkt_num_spaces
+                .crypto
+                .get_mut(packet::Epoch::Initial)
+                .crypto_seal = Some(aead_seal);
+
+            self.derived_initial_secrets = true;
+        }
+
+        // Select packet number space epoch based on the received packet's type.
+        let epoch = hdr.ty.to_epoch()?;
+
+        let space_id = if paths.multipath() {
+            if let Some((scid_seq, _)) = self.ids.find_scid_seq(&hdr.dcid) {
+                scid_seq
+            } else {
+                trace!(
+                    "{} ignored unknown Source CID {:?}",
+                    self.trace_id,
+                    hdr.dcid
+                );
+                return Err(Error::Done);
+            }
+        } else {
+            packet::INITIAL_PACKET_NUMBER_SPACE_ID
+        };
+
+        // This might be a new space identifier yet unseen before. In such case,
+        // it should start with 0.
+        let largest_rx_pkt_num = self
+            .pkt_num_spaces
+            .spaces
+            .get(epoch, space_id)
+            .map(|pns| pns.largest_rx_pkt_num)
+            .unwrap_or(0);
+        let pn = packet::decode_pkt_num(
+            largest_rx_pkt_num,
+            hdr.pkt_num,
+            hdr.pkt_num_len,
+        );
+
+        trace!(
+            "{} rx pkt {:?} len={} pn={} {}",
+            self.trace_id,
+            hdr,
+            payload_len,
+            pn,
+            AddrTupleFmt(info.from, info.to)
+        );
+
+        #[cfg(feature = "qlog")]
+        let mut qlog_frames = vec![];
+
+        let pkt_num_space = self
+            .pkt_num_spaces
+            .spaces
+            .get_mut_or_create(epoch, space_id);
+        if pkt_num_space.recv_pkt_num.contains(pn) {
+            trace!("{} ignored duplicate packet {}", self.trace_id, pn);
+            return Err(Error::Done);
+        }
+
+        if frames.len() == 0{
+            return Err(Error::InvalidPacket);
+        }
+
+        // Now that we decrypted the packet, let's see if we can map it to an
+        // existing path.
+        let recv_pid = if hdr.ty == packet::Type::Short && self.got_peer_conn_id {
+            let pkt_dcid = ConnectionId::from_ref(&hdr.dcid);
+            self.get_or_create_recv_path_id(paths, recv_pid, &pkt_dcid, buf_len, info)?
+        } else {
+            // During handshake, we are on the initial path.
+            paths.get_active_path_id()?
+        };
+
+        if !self.is_server && !self.got_peer_conn_id {
+            if self.odcid.is_none() {
+                self.odcid = Some(self.destination_id(paths.get_active().ok()).into_owned());
+            }
+
+            // Replace the randomly generated destination connection ID with
+            // the one supplied by the server.
+            self.set_initial_dcid(
+                paths.get_mut(recv_pid).unwrap(),
+                ConnectionId::from_vec(hdr.scid.to_vec()),
+                self.peer_transport_params.stateless_reset_token,
+            )?;
+
+            self.got_peer_conn_id = true;
+        }
+
+        if self.is_server && !self.got_peer_conn_id {
+            self.set_initial_dcid(paths.get_mut(recv_pid).unwrap(), ConnectionId::from_vec(hdr.scid.to_vec()), None)?;
+
+            if !self.did_retry {
+                self.local_transport_params
+                    .original_destination_connection_id =
+                    Some(hdr.dcid.to_vec().into());
+
+                self.encode_transport_params()?;
+            }
+
+            self.got_peer_conn_id = true;
+        }
+
+        // To avoid sending an ACK in response to an ACK-only packet, we need
+        // to keep track of whether this packet contains any frame other than
+        // ACK and PADDING.
+        let mut ack_elicited = false;
+
+        // Process packet payload. If a frame cannot be processed, store the
+        // error and stop further packet processing.
+        let mut frame_processing_err = None;
+
+        // To know if the peer migrated the connection, we need to keep track
+        // whether this is a non-probing packet.
+        let mut probing = true;
+
+        for frame in frames {
+            qlog_with_type!(QLOG_PACKET_RX, self.qlog, _q, {
+                qlog_frames.push(frame.to_qlog());
+            });
+
+            if frame.ack_eliciting() {
+                ack_elicited = true;
+            }
+
+            if !frame.probing() {
+                probing = false;
+            }
+
+            if let Err(e) = self.process_frame(paths, frame, &hdr, recv_pid, epoch, now)
+            {
+                frame_processing_err = Some(e);
+                break;
+            }
+        }
+
+        qlog_with_type!(QLOG_PACKET_RX, self.qlog, q, {
+            let packet_size = buf_len;
+
+            let qlog_pkt_hdr = qlog::events::quic::PacketHeader::with_type(
+                hdr.ty.to_qlog(),
+                Some(pn),
+                Some(hdr.version),
+                Some(&hdr.scid),
+                Some(&hdr.dcid),
+            );
+
+            let qlog_raw_info = RawInfo {
+                length: Some(packet_size as u64),
+                payload_length: Some(payload_len as u64),
+                data: None,
+            };
+
+            let ev_data =
+                EventData::PacketReceived(qlog::events::quic::PacketReceived {
+                    header: qlog_pkt_hdr,
+                    frames: Some(qlog_frames),
+                    is_coalesced: None,
+                    retry_token: None,
+                    stateless_reset_token: None,
+                    supported_versions: None,
+                    raw: Some(qlog_raw_info),
+                    datagram_id: None,
+                    trigger: None,
+                });
+
+            q.add_event_data_with_instant(ev_data, now).ok();
+        });
+
+        qlog_with_type!(QLOG_PACKET_RX, self.qlog, q, {
+            let recv_path = paths.get_mut(recv_pid)?;
+            if let Some(ev_data) = recv_path.recovery.maybe_qlog() {
+                q.add_event_data_with_instant(ev_data, now).ok();
+            }
+        });
+
+        if let Some(e) = frame_processing_err {
+            // Any frame error is terminal, so now just return.
+            return Err(e);
+        }
+
+        // Only log the remote transport parameters once the connection is
+        // established (i.e. after frames have been fully parsed) and only
+        // once per connection.
+        if self.is_established() {
+            qlog_with_type!(QLOG_PARAMS_SET, self.qlog, q, {
+                if !self.qlog.logged_peer_params {
+                    let ev_data = self
+                        .peer_transport_params
+                        .to_qlog(TransportOwner::Remote, self.handshake.cipher());
+
+                    q.add_event_data_with_instant(ev_data, now).ok();
+
+                    self.qlog.logged_peer_params = true;
+                }
+            });
+        }
+
+        // Process acked frames. Note that several packets from several paths
+        // might have been acked by the received packet.
+        for (_, p) in paths.iter_mut() {
+            for acked in p.recovery.acked[epoch].drain(..) {
+                match acked {
+                    frame::Frame::ACK { ranges, .. } => {
+                        // Stop acknowledging packets less than or equal to the
+                        // largest acknowledged in the sent ACK frame that, in
+                        // turn, got acked.
+                        if let Some(largest_acked) = ranges.last() {
+                            self.pkt_num_spaces
+                                .spaces
+                                .get_mut(epoch, 0)
+                                .map(|pns| {
+                                    pns.recv_pkt_need_ack
+                                        .remove_until(largest_acked)
+                                })
+                                .ok();
+                        }
+                    },
+
+                    frame::Frame::CryptoHeader { offset, length } => {
+                        self.pkt_num_spaces
+                            .crypto
+                            .get_mut(epoch)
+                            .crypto_stream
+                            .send
+                            .ack_and_drop(offset, length);
+                    },
+
+                    frame::Frame::StreamHeader {
+                        stream_id,
+                        offset,
+                        length,
+                        ..
+                    } => {
+                        let stream = match self.streams.get_mut(stream_id) {
+                            Some(v) => v,
+
+                            None => continue,
+                        };
+
+                        stream.send.ack_and_drop(offset, length);
+
+                        self.tx_buffered =
+                            self.tx_buffered.saturating_sub(length);
+
+                        qlog_with_type!(QLOG_DATA_MV, self.qlog, q, {
+                            let ev_data = EventData::DataMoved(
+                                qlog::events::quic::DataMoved {
+                                    stream_id: Some(stream_id),
+                                    offset: Some(offset),
+                                    length: Some(length as u64),
+                                    from: Some(DataRecipient::Transport),
+                                    to: Some(DataRecipient::Dropped),
+                                    raw: None,
+                                },
+                            );
+
+                            q.add_event_data_with_instant(ev_data, now).ok();
+                        });
+
+                        // Only collect the stream if it is complete and not
+                        // readable. If it is readable, it will get collected when
+                        // stream_recv() is used.
+                        if stream.is_complete() && !stream.is_readable() {
+                            let local = stream.local;
+                            self.streams.collect(stream_id, local);
+                        }
+                    },
+
+                    frame::Frame::HandshakeDone => {
+                        // Explicitly set this to true, so that if the frame was
+                        // already scheduled for retransmission, it is aborted.
+                        self.handshake_done_sent = true;
+
+                        self.handshake_done_acked = true;
+                    },
+
+                    frame::Frame::ResetStream { stream_id, .. } => {
+                        let stream = match self.streams.get_mut(stream_id) {
+                            Some(v) => v,
+
+                            None => continue,
+                        };
+
+                        // Only collect the stream if it is complete and not
+                        // readable. If it is readable, it will get collected when
+                        // stream_recv() is used.
+                        if stream.is_complete() && !stream.is_readable() {
+                            let local = stream.local;
+                            self.streams.collect(stream_id, local);
+                        }
+                    },
+
+                    frame::Frame::ACKMP {
+                        space_identifier,
+                        ranges,
+                        ..
+                    } => {
+                        // Stop acknowledging packets less than or equal to the
+                        // largest acknowledged in the sent ACK_MP frame that,
+                        // in turn, got acked.
+                        if let Some(largest_acked) = ranges.last() {
+                            self.pkt_num_spaces
+                                .spaces
+                                .get_mut(
+                                    packet::Epoch::Application,
+                                    space_identifier,
+                                )
+                                .map(|pns| {
+                                    pns.recv_pkt_need_ack
+                                        .remove_until(largest_acked)
+                                })
+                                .ok();
+                        }
+                    },
+
+                    frame::Frame::PathAbandon { dcid_seq_num, .. } => {
+                        self.dcid_seq_to_abandon.push_back(dcid_seq_num);
+                    },
+
+                    _ => (),
+                }
+            }
+        }
+
+        for dcid_seq in self.dcid_seq_to_abandon.drain(..) {
+            // The path might be already abandoned.
+            if let Ok(e) = self.ids.get_dcid(dcid_seq) {
+                if let Some(pid) = e.path_id {
+                    let (lost_packets, lost_bytes) = close_path(
+                        &mut self.ids,
+                        &mut self.pkt_num_spaces,
+                        paths.get_mut(pid).unwrap(),
+                        now,
+                        &self.trace_id,
+                    )?;
+                    self.lost_count += lost_packets;
+                    self.lost_bytes += lost_bytes as u64;
+                }
+            }
+        }
+
+        // Now that we processed all the frames, if there is a path that has no
+        // Destination CID, try to allocate one.
+        for (pid, p) in paths
+            .iter_mut()
+            .filter(|(_, p)| p.active_dcid_seq.is_none())
+        {
+            if self.ids.zero_length_dcid() {
+                p.active_dcid_seq = Some(0);
+                continue;
+            }
+
+            let dcid_seq = match self.ids.lowest_available_dcid_seq() {
+                Some(seq) => seq,
+                None => break,
+            };
+
+            update_dcid(&mut self.ids, pid, p, Some(dcid_seq))?;
+        }
+
+        let multipath_enabled = paths.multipath();
+        let pkt_num_space =
+            self.pkt_num_spaces.spaces.get_mut(epoch, space_id)?;
+
+        // We only record the time of arrival of the largest packet number
+        // that still needs to be acked, to be used for ACK delay calculation.
+        if pkt_num_space.recv_pkt_need_ack.last() < Some(pn) {
+            pkt_num_space.largest_rx_pkt_time = now;
+        }
+
+        pkt_num_space.recv_pkt_num.insert(pn);
+
+        pkt_num_space.recv_pkt_need_ack.push_item(pn);
+
+        pkt_num_space.ack_elicited =
+            cmp::max(pkt_num_space.ack_elicited, ack_elicited);
+
+        pkt_num_space.largest_rx_pkt_num =
+            cmp::max(pkt_num_space.largest_rx_pkt_num, pn);
+
+        if !probing {
+            pkt_num_space.largest_rx_non_probing_pkt_num =
+                cmp::max(pkt_num_space.largest_rx_non_probing_pkt_num, pn);
+
+            // Did the peer migrate to another path? This only applies when
+            // multipath extensions have not been negotiated.
+            let active_path_id = paths.get_active_path_id()?;
+
+            if self.is_server &&
+                !multipath_enabled &&
+                recv_pid != active_path_id &&
+                pkt_num_space.largest_rx_non_probing_pkt_num == pn
+            {
+                match paths.on_peer_migrated(recv_pid, self.disable_dcid_reuse, now, &self.trace_id) {
+                    Ok((lc, lb)) => {
+                        self.lost_count += lc;
+                        self.lost_bytes += lb as u64;
+                    }, 
+                    Err(_) => return Err(Error::InvalidState),
+                }
+            }
+        }
+
+        if let Some(idle_timeout) = self.idle_timeout(paths) {
+            self.idle_timer = Some(now + idle_timeout);
+        }
+
+        // Update send capacity.
+        self.update_path_stats_from_path(paths.get_mut(recv_pid)?);
+        self.update_tx_cap();
+
+        self.recv_count += 1;
+        paths.get_mut(recv_pid)?.recv_count += 1;
+
+        let read = buf_len;
+
+        self.recv_bytes += read as u64;
+        paths.get_mut(recv_pid)?.recv_bytes += read as u64;
+
+        // An Handshake packet has been received from the client and has been
+        // successfully processed, so we can drop the initial state and consider
+        // the client's address to be verified.
+        if self.is_server && hdr.ty == packet::Type::Handshake {
+            self.drop_epoch_state(paths.get_active_mut().unwrap(), packet::Epoch::Initial, now);
+            paths.get_mut(recv_pid)?.verified_peer_address = true;
+        }
+
+        self.ack_eliciting_sent = false;
+
+        Ok(())
+    }
+
+    /// Another recv function that parses decrypted packets already
+    pub fn recv_decrypted_pkts(
+        &mut self, 
+        paths: &mut path::PathMap, info: &RecvInfo,
+        header: Header, frames: Vec<frame::Frame>,
+    ) -> Result<()> {
+
+        let recv_pid = paths.path_id_from_addrs(&(info.to, info.from));
+
+        let mut out = [0u8; MAX_SEND_UDP_PAYLOAD_SIZE]; 
+        let payload_len: usize = frames.iter().map(|f| f.wire_len()).sum();
+        let mut b = octets::OctetsMut::with_slice(&mut out);
+        let header_clone = header.clone();
+        header_clone.to_bytes(&mut b)?;
+        let buf_len = payload_len + b.off();
+
+        if let Some(recv_pid) = recv_pid {
+            let recv_path = paths.get_mut(recv_pid)?;
+
+            // Keep track of how many bytes we received from the client, so we
+            // can limit bytes sent back before address validation, to a
+            // multiple of this. The limit needs to be increased early on, so
+            // that if there is an error there is enough credit to send a
+            // CONNECTION_CLOSE.
+            //
+            // It doesn't matter if the packets received were valid or not, we
+            // only need to track the total amount of bytes received.
+            //
+            // Note that we also need to limit the number of bytes we sent on a
+            // path if we are not the host that initiated its usage.
+            if self.is_server && !recv_path.verified_peer_address {
+                // TODO check if buf_len won't cause any issue as this isn't the actual initial len
+                recv_path.max_send_bytes += buf_len * MAX_AMPLIFICATION_FACTOR;
+            }
+        } else if !self.is_server {
+            // If a client receives packets from an unknown server address,
+            // the client MUST discard these packets.
+            trace!(
+                "{} client received packet from unknown address {:?}, dropping",
+                self.trace_id,
+                info,
+            );
+
+            return Ok(());
+        }
+
+        self.recv_single_decrypted(
+            paths, header, frames, payload_len, buf_len, info, recv_pid
+        )
+
+    }
+
     /// Processes QUIC packets received from the peer.
     ///
     /// On success the number of bytes processed from the input buffer is
@@ -2506,6 +3237,8 @@ impl Connection {
 
         // Derive initial secrets on the server.
         if !self.derived_initial_secrets {
+            info!("[TO_REMOVE] CANT_DO_OUTSIDE");
+
             let (aead_open, aead_seal) = crypto::derive_initial_key_material(
                 &hdr.dcid,
                 self.version,
@@ -2545,6 +3278,7 @@ impl Connection {
             Some(v) => v,
 
             None => {
+                info!("[TO_REMOVE] CANT_DO_OUTSIDE");
                 if hdr.ty == packet::Type::ZeroRTT &&
                     self.undecryptable_pkts.len() < MAX_UNDECRYPTABLE_PACKETS &&
                     !self.is_established()
@@ -2624,10 +3358,12 @@ impl Connection {
         // Check for key update.
         let mut aead_next = None;
 
+
         if self.handshake_confirmed &&
             hdr.ty != Type::ZeroRTT &&
             hdr.key_phase != self.key_phase
         {
+            info!("[TOREMOVE] CANT_DO_OUTSIDE");
             // Check if this packet arrived before key update.
             if let Some(key_update) = self
                 .pkt_num_spaces
@@ -9107,24 +9843,155 @@ pub mod testing {
             Ok(())
         }
 
-        pub fn client_recv(&mut self, buf: &mut [u8]) -> Result<usize> {
+        pub fn multicore_client_recv(&mut self, buf: &mut [u8]) -> Result<usize> {
+            if buf.len() == 0{
+                return Err(Error::BufferTooShort);
+            }
             let server_path = self.server_paths.get_active().unwrap();
             let info = RecvInfo {
                 to: server_path.peer_addr(),
                 from: server_path.local_addr(),
             };
-
-            self.client.recv(&mut self.client_paths, buf, info)
+            let initial_buf_len = buf.len();
+            let mut done = 0;
+            let len = buf.len();
+            let mut left = len;
+            'iterate: while left > 0 {
+                let mut read_normally = true;
+                if self.client.is_established() {
+                    let mut b = octets::OctetsMut::with_slice(buf);
+                    let mut hdr = match Header::from_bytes(&mut b, self.client.source_id(self.client_paths.get_active().ok()).len()){
+                        Ok(hdr) => hdr, 
+                        Err(..) => {
+                            // TODO check
+                            done += left;
+                            left -= left;
+                            continue 'iterate
+                        }, 
+                    };
+                    let epoch = hdr.ty.to_epoch()?;
+                    info!("[multicore_client_recv] Checking if can decrypt using header");
+                    if self.client.can_decrypt_outside_conn(&hdr, epoch){
+                        info!("[multicore_client_recv] Outside decrypt");
+                        let (read, frames) = match testing::decrypt_packet_outside_conn(&mut self.client, &mut self.client_paths, &mut b, &mut hdr, &info, initial_buf_len){
+                            Ok(v) => v, 
+                            Err(Error::Done) => (left, Vec::new()), 
+                            Err(e) => {
+                                // In case of error processing the incoming packet, close
+                                // the connection.
+                                self.server.close(false, e.to_wire(), b"").ok();
+                                return Err(e);
+                            },
+                        };
+                        info!("[multicore_client_recv] Passing decrypted packets");
+                        self.client.recv_decrypted_pkts(&mut self.client_paths, &info, hdr, frames)?;
+                        done += read;
+                        left -= read;
+                        read_normally = false;
+                    }
+                }
+                if read_normally {
+                    info!("[multicore_client_recv] Going to recv normally | len : {}, left: {}", len, left);
+                    let read = self.client.recv(&mut self.client_paths, buf, info)?;
+                    done += read;
+                    left -= read;
+                }
+            }
+            info!("[multicore_client_recv] Done");
+            Ok(done)
         }
 
-        pub fn server_recv(&mut self, buf: &mut [u8]) -> Result<usize> {
+        pub fn multicore_server_recv(&mut self, buf: &mut [u8]) -> Result<usize> {
+            if buf.len() == 0{
+                return Err(Error::BufferTooShort);
+            }
             let client_path = self.client_paths.get_active().unwrap();
             let info = RecvInfo {
                 to: client_path.peer_addr(),
                 from: client_path.local_addr(),
             };
+            let initial_buf_len = buf.len();
+            let mut done = 0;
+            let len = buf.len();
+            let mut left = len;
+            'iterate: while left > 0 {
+                info!("[multicore_server_recv] left: {}", left);
+                let mut read_normally = true;
+                if self.server.is_established(){
+                    let mut b = octets::OctetsMut::with_slice(buf);
+                    let mut hdr = match Header::from_bytes(&mut b, self.server.source_id(self.server_paths.get_active().ok()).len()){
+                        Ok(hdr) => hdr, 
+                        Err(..) => {
+                            // TODO check
+                            done += left;
+                            left -= left;
+                            continue 'iterate
+                        }, 
+                    };
+                    let epoch = hdr.ty.to_epoch()?;
+                    info!("[multicore_server_recv] Checking if can decrypt using header");
+                    if self.server.can_decrypt_outside_conn(&hdr, epoch){
+                        info!("[multicore_server_recv] Outside decrypt");
+                        let (read, frames) = match testing::decrypt_packet_outside_conn(&mut self.server, &mut self.server_paths, &mut b, &mut hdr, &info, initial_buf_len){
+                            Ok(v) => v, 
+                            Err(Error::Done) => (left, Vec::new()), 
+                            Err(e) => {
+                                // In case of error processing the incoming packet, close
+                                // the connection.
+                                self.server.close(false, e.to_wire(), b"").ok();
+                                return Err(e);
+                            },
+                        };
+                        info!("[multicore_server_recv] Passing decrypted packets");
+                        self.server.recv_decrypted_pkts(&mut self.server_paths, &info, hdr, frames)?;
+                        done += read;
+                        left -= read;
+                        read_normally = false;
+                    }
+                }
+                if read_normally {
+                    info!("[multicore_server_recv] Going to recv normally | len : {}, left: {}", len, left);
+                    let client_path = self.client_paths.get_active().unwrap();
+                    let info = RecvInfo {
+                        to: client_path.peer_addr(),
+                        from: client_path.local_addr(),
+                    };
 
-            self.server.recv(&mut self.server_paths, buf, info)
+                    let read = self.server.recv(&mut self.server_paths, buf, info)?;
+                    done += read;
+                    left -= read;
+                }
+            }
+            info!("[multicore_server_recv] Done");
+            Ok(done)
+        }
+
+        pub fn client_recv(&mut self, buf: &mut [u8]) -> Result<usize> {
+            if cfg!(feature = "multicore") {
+                self.multicore_client_recv(buf)
+            } else {
+                let server_path = self.server_paths.get_active().unwrap();
+                let info = RecvInfo {
+                    to: server_path.peer_addr(),
+                    from: server_path.local_addr(),
+                };
+    
+                self.client.recv(&mut self.client_paths, buf, info)
+            }
+        }
+
+        pub fn server_recv(&mut self, buf: &mut [u8]) -> Result<usize> {
+            if cfg!(feature = "multicore") {
+                self.multicore_server_recv(buf)
+            } else {
+                let client_path = self.client_paths.get_active().unwrap();
+                let info = RecvInfo {
+                    to: client_path.peer_addr(),
+                    from: client_path.local_addr(),
+                };
+
+                self.server.recv(&mut self.server_paths, buf, info)
+            }
         }
 
         pub fn send_pkt_to_server(
@@ -9268,7 +10135,7 @@ pub mod testing {
         }
     }
 
-    pub fn process_flight(
+    pub fn multicore_process_flight(
         conn: &mut Connection, paths: &mut path::PathMap, flight: Vec<(Vec<u8>, SendInfo)>,
     ) -> Result<()> {
         for (mut pkt, si) in flight {
@@ -9276,8 +10143,66 @@ pub mod testing {
                 to: si.to,
                 from: si.from,
             };
+            let initial_buf_len = pkt.len();
+            let len = pkt.len();
+            let mut left = len;
+            info!("[multicore_process_flight] New inflight len : {}", len);
+            'iterate: while left > 0 {
+                let mut read_normally = true;
+                if conn.is_established(){
+                    let mut b = octets::OctetsMut::with_slice(&mut pkt);
+                    let mut hdr = match Header::from_bytes(&mut b, conn.source_id(paths.get_active().ok()).len()){
+                        Ok(hdr) => hdr, 
+                        Err(..) => {
+                            // TODO check
+                            left -= left;
+                            continue 'iterate
+                        }, 
+                    };
+                    let epoch = hdr.ty.to_epoch()?;
+                    if conn.can_decrypt_outside_conn(&hdr, epoch){
+                        info!("[multicore_process_flight] Outside decrypt");
+                        let (read, frames) = match testing::decrypt_packet_outside_conn(conn, paths, &mut b, &mut hdr, &info, initial_buf_len){
+                            Ok(v) => v, 
+                            Err(Error::Done) => return Ok(()), 
+                            Err(e) => {
+                                // In case of error processing the incoming packet, close
+                                // the connection.
+                                conn.close(false, e.to_wire(), b"").ok();
+                                return Err(e);
+                            },
+                        };
+                        conn.recv_decrypted_pkts(paths, &info, hdr, frames)?;
+                        left -= read;
+                        read_normally = false;
+                    }
+                }
+                if read_normally {
+                    info!("[multicore_process_flight] Normal read");
+                    let read = conn.recv(paths, &mut pkt[len-left..len], info)?;
+                    left -= read;
+                }
+                info!("[multicore_process_flight] left: {}", left);
+            }
+        }
 
-            conn.recv(paths, &mut pkt, info)?;
+        Ok(())
+    }
+
+    pub fn process_flight(
+        conn: &mut Connection, paths: &mut path::PathMap, flight: Vec<(Vec<u8>, SendInfo)>,
+    ) -> Result<()> {
+        if cfg!(feature = "multicore") {
+            multicore_process_flight(conn, paths, flight)?;
+        } else {
+            for (mut pkt, si) in flight {
+                let info = RecvInfo {
+                    to: si.to,
+                    from: si.from,
+                };
+    
+                conn.recv(paths, &mut pkt, info)?;
+            }
         }
 
         Ok(())
@@ -9413,6 +10338,103 @@ pub mod testing {
         Ok(written)
     }
 
+    pub fn decrypt_packet_outside_conn(
+        conn: &mut Connection, paths: &mut path::PathMap, b: &mut octets::OctetsMut, hdr: &mut Header, 
+        info: &RecvInfo, initial_buf_len: usize
+    ) -> Result<(usize, Vec<frame::Frame>)> {
+        let len = initial_buf_len;
+        if len == 0 {
+            return Err(Error::BufferTooShort);
+        }
+
+        let recv_pid = paths.path_id_from_addrs(&(info.to, info.from));
+        if let Some(recv_pid) = recv_pid {
+            let recv_path = paths.get_mut(recv_pid)?;
+
+            // Keep track of how many bytes we received from the client, so we
+            // can limit bytes sent back before address validation, to a
+            // multiple of this. The limit needs to be increased early on, so
+            // that if there is an error there is enough credit to send a
+            // CONNECTION_CLOSE.
+            //
+            // It doesn't matter if the packets received were valid or not, we
+            // only need to track the total amount of bytes received.
+            //
+            // Note that we also need to limit the number of bytes we sent on a
+            // path if we are not the host that initiated its usage.
+            if conn.is_server && !recv_path.verified_peer_address {
+                recv_path.max_send_bytes += len * MAX_AMPLIFICATION_FACTOR;
+            }
+        } else if !conn.is_server {
+            // If a client receives packets from an unknown server address,
+            // the client MUST discard these packets.
+            trace!(
+                "{} client received packet from unknown address {:?}, dropping",
+                conn.trace_id,
+                info,
+            );
+
+            return Ok((len, Vec::new()));
+        }
+
+        let epoch = hdr.ty.to_epoch()?;
+        let aead = if hdr.ty == packet::Type::ZeroRTT {
+            // Only use 0-RTT key if incoming packet is 0-RTT.
+            conn.pkt_num_spaces
+                .crypto
+                .get(epoch)
+                .crypto_0rtt_open
+                .as_ref().unwrap()
+        } else {
+            // Otherwise use the packet number space's main key.
+            conn.pkt_num_spaces.crypto.get(epoch).crypto_open.as_ref().unwrap()
+        };
+
+        let payload_len = b.cap();
+
+        packet::decrypt_hdr(b, hdr, aead).map_err(|e| {
+            drop_pkt_on_err(e, conn.recv_count, conn.is_server, &conn.trace_id)
+        })?;
+
+        let pn = packet::decode_pkt_num(
+            conn.pkt_num_spaces.spaces.get(epoch, 0)?.largest_rx_pkt_num,
+            hdr.pkt_num,
+            hdr.pkt_num_len,
+        );
+
+        let space_seq = if paths.multipath() {
+            conn.ids
+                .find_scid_seq(&hdr.dcid)
+                .map(|(seq, _)| seq)
+                .unwrap() as u32
+        } else {
+            packet::INITIAL_PACKET_NUMBER_SPACE_ID as u32
+        };
+
+        info!("[decrypt_packet_outside_conn] packet header {:?}", hdr);
+        info!("[decrypt_packet_outside_conn] off : {}, len: {}", b.off(), b.len());
+
+        let mut payload = packet::decrypt_pkt(
+            b,
+            space_seq,
+            pn,
+            hdr.pkt_num_len,
+            payload_len,
+            aead,
+        ).map_err(|e| {
+            drop_pkt_on_err(e, conn.recv_count, conn.is_server, &conn.trace_id)
+        })?;
+
+        let mut frames = Vec::new();
+
+        while payload.cap() > 0 {
+            let frame = frame::Frame::from_bytes(&mut payload, hdr.ty)?;
+            frames.push(frame);
+        }
+
+        Ok((b.off() + aead.alg().tag_len(), frames))
+    }
+
     pub fn decode_pkt(
         conn: &mut Connection, paths: &mut path::PathMap, buf: &mut [u8],
     ) -> Result<Vec<frame::Frame>> {
@@ -9485,6 +10507,7 @@ pub mod testing {
 }
 
 #[cfg(test)]
+
 mod tests {
     use super::*;
 
@@ -9552,6 +10575,7 @@ mod tests {
 
         assert_eq!(new_tp, tp);
     }
+    
 
     #[test]
     fn transport_params_forbid_duplicates() {
@@ -9778,8 +10802,8 @@ mod tests {
             Err(Error::InvalidTransportParam)
         );
     }
-
-    #[test]
+    use test_log;
+    #[test_log::test]
     fn handshake() {
         let mut pipe = testing::Pipe::new().unwrap();
         assert_eq!(pipe.handshake(), Ok(()));
@@ -12467,7 +13491,7 @@ mod tests {
         assert!(pipe.server.is_closed());
     }
 
-    #[test]
+    #[test_log::test]
     /// Tests that invalid packets don't cause the connection to be closed.
     fn invalid_packet() {
         let mut buf = [0; 65535];
