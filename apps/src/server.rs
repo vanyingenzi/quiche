@@ -404,11 +404,7 @@ pub fn start_server(
                 let app_proto = client.conn.application_proto();
 
                 #[allow(clippy::box_default)]
-                if alpns::HTTP_09.contains(&app_proto) {
-                    client.http_conn = Some(Box::<Http09Conn>::default());
-
-                    client.app_proto_selected = true;
-                } else if alpns::HTTP_3.contains(&app_proto) {
+                if alpns::HTTP_3.contains(&app_proto) {
                     let dgram_sender = if conn_args.dgrams_enabled {
                         Some(Http3DgramSender::new(
                             conn_args.dgram_count,
@@ -435,6 +431,9 @@ pub fn start_server(
                     };
 
                     client.app_proto_selected = true;
+                } else {
+                    error!("HTTP not 3!");
+                    client.conn.close(true, 0, "HTTP not 3".as_bytes()).unwrap();
                 }
 
                 // Update max_datagram_size after connection established.

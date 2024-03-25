@@ -402,7 +402,7 @@ pub fn multicore_connect(
         config.enable_dgram(true, 1000, 1000);
     }
 
-    let mut http_conn: Option<Box<dyn HttpConn>> = None;
+    let mut http_conn: Option<Box<MulticoreHttp3Conn>> = None;
 
     // Generate a random source connection ID for the connection.
     let mut scid = [0; quiche::MAX_CONN_ID_LEN];

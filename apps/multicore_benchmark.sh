@@ -1,8 +1,8 @@
 #!/bin/bash
 
 RUST_PLATFORM="x86_64-unknown-linux-gnu"
-FILE_SIZE=1
-NB_RUNS=1
+FILE_SIZE=2
+NB_RUNS=4
 
 RED='\033[0;31m'
 RESET='\033[0m'
@@ -38,14 +38,13 @@ setup_rust() {
 
 setup_environment() {
     mkdir -p "${ROOT_DIR}"
-    fallocate -l ${FILE_SIZE} "${ROOT_DIR}/${FILENAME}"
+    fallocate -l "${FILE_SIZE}G" "${ROOT_DIR}/${FILENAME}"
 }
 
 mcmpquic_iteration_loop() {
     RUSTFLAGS='-C target-cpu=native' cargo build --release || exit 1
     local server_pid server_port client_port_1 client_port_2 error_code
     local total_runtime=0
-    local total_goodput=0
     for iter in $(seq 1 ${NB_RUNS}); do
         echo "Benchmarking multicore Multi-Path QUIC [mcMPQUIC] - Iteration $iter"
         client_port_1=$(get_unused_port)
@@ -66,7 +65,7 @@ mcmpquic_iteration_loop() {
             "https://127.0.0.1:4433/${FILENAME}" \
             -A 127.0.0.1:${client_port_1} \
             -A 127.0.0.1:${client_port_2} \
-            --multipath --multicore --no-verify 1>/dev/null 2>&1
+            --multipath --multicore --no-verify 1>/dev/null
         error_code=$?
         end=$(date +%s.%N)
         if [ $error_code -ne 0 ]; then
@@ -86,7 +85,6 @@ mpquic_iteration_loop() {
     RUSTFLAGS='-C target-cpu=native' cargo build --release || exit 1
     local server_pid server_port client_port_1 client_port_2 error_code
     local total_runtime=0
-    local total_goodput=0
     for iter in $(seq 1 ${NB_RUNS}); do
         echo "Benchmarking Multi-Path QUIC [MPQUIC]- Iteration $iter" >&2
         client_port_1=$(get_unused_port)
