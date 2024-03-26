@@ -23,5 +23,6 @@ jobs:
       - name: Multicore Logic Tests
         uses: actions-rs/cargo@v1
         with:
-          command: test --features=multicore
+          command: test 
+          args: --features=multicore
   
