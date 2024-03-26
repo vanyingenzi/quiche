@@ -2,7 +2,7 @@
 
 RUST_PLATFORM="x86_64-unknown-linux-gnu"
 FILE_SIZE=2
-NB_RUNS=4
+NB_RUNS=10
 
 RED='\033[0;31m'
 RESET='\033[0m'
@@ -61,7 +61,7 @@ mcmpquic_iteration_loop() {
 
         # Run client
         start=$(date +%s.%N)
-        ../target/release/quiche-client \
+        RUST_LOG=info ../target/release/quiche-client \
             "https://127.0.0.1:4433/${FILENAME}" \
             -A 127.0.0.1:${client_port_1} \
             -A 127.0.0.1:${client_port_2} \

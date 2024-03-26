@@ -3363,7 +3363,6 @@ impl Connection {
             hdr.ty != Type::ZeroRTT &&
             hdr.key_phase != self.key_phase
         {
-            info!("[TOREMOVE] CANT_DO_OUTSIDE");
             // Check if this packet arrived before key update.
             if let Some(key_update) = self
                 .pkt_num_spaces
@@ -3401,6 +3400,8 @@ impl Connection {
                 aead = &aead_next.as_ref().unwrap().0;
             }
         }
+
+        info!("b off: {}, space_id {}, pn {}, pn len {} payload_len {}", b.off(), space_id, pn, pn_len, payload_len);
 
         let mut payload = packet::decrypt_pkt(
             &mut b,
@@ -10390,33 +10391,53 @@ pub mod testing {
             conn.pkt_num_spaces.crypto.get(epoch).crypto_open.as_ref().unwrap()
         };
 
-        let payload_len = b.cap();
+        let payload_len = if hdr.ty == packet::Type::Short {
+            b.cap()
+        } else {
+            b.get_varint().map_err(|e| {
+                drop_pkt_on_err(
+                    e.into(),
+                    conn.recv_count,
+                    conn.is_server,
+                    &conn.trace_id,
+                )
+            })? as usize
+        };
 
         packet::decrypt_hdr(b, hdr, aead).map_err(|e| {
             drop_pkt_on_err(e, conn.recv_count, conn.is_server, &conn.trace_id)
         })?;
+        
+        let space_id = if paths.multipath() {
+            if let Some((scid_seq, _)) = conn.ids.find_scid_seq(&hdr.dcid) {
+                scid_seq
+            } else {
+                trace!(
+                    "{} ignored unknown Source CID {:?}",
+                    conn.trace_id,
+                    hdr.dcid
+                );
+                return Err(Error::Done);
+            }
+        } else {
+            packet::INITIAL_PACKET_NUMBER_SPACE_ID
+        };
 
+        let largest_rx_pkt_num = conn
+            .pkt_num_spaces
+            .spaces
+            .get(epoch, space_id)
+            .map(|pns| pns.largest_rx_pkt_num)
+            .unwrap_or(0);
         let pn = packet::decode_pkt_num(
-            conn.pkt_num_spaces.spaces.get(epoch, 0)?.largest_rx_pkt_num,
+            largest_rx_pkt_num,
             hdr.pkt_num,
             hdr.pkt_num_len,
         );
 
-        let space_seq = if paths.multipath() {
-            conn.ids
-                .find_scid_seq(&hdr.dcid)
-                .map(|(seq, _)| seq)
-                .unwrap() as u32
-        } else {
-            packet::INITIAL_PACKET_NUMBER_SPACE_ID as u32
-        };
-
-        info!("[decrypt_packet_outside_conn] packet header {:?}", hdr);
-        info!("[decrypt_packet_outside_conn] off : {}, len: {}", b.off(), b.len());
-
         let mut payload = packet::decrypt_pkt(
             b,
-            space_seq,
+            space_id as u32,
             pn,
             hdr.pkt_num_len,
             payload_len,
@@ -16010,7 +16031,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[test_log::test]
     fn app_close_by_server_during_handshake_not_established() {
         let mut pipe = testing::Pipe::new().unwrap();
 
