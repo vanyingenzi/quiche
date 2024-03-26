@@ -44,30 +44,106 @@ use std::io::prelude::*;
 // use std::rc::Rc;
 // use std::cell::RefCell;
 use std::str::FromStr;
-use std::sync::RwLock;
 use std::thread;
 use std::time::Duration;
-use std::time::Instant;
+//use std::time::Instant;
 
 use mio::net::UdpSocket;
 use quiche::Connection;
 use quiche::ConnectionId;
 use ring::rand::*;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, RwLock};
 //use spin::Mutex;
 
 const MAX_BUF_SIZE: usize = 65507;
 const MAX_DATAGRAM_SIZE: usize = 1350;
-const MAX_OFFSET: usize = MAX_BUF_SIZE / MAX_DATAGRAM_SIZE;
+
+#[inline]
+fn _inner_read_packet(
+    quiche_conn: &Arc<RwLock<Connection>>, 
+    paths_guard: &Arc<RwLock<quiche::path::PathMap>>,
+    buf: &mut [u8],
+    recv_info: quiche::RecvInfo,
+) -> Result<usize, quiche::Error>{
+    let initial_buf_len = buf.len();
+    let mut done = 0;
+    let len = buf.len();
+    let mut left = len;
+    let mut is_established; 
+    let mut dcid_len;
+    let mut can_decrypt_outside ;
+    'iterate: while left > 0 {
+        let mut read_normally = true;
+        {
+            let paths_read = paths_guard.read().unwrap();
+            let conn_read = quiche_conn.read().unwrap();
+            is_established = conn_read.is_established();
+            dcid_len = conn_read.source_id(paths_read.get_active().ok()).len();
+        }
+        if is_established {
+            let mut b = octets::OctetsMut::with_slice(buf);
+            let mut hdr = match quiche::Header::from_bytes(&mut b, dcid_len){
+                Ok(hdr) => hdr, 
+                Err(..) => {
+                    // TODO check
+                    done += left;
+                    left -= left;
+                    continue 'iterate
+                }, 
+            };
+
+            let epoch = hdr.ty.to_epoch().unwrap();
+            {
+                let conn_read = quiche_conn.read().unwrap();
+                can_decrypt_outside = conn_read.can_decrypt_outside_conn(&hdr, epoch);
+            }
+            if can_decrypt_outside {
+                debug!("[inner_read_packet] Outside decrypt");
+                let (read, frames) = match quiche::decrypt_packet_outside_conn_with_locks(
+                    paths_guard, quiche_conn, &mut b, &mut hdr, &recv_info, initial_buf_len
+                ){
+                    Ok(v) => v, 
+                    Err(quiche::Error::Done) => (left, Vec::new()), 
+                    Err(e) => {
+                        // In case of error processing the incoming packet, close
+                        // the connection.
+                        let mut conn = quiche_conn.write().unwrap();
+                        conn.close(false, e.to_wire(), b"").ok();
+                        return Err(e);
+                    },
+                };
+                {
+                    let mut paths = paths_guard.write().unwrap();
+                    let mut conn = quiche_conn.write().unwrap();
+                    conn.recv_decrypted_pkts(&mut paths, &recv_info, hdr, frames)?;
+                }
+                done += read;
+                left -= read;
+                read_normally = false;
+            }
+        }
+        if read_normally {
+            info!("NORMAL_READ");
+            let mut paths = paths_guard.write().unwrap();
+            let mut conn = quiche_conn.write().unwrap();
+            debug!("[inner_read_packet] Going to recv normally | len : {}, left: {}", len, left);
+            let read = conn.recv(&mut paths, buf, recv_info)?;
+            done += read;
+            left -= read;
+        }
+    }
+    trace!("[inner_read_packet] Done");
+    Ok(done)
+}
 
 #[inline]
 pub fn read_packets_on_socket(
-    socket: &UdpSocket, events: &Events, quiche_conn: &Arc<Mutex<Connection>>,
-    paths_guard: &Arc<Mutex<quiche::path::PathMap>>, pkt_count: &mut u64, dump_packet_path: &Option<String>, 
-    buf: &mut [u8], local_addr: SocketAddr, _peer_addr: SocketAddr
+    socket: &UdpSocket, events: &Events, quiche_conn: &Arc<RwLock<Connection>>,
+    paths_guard: &Arc<RwLock<quiche::path::PathMap>>, pkt_count: &mut u64, dump_packet_path: &Option<String>, 
+    buf: &mut [u8], local_addr: &SocketAddr, _peer_addr: &SocketAddr
 ) -> Result<(), ClientError> {
-    let mut conn_paths = paths_guard.lock().unwrap();
-    let mut conn = quiche_conn.lock().unwrap();
+    let mut paths = paths_guard.write().unwrap();
+    let mut conn = quiche_conn.write().unwrap();
     for event in events {
         if event.is_readable() {
             'read: loop {
@@ -101,8 +177,8 @@ pub fn read_packets_on_socket(
 
                 *pkt_count += 1;
 
-                let read = match conn.recv(&mut conn_paths, &mut buf[..len], quiche::RecvInfo {
-                    to: local_addr,
+                let read = match conn.recv(&mut paths, &mut buf[..len], quiche::RecvInfo {
+                    to: *local_addr,
                     from,
                 }) {
                     Ok(v) => v,
@@ -123,26 +199,22 @@ pub fn read_packets_on_socket(
 #[inline]
 pub fn write_packets_on_path(
     local_addr: &SocketAddr, peer_addr: &SocketAddr, socket: &UdpSocket,
-    quiche_conn: &Arc<Mutex<Connection>>, paths_guard: &Arc<Mutex<quiche::path::PathMap>>, 
+    quiche_conn: &Arc<RwLock<Connection>>, paths_guard: &Arc<RwLock<quiche::path::PathMap>>, 
     out: &mut [u8],
 ) -> Result<usize, ClientError> {
-    let mut offset_buf = vec![(0, 0); MAX_OFFSET];
-    let mut count = 0;
-    let mut offset = 0;
+    let mut conn_paths = paths_guard.write().unwrap();
+    let mut conn = quiche_conn.write().unwrap();
     let mut written = 0;
-    let timestamp = Instant::now();
-    {
-        let mut conn_paths = paths_guard.lock().unwrap();
-        let mut conn = quiche_conn.lock().unwrap();
-        loop {
-            let (write, _) = match conn.send_on_path(&mut conn_paths, &mut out[offset..], Some(*local_addr), Some(*peer_addr)) {
+    //let timestamp = Instant::now();
+    loop {
+        let (write, send_info) = match conn.send_on_path(&mut conn_paths, out, Some(*local_addr), Some(*peer_addr)) {
                 Ok(v) => v,
 
                 Err(quiche::Error::Done) => {
                     trace!("{} -> {}: done writing", local_addr, peer_addr);
                     break;
                 },
-                
+
                 Err(e) => {
                     error!(
                         "{} -> {}: send failed: {:?}",
@@ -153,29 +225,21 @@ pub fn write_packets_on_path(
                     break;
                 },
             };
-            offset_buf[count] = (offset, write);
-            count += 1;
-            offset += write;
-        }
-    }
-
-    for i in 0..count{
-        let (offset, write) = offset_buf[i];
-        // TODO check the peer address as for server migration this would pose an issue
-        if let Err(e) = socket.send_to(&out[offset..offset+write], *peer_addr) {
+        if let Err(e) = socket.send_to(&out[..write], send_info.to) {
             if e.kind() == std::io::ErrorKind::WouldBlock {
-                trace!("{} -> {}: send() would block", local_addr, peer_addr);
+                trace!("{} -> {}: send() would block", local_addr, send_info.to);
+                break;
             }
 
             return Err(ClientError::Other(format!(
                 "{} -> {}: send() failed: {:?}",
-                local_addr, peer_addr, e
+                local_addr, send_info.to, e
             )));
         }
         written += write;
-        trace!("{} -> {}: written {}", local_addr, peer_addr, write);
+        trace!("{} -> {}: written {}", local_addr, send_info.to, write);
     }
-    trace!("[PARSE_EVENT] [topic: locking] [type: duration] [event: Conn + UDP Snd CS] [metadata: {:?}] [value: {:?}]", thread::current().id(), timestamp.elapsed().as_nanos());
+    //trace!("[PARSE_EVENT] [topic: locking] [type: duration] [event: Conn + UDP Snd CS] [metadata: {:?}] [value: {:?}]", thread::current().id(), timestamp.elapsed().as_nanos());
     Ok(written)
 }
 
@@ -218,13 +282,13 @@ fn multicore_initiate_connection(
 }
 
 #[inline]
-fn can_send_on_path(paths: &quiche::path::PathMap, local_addr: SocketAddr, peer_addr: SocketAddr) -> bool {
-    paths.iter().map(|(_, p)| p.stats()).any(|p| p.local_addr == local_addr && p.peer_addr == peer_addr)
+fn can_send_on_path(paths: &quiche::path::PathMap, local_addr: &SocketAddr, peer_addr: &SocketAddr) -> bool {
+    paths.iter().map(|(_, p)| p.stats()).any(|p| p.local_addr == *local_addr && p.peer_addr == *peer_addr)
 }
 
 fn client_thread(
-    quiche_conn: Arc<Mutex<Connection>>,
-    paths_guard: Arc<Mutex<quiche::path::PathMap>>,
+    quiche_conn: Arc<RwLock<Connection>>,
+    paths_guard: Arc<RwLock<quiche::path::PathMap>>,
     dump_packet_path: Option<String>,
     addrs: (SocketAddr, SocketAddr), 
     initiate_connection: bool,
@@ -240,15 +304,15 @@ fn client_thread(
     let (local_addr, peer_addr) = addrs;
     let mut socket = multicore_create_socket((&local_addr, &peer_addr), &mut poll);
     if initiate_connection {
-        let mut conn_paths = paths_guard.lock().unwrap();
-        let mut conn = quiche_conn.lock().unwrap();
+        let mut conn_paths = paths_guard.write().unwrap();
+        let mut conn = quiche_conn.write().unwrap();
         multicore_initiate_connection(&peer_addr, &local_addr, &mut out, &scid, &mut conn, &mut conn_paths, &mut socket).unwrap();
         *sent_conn_init_pkt.write().unwrap() = true;
     } else {
-        while !*sent_conn_init_pkt.read().unwrap() {}
+        while !paths_guard.read().unwrap().get_active().unwrap().path_validated() {}
     }
-
-    debug!(
+    
+    info!(
         "[Path Thread]: Thread {:?}, started with path {} <-> {}",
         thread::current().id(),
         local_addr,
@@ -257,32 +321,36 @@ fn client_thread(
 
     let mut can_send = initiate_connection; // Initial path can send
     let mut path_timeout;
-    
+    let mut wake_main = true;
     loop {
+        if wake_main {
+            main_thread_advance_lock.wake().expect("Unable to wake");
+        }
         {
-            let mut conn_paths = paths_guard.lock().unwrap();
+            let mut conn_paths = paths_guard.write().unwrap();
             path_timeout = match conn_paths.get_mut_from_addr(local_addr, peer_addr){
                 Ok(path) => path.path_timeout(), 
                 Err(_) => Some(Duration::from_nanos(1)) // Path may not be active or registered yet
             };
         }
 
+        wake_main = false;
         poll.poll(&mut events, path_timeout).unwrap();
 
         if !events.is_empty() {
-            read_packets_on_socket(&socket, &events, &quiche_conn, &paths_guard, &mut pkt_count, &dump_packet_path, &mut buf, local_addr, peer_addr).unwrap();
-            main_thread_advance_lock.wake().expect("Unable to wake");
+            read_packets_on_socket(&socket, &events, &quiche_conn, &paths_guard, &mut pkt_count, &dump_packet_path, &mut buf, &local_addr, &peer_addr).unwrap();
+            wake_main |= true;
         }
 
         if can_send {
-            if let Ok(v) = write_packets_on_path(&local_addr, &peer_addr, &socket, &quiche_conn, &paths_guard, &mut buf){
+            if let Ok(v) = write_packets_on_path(&local_addr, &peer_addr, &socket, &quiche_conn, &paths_guard, &mut out){
                 if v > 0 {
-                    main_thread_advance_lock.wake().expect("Unable to wake");
+                    wake_main |= true;
                 }
             }
         } else {
-            let mut conn_paths = paths_guard.lock().unwrap();
-            can_send = can_send_on_path(&mut conn_paths, local_addr, peer_addr);
+            let conn_paths = paths_guard.read().unwrap();
+            can_send = can_send_on_path(&conn_paths, &local_addr, &peer_addr);
         }
     }
 }
@@ -447,8 +515,8 @@ pub fn multicore_connect(
         }
     }
 
-    let conn_guard = Arc::new(Mutex::new(conn));
-    let paths_guard = Arc::new(Mutex::new(conn_paths));
+    let paths_guard = Arc::new(RwLock::new(conn_paths));
+    let conn_guard = Arc::new(RwLock::new(conn));
     let sent_connection_initial_packet = Arc::new(RwLock::new(false));
     
     let wake_token = mio::Token(0); // The number in the token represents the id of the token
@@ -457,7 +525,8 @@ pub fn multicore_connect(
     let mut events = Events::with_capacity(3);
     let main_thread_advance = Arc::new(mio::Waker::new(poll.registry(), wake_token).unwrap());
 
-    let core_ids = core_affinity::get_core_ids().unwrap();
+    let mut core_ids = core_affinity::get_core_ids().unwrap();
+    core_ids.reverse();
     let mut current_path_thread_idx = 0;
 
     for (local, peer) in sockets_addrs.clone() {
@@ -505,9 +574,9 @@ pub fn multicore_connect(
     
     loop {
         {
-            let mut conn_paths = paths_guard.lock().unwrap();
-            let conn = conn_guard.lock().unwrap();
-            conn_timeout = conn.timeout(&mut conn_paths); // Default timeout
+            let conn_paths = paths_guard.read().unwrap();
+            let conn = conn_guard.read().unwrap();
+            conn_timeout = conn.timeout(&conn_paths);
             is_in_early_data = conn.is_in_early_data();
         }
         
@@ -516,8 +585,8 @@ pub fn multicore_connect(
         }
 
         if events.is_empty() {
-            let mut conn_paths = paths_guard.lock().unwrap();
-            let mut conn = conn_guard.lock().unwrap();
+            let mut conn_paths = paths_guard.write().unwrap();
+            let mut conn = conn_guard.write().unwrap();
             if !conn.is_in_early_data() || app_proto_selected {
                 trace!("timed out");
                 conn.on_timeout(&mut conn_paths);
@@ -526,8 +595,8 @@ pub fn multicore_connect(
 
         {
             // let timestamp = Instant::now();
-            let mut conn_paths = paths_guard.lock().unwrap();
-            let mut conn = conn_guard.lock().unwrap();
+            let mut conn_paths = paths_guard.write().unwrap();
+            let mut conn = conn_guard.write().unwrap();
             // trace!("[PARSE_EVENT] [topic: locking] [type: duration] [event: Acquire HTTP Lock] [metadata: {:?}] [value: {:?}]", thread::current().id(), timestamp.elapsed().as_nanos());
             // let timestamp = Instant::now();
             if conn.is_closed() {

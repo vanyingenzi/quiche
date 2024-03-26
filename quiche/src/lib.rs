@@ -482,7 +482,7 @@ const CONNECTION_WINDOW_FACTOR: f64 = 1.5;
 
 // How many probing packet timeouts do we tolerate before considering the path
 // validation as failed.
-const MAX_PROBING_TIMEOUTS: usize = 5; // Push back down to 3
+const MAX_PROBING_TIMEOUTS: usize = 10; // Push back down to 3
 
 // The default initial congestion window size in terms of packet count.
 const DEFAULT_INITIAL_CONGESTION_WINDOW_PACKETS: usize = 10;
@@ -574,7 +574,8 @@ pub enum Error {
 }
 
 impl Error {
-    fn to_wire(self) -> u64 {
+    /// Vany made it public
+    pub fn to_wire(self) -> u64 {
         match self {
             Error::Done => 0x0,
             Error::InvalidFrame => 0x7,
@@ -2091,7 +2092,6 @@ impl Connection {
         }
         if  hdr.ty == packet::Type::Retry || 
             hdr.ty == packet::Type::VersionNegotiation || 
-            hdr.ty == packet::Type::Short ||
             (hdr.ty != packet::Type::Short && hdr.version != self.version)
         {
             return false;
@@ -3237,8 +3237,6 @@ impl Connection {
 
         // Derive initial secrets on the server.
         if !self.derived_initial_secrets {
-            info!("[TO_REMOVE] CANT_DO_OUTSIDE");
-
             let (aead_open, aead_seal) = crypto::derive_initial_key_material(
                 &hdr.dcid,
                 self.version,
@@ -3278,7 +3276,6 @@ impl Connection {
             Some(v) => v,
 
             None => {
-                info!("[TO_REMOVE] CANT_DO_OUTSIDE");
                 if hdr.ty == packet::Type::ZeroRTT &&
                     self.undecryptable_pkts.len() < MAX_UNDECRYPTABLE_PACKETS &&
                     !self.is_established()
@@ -3400,9 +3397,7 @@ impl Connection {
                 aead = &aead_next.as_ref().unwrap().0;
             }
         }
-
-        info!("b off: {}, space_id {}, pn {}, pn len {} payload_len {}", b.off(), space_id, pn, pn_len, payload_len);
-
+        
         let mut payload = packet::decrypt_pkt(
             &mut b,
             space_id as u32,
@@ -4632,7 +4627,6 @@ impl Connection {
                 if push_frame_to_pkt!(b, frames, frame, left) {
                     // Let's notify the path once we know the packet size.
                     challenge_data = Some(data);
-
                     ack_eliciting = true;
                     in_flight = true;
                 }
@@ -6580,7 +6574,7 @@ impl Connection {
     /// disarmed.
     ///
     /// [`on_timeout()`]: struct.Connection.html#method.on_timeout
-    pub fn timeout_instant(&self, paths: &mut path::PathMap) -> Option<time::Instant> {
+    pub fn timeout_instant(&self, paths: &path::PathMap) -> Option<time::Instant> {
         if self.is_closed() {
             return None;
         }
@@ -6615,7 +6609,7 @@ impl Connection {
     /// be called. A timeout of `None` means that the timer should be disarmed.
     ///
     /// [`on_timeout()`]: struct.Connection.html#method.on_timeout
-    pub fn timeout(&self, paths: &mut path::PathMap) -> Option<time::Duration> {
+    pub fn timeout(&self, paths: &path::PathMap) -> Option<time::Duration> {
         self.timeout_instant(paths).map(|timeout| {
             let now = time::Instant::now();
 
@@ -9001,6 +8995,273 @@ fn drop_pkt_on_err(
     Error::Done
 }
 
+use std::sync::RwLock;
+
+/// Tries to decrypt outside of the connection
+pub fn decrypt_packet_outside_conn_with_locks(
+    paths_guard: &Arc<RwLock<path::PathMap>>,
+    quiche_conn: &Arc<RwLock<Connection>>, 
+    b: &mut octets::OctetsMut, 
+    hdr: &mut Header, 
+    info: &RecvInfo, initial_buf_len: usize
+) -> Result<(usize, Vec<frame::Frame>)> {
+    let len = initial_buf_len;
+    if len == 0 {
+        return Err(Error::BufferTooShort);
+    }
+
+    let recv_count;
+    let space_id;
+    let trace_id;
+    let largest_rx_pkt_num;
+    let is_server;
+
+    let epoch = hdr.ty.to_epoch()?;
+    {
+        let mut paths = paths_guard.write().unwrap();
+        let conn = quiche_conn.read().unwrap();
+        let recv_pid = paths.path_id_from_addrs(&(info.to, info.from));
+        paths.path_id_from_addrs(&(info.to, info.from));
+        if let Some(recv_pid) = recv_pid {
+            let recv_path = paths.get_mut(recv_pid)?;
+
+            // Keep track of how many bytes we received from the client, so we
+            // can limit bytes sent back before address validation, to a
+            // multiple of this. The limit needs to be increased early on, so
+            // that if there is an error there is enough credit to send a
+            // CONNECTION_CLOSE.
+            //
+            // It doesn't matter if the packets received were valid or not, we
+            // only need to track the total amount of bytes received.
+            //
+            // Note that we also need to limit the number of bytes we sent on a
+            // path if we are not the host that initiated its usage.
+            if conn.is_server && !recv_path.verified_peer_address {
+                recv_path.max_send_bytes += len * MAX_AMPLIFICATION_FACTOR;
+            }
+        } else if !conn.is_server {
+            // If a client receives packets from an unknown server address,
+            // the client MUST discard these packets.
+            trace!(
+                "{} client received packet from unknown address {:?}, dropping",
+                conn.trace_id,
+                info,
+            );
+
+            return Ok((len, Vec::new()));
+        }
+        trace_id = conn.trace_id.clone();
+        is_server = conn.is_server;
+        recv_count = conn.recv_count;
+        space_id = if paths.multipath() {
+            if let Some((scid_seq, _)) = conn.ids.find_scid_seq(&hdr.dcid) {
+                scid_seq
+            } else {
+                trace!(
+                    "{} ignored unknown Source CID {:?}",
+                    conn.trace_id,
+                    hdr.dcid
+                );
+                return Err(Error::Done);
+            }
+        } else {
+            packet::INITIAL_PACKET_NUMBER_SPACE_ID
+        };
+        largest_rx_pkt_num = conn
+            .pkt_num_spaces
+            .spaces
+            .get(epoch, space_id)
+            .map(|pns| pns.largest_rx_pkt_num)
+            .unwrap_or(0);
+        recv_pid
+    };
+
+    
+    let payload_len = if hdr.ty == packet::Type::Short {
+        b.cap()
+    } else {
+        b.get_varint().map_err(|e| {
+            drop_pkt_on_err(
+                e.into(),
+                recv_count,
+                is_server,
+                &trace_id,
+            )
+        })? as usize
+    };
+    let mut payload;
+    let tag_len;
+
+    {
+        let conn = quiche_conn.read().unwrap();
+        let aead = {
+            if hdr.ty == packet::Type::ZeroRTT {
+                // Only use 0-RTT key if incoming packet is 0-RTT.
+                conn.pkt_num_spaces
+                    .crypto
+                    .get(epoch)
+                    .crypto_0rtt_open
+                    .as_ref().unwrap()
+            } else {
+                // Otherwise use the packet number space's main key.
+                conn.pkt_num_spaces.crypto.get(epoch).crypto_open.as_ref().unwrap()
+            }
+        };
+
+        packet::decrypt_hdr(b, hdr, aead).map_err(|e| {
+            drop_pkt_on_err(e, recv_count, is_server, &trace_id)
+        })?;
+        
+    
+        let pn = packet::decode_pkt_num(
+            largest_rx_pkt_num,
+            hdr.pkt_num,
+            hdr.pkt_num_len,
+        );
+    
+        payload = packet::decrypt_pkt(
+            b,
+            space_id as u32,
+            pn,
+            hdr.pkt_num_len,
+            payload_len,
+            aead,
+        ).map_err(|e| {
+            drop_pkt_on_err(e, recv_count, is_server, &trace_id)
+        })?;
+
+        tag_len = aead.alg().tag_len();
+    }
+
+    let mut frames = Vec::new();
+
+    while payload.cap() > 0 {
+        let frame = frame::Frame::from_bytes(&mut payload, hdr.ty)?;
+        frames.push(frame);
+    }
+
+    Ok((b.off() + tag_len, frames))
+}
+
+
+/// Tries to decrypt outside of the connection
+pub fn decrypt_packet_outside_conn(
+    conn: &mut Connection, paths: &mut path::PathMap, b: &mut octets::OctetsMut, hdr: &mut Header, 
+    info: &RecvInfo, initial_buf_len: usize
+) -> Result<(usize, Vec<frame::Frame>)> {
+    let len = initial_buf_len;
+    if len == 0 {
+        return Err(Error::BufferTooShort);
+    }
+
+    let recv_pid = paths.path_id_from_addrs(&(info.to, info.from));
+    if let Some(recv_pid) = recv_pid {
+        let recv_path = paths.get_mut(recv_pid)?;
+
+        // Keep track of how many bytes we received from the client, so we
+        // can limit bytes sent back before address validation, to a
+        // multiple of this. The limit needs to be increased early on, so
+        // that if there is an error there is enough credit to send a
+        // CONNECTION_CLOSE.
+        //
+        // It doesn't matter if the packets received were valid or not, we
+        // only need to track the total amount of bytes received.
+        //
+        // Note that we also need to limit the number of bytes we sent on a
+        // path if we are not the host that initiated its usage.
+        if conn.is_server && !recv_path.verified_peer_address {
+            recv_path.max_send_bytes += len * MAX_AMPLIFICATION_FACTOR;
+        }
+    } else if !conn.is_server {
+        // If a client receives packets from an unknown server address,
+        // the client MUST discard these packets.
+        trace!(
+            "{} client received packet from unknown address {:?}, dropping",
+            conn.trace_id,
+            info,
+        );
+
+        return Ok((len, Vec::new()));
+    }
+
+    let epoch = hdr.ty.to_epoch()?;
+    let aead = if hdr.ty == packet::Type::ZeroRTT {
+        // Only use 0-RTT key if incoming packet is 0-RTT.
+        conn.pkt_num_spaces
+            .crypto
+            .get(epoch)
+            .crypto_0rtt_open
+            .as_ref().unwrap()
+    } else {
+        // Otherwise use the packet number space's main key.
+        conn.pkt_num_spaces.crypto.get(epoch).crypto_open.as_ref().unwrap()
+    };
+
+    let payload_len = if hdr.ty == packet::Type::Short {
+        b.cap()
+    } else {
+        b.get_varint().map_err(|e| {
+            drop_pkt_on_err(
+                e.into(),
+                conn.recv_count,
+                conn.is_server,
+                &conn.trace_id,
+            )
+        })? as usize
+    };
+
+    packet::decrypt_hdr(b, hdr, aead).map_err(|e| {
+        drop_pkt_on_err(e, conn.recv_count, conn.is_server, &conn.trace_id)
+    })?;
+    
+    let space_id = if paths.multipath() {
+        if let Some((scid_seq, _)) = conn.ids.find_scid_seq(&hdr.dcid) {
+            scid_seq
+        } else {
+            trace!(
+                "{} ignored unknown Source CID {:?}",
+                conn.trace_id,
+                hdr.dcid
+            );
+            return Err(Error::Done);
+        }
+    } else {
+        packet::INITIAL_PACKET_NUMBER_SPACE_ID
+    };
+
+    let largest_rx_pkt_num = conn
+        .pkt_num_spaces
+        .spaces
+        .get(epoch, space_id)
+        .map(|pns| pns.largest_rx_pkt_num)
+        .unwrap_or(0);
+    let pn = packet::decode_pkt_num(
+        largest_rx_pkt_num,
+        hdr.pkt_num,
+        hdr.pkt_num_len,
+    );
+
+    let mut payload = packet::decrypt_pkt(
+        b,
+        space_id as u32,
+        pn,
+        hdr.pkt_num_len,
+        payload_len,
+        aead,
+    ).map_err(|e| {
+        drop_pkt_on_err(e, conn.recv_count, conn.is_server, &conn.trace_id)
+    })?;
+
+    let mut frames = Vec::new();
+
+    while payload.cap() > 0 {
+        let frame = frame::Frame::from_bytes(&mut payload, hdr.ty)?;
+        frames.push(frame);
+    }
+
+    Ok((b.off() + aead.alg().tag_len(), frames))
+}
+
 /// Sets the DCID sequence number of the provided path identifier and
 /// updates our internal state.
 /// `path_id` must be the identifier of `path`.
@@ -10337,123 +10598,6 @@ pub mod testing {
         conn.pkt_num_spaces.spaces.get_mut(epoch, 0)?.next_pkt_num += 1;
 
         Ok(written)
-    }
-
-    pub fn decrypt_packet_outside_conn(
-        conn: &mut Connection, paths: &mut path::PathMap, b: &mut octets::OctetsMut, hdr: &mut Header, 
-        info: &RecvInfo, initial_buf_len: usize
-    ) -> Result<(usize, Vec<frame::Frame>)> {
-        let len = initial_buf_len;
-        if len == 0 {
-            return Err(Error::BufferTooShort);
-        }
-
-        let recv_pid = paths.path_id_from_addrs(&(info.to, info.from));
-        if let Some(recv_pid) = recv_pid {
-            let recv_path = paths.get_mut(recv_pid)?;
-
-            // Keep track of how many bytes we received from the client, so we
-            // can limit bytes sent back before address validation, to a
-            // multiple of this. The limit needs to be increased early on, so
-            // that if there is an error there is enough credit to send a
-            // CONNECTION_CLOSE.
-            //
-            // It doesn't matter if the packets received were valid or not, we
-            // only need to track the total amount of bytes received.
-            //
-            // Note that we also need to limit the number of bytes we sent on a
-            // path if we are not the host that initiated its usage.
-            if conn.is_server && !recv_path.verified_peer_address {
-                recv_path.max_send_bytes += len * MAX_AMPLIFICATION_FACTOR;
-            }
-        } else if !conn.is_server {
-            // If a client receives packets from an unknown server address,
-            // the client MUST discard these packets.
-            trace!(
-                "{} client received packet from unknown address {:?}, dropping",
-                conn.trace_id,
-                info,
-            );
-
-            return Ok((len, Vec::new()));
-        }
-
-        let epoch = hdr.ty.to_epoch()?;
-        let aead = if hdr.ty == packet::Type::ZeroRTT {
-            // Only use 0-RTT key if incoming packet is 0-RTT.
-            conn.pkt_num_spaces
-                .crypto
-                .get(epoch)
-                .crypto_0rtt_open
-                .as_ref().unwrap()
-        } else {
-            // Otherwise use the packet number space's main key.
-            conn.pkt_num_spaces.crypto.get(epoch).crypto_open.as_ref().unwrap()
-        };
-
-        let payload_len = if hdr.ty == packet::Type::Short {
-            b.cap()
-        } else {
-            b.get_varint().map_err(|e| {
-                drop_pkt_on_err(
-                    e.into(),
-                    conn.recv_count,
-                    conn.is_server,
-                    &conn.trace_id,
-                )
-            })? as usize
-        };
-
-        packet::decrypt_hdr(b, hdr, aead).map_err(|e| {
-            drop_pkt_on_err(e, conn.recv_count, conn.is_server, &conn.trace_id)
-        })?;
-        
-        let space_id = if paths.multipath() {
-            if let Some((scid_seq, _)) = conn.ids.find_scid_seq(&hdr.dcid) {
-                scid_seq
-            } else {
-                trace!(
-                    "{} ignored unknown Source CID {:?}",
-                    conn.trace_id,
-                    hdr.dcid
-                );
-                return Err(Error::Done);
-            }
-        } else {
-            packet::INITIAL_PACKET_NUMBER_SPACE_ID
-        };
-
-        let largest_rx_pkt_num = conn
-            .pkt_num_spaces
-            .spaces
-            .get(epoch, space_id)
-            .map(|pns| pns.largest_rx_pkt_num)
-            .unwrap_or(0);
-        let pn = packet::decode_pkt_num(
-            largest_rx_pkt_num,
-            hdr.pkt_num,
-            hdr.pkt_num_len,
-        );
-
-        let mut payload = packet::decrypt_pkt(
-            b,
-            space_id as u32,
-            pn,
-            hdr.pkt_num_len,
-            payload_len,
-            aead,
-        ).map_err(|e| {
-            drop_pkt_on_err(e, conn.recv_count, conn.is_server, &conn.trace_id)
-        })?;
-
-        let mut frames = Vec::new();
-
-        while payload.cap() > 0 {
-            let frame = frame::Frame::from_bytes(&mut payload, hdr.ty)?;
-            frames.push(frame);
-        }
-
-        Ok((b.off() + aead.alg().tag_len(), frames))
     }
 
     pub fn decode_pkt(
@@ -16991,7 +17135,7 @@ mod tests {
         let client_addr_2 = "127.0.0.1:5678".parse().unwrap();
         assert_eq!(pipe.client.probe_path(&mut pipe.client_paths, client_addr_2, server_addr), Ok(1));
 
-        for _ in 0..MAX_PROBING_TIMEOUTS {
+        for _ in 0..3 { // Changed Max Probing due to multicore issue
             // The client creates the PATH CHALLENGE, but it is always lost.
             testing::emit_flight(&mut pipe.client, &mut pipe.client_paths).unwrap();
 

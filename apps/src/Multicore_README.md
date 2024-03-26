@@ -20,5 +20,5 @@ sudo perf record -e cycles -F 999 -g --call-graph lbr -- ../target/release/quich
 ```
 
 ```bash
-cargo test  --features=multicore
+cargo test --features=multicore
 ```

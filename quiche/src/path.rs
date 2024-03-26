@@ -373,6 +373,11 @@ impl Path {
         self.validation_state > PathValidationState::Failed
     }
 
+    #[inline]
+    pub fn path_validated(&self) -> bool {
+        self.verified_peer_address && self.validated()
+    }
+
     /// Returns whether the path is active.
     #[inline]
     pub fn active(&self) -> bool {

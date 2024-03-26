@@ -143,7 +143,8 @@ impl Type {
         }
     }
 
-    pub(crate) fn to_epoch(self) -> Result<Epoch> {
+    /// Vany Made it Public
+    pub fn to_epoch(self) -> Result<Epoch> {
         match self {
             Type::Initial => Ok(Epoch::Initial),
 
@@ -346,7 +347,8 @@ impl<'a> Header<'a> {
         Header::from_bytes(&mut b, dcid_len)
     }
 
-    pub(crate) fn from_bytes<'b>(
+    /// Vany Made it Public
+    pub fn from_bytes<'b>(
         b: &'b mut octets::OctetsMut, dcid_len: usize,
     ) -> Result<Header<'a>> {
         let first = b.get_u8()?;

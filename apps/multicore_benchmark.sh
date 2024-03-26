@@ -61,7 +61,7 @@ mcmpquic_iteration_loop() {
 
         # Run client
         start=$(date +%s.%N)
-        RUST_LOG=info ../target/release/quiche-client \
+        ../target/release/quiche-client \
             "https://127.0.0.1:4433/${FILENAME}" \
             -A 127.0.0.1:${client_port_1} \
             -A 127.0.0.1:${client_port_2} \
