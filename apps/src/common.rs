@@ -46,6 +46,7 @@ use std::cell::RefCell;
 use std::path;
 use std::thread::JoinHandle;
 
+use gearhash::Hasher;
 use ring::rand::SecureRandom;
 
 use quiche::ConnectionId;
@@ -382,6 +383,20 @@ struct Http3Request {
     response_body: Vec<u8>,
     response_body_max: usize,
     response_writer: Option<std::io::BufWriter<std::fs::File>>,
+}
+
+
+struct MulticoreHttp3Request {
+    url: url::Url,
+    cardinal: u64,
+    stream_id: Option<u64>,
+    hdrs: Vec<quiche::h3::Header>,
+    priority: Option<Priority>,
+    response_hdrs: Vec<quiche::h3::Header>,
+    response_body: Vec<u8>,
+    response_body_max: usize,
+    response_writer: Option<std::io::BufWriter<std::fs::File>>,
+    hasher: gearhash::Hasher<'static>,
 }
 
 type Http3ResponseBuilderResult = std::result::Result<
@@ -1656,7 +1671,7 @@ pub struct MulticoreHttp3Conn {
     reqs_hdrs_sent: usize,
     reqs_complete: usize,
     largest_processed_request: u64,
-    reqs: Vec<Http3Request>,
+    reqs: Vec<MulticoreHttp3Request>,
     body: Option<Vec<u8>>,
     sent_body_bytes: HashMap<u64, usize>,
     dump_json: bool,
@@ -1721,7 +1736,7 @@ impl MulticoreHttp3Conn {
                     ));
                 }
 
-                reqs.push(Http3Request {
+                reqs.push(MulticoreHttp3Request {
                     url: url.clone(),
                     cardinal: i,
                     hdrs,
@@ -1731,6 +1746,7 @@ impl MulticoreHttp3Conn {
                     response_body_max: dump_json.unwrap_or_default(),
                     stream_id: None,
                     response_writer: None,
+                    hasher: Hasher::default()
                 });
             }
         }
@@ -1991,7 +2007,7 @@ impl MulticoreHttp3Conn {
 
                 match std::fs::metadata(file_path.as_path()) {
                     Ok(metadata) => {
-                        (200, std::iter::repeat(1).take(metadata.len().try_into().unwrap()).collect())
+                        (200, std::iter::repeat(255).take(metadata.len().try_into().unwrap()).collect())
                     },
 
                     Err(_) => (404, b"Not Found!".to_vec()),
@@ -2158,6 +2174,7 @@ impl HttpConn for MulticoreHttp3Conn {
                             req.response_body_max - req.response_body.len(),
                         );
                         req.response_body.extend_from_slice(&buf[..len]);
+                        req.hasher.update(&buf[..read]);
 
                         match &mut req.response_writer {
                             Some(rw) => {
@@ -2176,9 +2193,16 @@ impl HttpConn for MulticoreHttp3Conn {
                     }
                 },
 
-                Ok((_stream_id, quiche::h3::Event::Finished)) => {
+                Ok((stream_id, quiche::h3::Event::Finished)) => {
                     self.reqs_complete += 1;
                     let reqs_count = self.reqs.len();
+                    let req = self
+                                .reqs
+                                .iter_mut()
+                                .find(|r| r.stream_id == Some(stream_id))
+                                .unwrap();
+                    
+                    info!("Hash :{}", req.hasher.get_hash());
 
                     debug!(
                         "{}/{} responses received",
@@ -2537,6 +2561,9 @@ impl HttpConn for MulticoreHttp3Conn {
         resp.written += written;
 
         if resp.written == resp.body.len() {
+            let mut hasher = gearhash::Hasher::default();
+            hasher.update(&resp.body[..]);
+            info!("Hash :{}", hasher.get_hash());
             partial_responses.remove(&stream_id);
         }
     }

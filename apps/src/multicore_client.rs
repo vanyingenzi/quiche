@@ -59,7 +59,7 @@ const MAX_BUF_SIZE: usize = 65507;
 const MAX_DATAGRAM_SIZE: usize = 1350;
 
 #[inline]
-fn _inner_read_packet(
+fn inner_read_packet(
     quiche_conn: &Arc<RwLock<Connection>>, 
     paths_guard: &Arc<RwLock<quiche::path::PathMap>>,
     buf: &mut [u8],
@@ -142,8 +142,6 @@ pub fn read_packets_on_socket(
     paths_guard: &Arc<RwLock<quiche::path::PathMap>>, pkt_count: &mut u64, dump_packet_path: &Option<String>, 
     buf: &mut [u8], local_addr: &SocketAddr, _peer_addr: &SocketAddr
 ) -> Result<(), ClientError> {
-    let mut paths = paths_guard.write().unwrap();
-    let mut conn = quiche_conn.write().unwrap();
     for event in events {
         if event.is_readable() {
             'read: loop {
@@ -177,7 +175,7 @@ pub fn read_packets_on_socket(
 
                 *pkt_count += 1;
 
-                let read = match conn.recv(&mut paths, &mut buf[..len], quiche::RecvInfo {
+                let read = match inner_read_packet(quiche_conn, paths_guard, &mut buf[..len], quiche::RecvInfo {
                     to: *local_addr,
                     from,
                 }) {
