@@ -233,7 +233,7 @@ pub struct Path {
     pub stream_retrans_bytes: u64,
 
     /// The timeout of closing the path.
-    closing_timer: Option<std::time::Instant>,
+    pub(crate) closing_timer: Option<std::time::Instant>,
     /// Whether the peer abandoned this path.
     peer_abandoned: bool,
 
@@ -513,7 +513,7 @@ impl Path {
 
     /// Sets the state of a path, returning an error if the transition is not
     /// valid.
-    fn set_state(&mut self, state: PathState) -> Result<()> {
+    pub(crate) fn set_state(&mut self, state: PathState) -> Result<()> {
         if !self.valid_state_transition(&state) {
             return Err(Error::InvalidState);
         }
@@ -607,6 +607,7 @@ impl Path {
             peer_addr: self.peer_addr,
             validation_state: self.validation_state,
             state: self.state.clone(),
+            status: self.status.clone(), 
             active: self.active(),
             recv: self.recv_count,
             sent: self.sent_count,
@@ -618,6 +619,7 @@ impl Path {
             rttvar: self.recovery.rttvar(),
             rtt_update: self.recovery.rtt_update_count,
             cwnd: self.recovery.cwnd(),
+            cwnd_available: self.recovery.cwnd_available(),
             sent_bytes: self.sent_bytes,
             recv_bytes: self.recv_bytes,
             lost_bytes: self.recovery.bytes_lost,
@@ -1211,6 +1213,8 @@ pub struct PathStats {
     /// The size of the connection's congestion window in bytes.
     pub cwnd: usize,
 
+    pub cwnd_available: usize,
+
     /// The number of sent bytes.
     pub sent_bytes: u64,
 
@@ -1225,6 +1229,8 @@ pub struct PathStats {
 
     /// The current PMTU for the connection.
     pub pmtu: usize,
+
+    pub status: PathStatus,
 
     /// The most recent data delivery rate estimate in bytes/s.
     ///
