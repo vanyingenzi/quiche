@@ -1627,6 +1627,12 @@ pub struct MulticoreConnection {
     /// Lowest active path id
     lowest_active_path_id: usize,
 
+    /// Lowest active source connection ID
+    lowest_active_scid_seq: Option<u64>,
+
+    /// Lowest active destination connection ID
+    lowest_active_dcid_seq: Option<u64>,
+
     /// Paths stats of known paths
     paths_stats: BTreeMap<usize, path::PathStats>,
 
@@ -2428,6 +2434,8 @@ impl Connection {
         }
         Ok(())
     }
+
+    
 
     /// Returns true if a QUIC packet is a stateless reset.
     fn is_stateless_reset(&self, buf: &[u8]) -> bool {
@@ -8340,11 +8348,11 @@ pub enum MulticorePathPendingEvent {
 }
 
 pub struct MulticorePath {
-    inner_path: path::Path, 
+    inner_path: Option<path::Path>, 
     // Queue for path events
     events: VecDeque<path::PathEvent>, 
     // The path ID assigned by the connection
-    path_id: usize,
+    path_id: Option<usize>,
     /// Whether this manager serves a connection as a server.
     is_server: bool,
     /// Whether the initial secrets have been derived.
@@ -8359,15 +8367,32 @@ pub struct MulticorePath {
 
 impl MulticorePath {
 
+    /// Creates a new multipath connection
     pub fn new(
         local_addr: SocketAddr, peer_addr: SocketAddr, config: &Config, 
         recovery_config: &recovery::RecoveryConfig, is_initial: bool,
         path_id: usize, is_server: bool,
     ) -> Self {
         Self {
-            inner_path: path::Path::new(local_addr, peer_addr, recovery_config, is_initial), 
+            inner_path: Some(path::Path::new(local_addr, peer_addr, recovery_config, is_initial)), 
             events: VecDeque::new(),
-            path_id, 
+            path_id: Some(path_id), 
+            is_server, 
+            derived_initial_secrets: false, 
+            handshake_completed: false,
+            peer_transport_params: TransportParams::default(),
+            local_transport_params: config.local_transport_params.clone(),
+        }
+    }
+
+    pub fn default(
+        local_addr: SocketAddr, peer_addr: SocketAddr, config: &Config, 
+        is_server: bool,
+    ) -> Self {
+        Self {
+            inner_path: None, 
+            events: VecDeque::new(),
+            path_id: None, 
             is_server, 
             derived_initial_secrets: false, 
             handshake_completed: false,
@@ -8387,11 +8412,11 @@ impl MulticorePath {
     }
 
     fn set_path_state(&mut self, path_state:path::PathState) {
-        self.inner_path.set_state(path_state).unwrap();
+        self.get_inner_path_mut().unwrap().set_state(path_state).unwrap();
     }
 
     pub(crate) fn get_path_id(&self) -> usize {
-        self.path_id
+        self.path_id.unwrap()
     }
 
     /// Returns true if the connection handshake is complete.
@@ -8403,29 +8428,29 @@ impl MulticorePath {
     /// Collects and returns statistics about each known path for the
     /// connection.
     pub fn stats(&self) -> path::PathStats {
-        self.inner_path.stats()
+        self.get_inner_path().unwrap().stats()
     }
 
     /// Returns the local address on which this path operates.
     #[inline]
     pub fn local_addr(&self) -> SocketAddr {
-        self.inner_path.local_addr()
+        self.get_inner_path().unwrap().local_addr()
     }
 
     /// Returns the peer address on which this path operates.
     #[inline]
     pub fn peer_addr(&self) -> SocketAddr {
-        self.inner_path.peer_addr()
+        self.get_inner_path().unwrap().peer_addr()
     }
 
     #[inline]
-    pub(crate) fn get_inner_path(&self) -> &path::Path {
-        &self.inner_path
+    pub(crate) fn get_inner_path(&self) -> Option<&path::Path> {
+        self.inner_path.as_ref()
     }
 
     #[inline]
-    pub(crate) fn get_inner_path_mut(&mut self) -> &mut path::Path {
-        &mut self.inner_path
+    pub(crate) fn get_inner_path_mut(&mut self) -> Option<&mut path::Path> {
+        self.inner_path.as_mut()
     }
 
     /// Returns the maximum possible size of egress UDP payloads.
@@ -8442,8 +8467,8 @@ impl MulticorePath {
     ///     struct.Config.html#method.set_max_send_udp_payload_size
     /// [`send()`]: struct.Connection.html#method.send
     pub fn max_send_udp_payload_size(&self) -> usize {
-        if self.inner_path.active(){
-            let max_datagram_size = self.inner_path.recovery.max_datagram_size();
+        if self.get_inner_path().unwrap().active(){
+            let max_datagram_size = self.get_inner_path().unwrap().recovery.max_datagram_size();
     
             if self.is_established() {
                 // We cap the maximum packet size to 16KB or so, so that it can be
@@ -8466,7 +8491,7 @@ impl MulticorePath {
         match self.peer_transport_params.max_datagram_frame_size {
             None => None,
             Some(peer_frame_len) => {
-                let dcid = conn.destination_id(&self).unwrap();
+                let dcid = conn.destination_id();
                 // Start from the maximum packet size...
                 let mut max_len = self.max_send_udp_payload_size();
                 // ...subtract the Short packet header overhead...
@@ -8537,22 +8562,22 @@ impl MulticorePath {
                 continue;
             }
 
-            if conn.pkt_num_spaces.is_ready(epoch, self.inner_path.active_dcid_seq) {
+            if conn.pkt_num_spaces.is_ready(epoch, self.get_inner_path_mut().unwrap().active_dcid_seq) {
                 return Ok(packet::Type::from_epoch(epoch));
             }
 
             // There are lost frames in this packet number space.
-            if !self.inner_path.recovery.lost[epoch].is_empty() {
+            if !self.get_inner_path_mut().unwrap().recovery.lost[epoch].is_empty() {
                 return Ok(packet::Type::from_epoch(epoch));
             }
 
             // We need to send PTO probe packets.
-            if self.inner_path.recovery.loss_probes[epoch] > 0 {
+            if self.get_inner_path_mut().unwrap().recovery.loss_probes[epoch] > 0 {
                 return Ok(packet::Type::from_epoch(epoch));
             }
         }
 
-        let send_path = self.get_inner_path();
+        let send_path = self.get_inner_path().unwrap();
 
         // If there are flushable, almost full or blocked streams, use the
         // Application epoch.
@@ -8618,7 +8643,7 @@ impl MulticorePath {
 
         let epoch = pkt_type.to_epoch()?;
         let multiple_application_data_pkt_num_spaces = conn.use_path_pkt_num_space(epoch);
-        let mut p = self.get_inner_path_mut();
+        let p = self.get_inner_path_mut().unwrap();
         for lost in p.recovery.lost[epoch].drain(..) {
             match lost {
                 frame::Frame::CryptoHeader { offset, length } => {
@@ -8740,7 +8765,7 @@ impl MulticorePath {
 
         let mut left = b.cap();
 
-        let dcid_seq = self.get_inner_path_mut().active_dcid_seq.ok_or(Error::OutOfIdentifiers)?;
+        let dcid_seq = self.get_inner_path_mut().unwrap().active_dcid_seq.ok_or(Error::OutOfIdentifiers)?;
 
         let space_id = if multiple_application_data_pkt_num_spaces {
             dcid_seq
@@ -8762,7 +8787,7 @@ impl MulticorePath {
         let dcid =
             ConnectionId::from_ref(conn.ids.get_dcid(dcid_seq)?.cid.as_ref());
 
-        let scid = if let Some(scid_seq) = self.get_inner_path_mut().active_scid_seq {
+        let scid = if let Some(scid_seq) = self.get_inner_path_mut().unwrap().active_scid_seq {
             ConnectionId::from_ref(conn.ids.get_scid(scid_seq)?.cid.as_ref())
         } else if pkt_type == packet::Type::Short {
             ConnectionId::default()
@@ -8836,14 +8861,14 @@ impl MulticorePath {
                 // This usually happens when we try to send a new packet but
                 // failed because cwnd is almost full. In such case app_limited
                 // is set to false here to make cwnd grow when ACK is received.
-                self.get_inner_path_mut().recovery.update_app_limited(false);
+                self.get_inner_path_mut().unwrap().recovery.update_app_limited(false);
                 return Err(Error::Done);
             },
         }
 
         // Make sure there is enough space for the minimum payload length.
         if left < PAYLOAD_MIN_LEN {
-            self.get_inner_path_mut().recovery.update_app_limited(false);
+            self.get_inner_path_mut().unwrap().recovery.update_app_limited(false);
             return Err(Error::Done);
         }
 
@@ -8855,7 +8880,7 @@ impl MulticorePath {
 
         // Whether or not we should explicitly elicit an ACK via PING frame if we
         // implicitly elicit one otherwise.
-        let ack_elicit_required = self.get_inner_path_mut().recovery.should_elicit_ack(epoch);
+        let ack_elicit_required = self.get_inner_path_mut().unwrap().recovery.should_elicit_ack(epoch);
 
         let header_offset = b.off();
 
@@ -8872,7 +8897,7 @@ impl MulticorePath {
         let payload_offset = b.off();
 
         let cwnd_available =
-        self.get_inner_path_mut().recovery.cwnd_available().saturating_sub(overhead);
+        self.get_inner_path_mut().unwrap().recovery.cwnd_available().saturating_sub(overhead);
 
         let left_before_packing_ack_frame = left;
 
@@ -8890,7 +8915,7 @@ impl MulticorePath {
                     conn.local_error
                         .as_ref()
                         .map_or(false, |le| le.is_app))) &&
-            self.get_inner_path_mut().active()
+            self.get_inner_path_mut().unwrap().active()
         {
             let ack_delay = pkt_space.largest_rx_pkt_time.elapsed();
 
@@ -8921,13 +8946,13 @@ impl MulticorePath {
         // Create ACK_MP frames if needed.
         if multiple_application_data_pkt_num_spaces &&
             !is_closing &&
-            self.get_inner_path_mut().active()
+            self.get_inner_path_mut().unwrap().active()
         {
             // We first check if we should bundle the ACK_MP belonging to our
             // path. We only bundle additional ACK_MP from other paths if we
             // need to send one. This avoids sending ACK_MP frames endlessly.
             let mut wrote_ack_mp = false;
-            if let Some(active_scid_seq) = self.get_inner_path_mut().active_scid_seq {
+            if let Some(active_scid_seq) = self.get_inner_path_mut().unwrap().active_scid_seq {
                 let pns =
                     conn.pkt_num_spaces.spaces.get_mut(epoch, active_scid_seq)?;
                 if pns.recv_pkt_need_ack.len() > 0 &&
@@ -9033,7 +9058,7 @@ impl MulticorePath {
         if pkt_type == packet::Type::Short {
             // Create PATH_RESPONSE frame if needed.
             // We do not try to ensure that these are really sent.
-            while let Some(challenge) = self.get_inner_path_mut().pop_received_challenge() {
+            while let Some(challenge) = self.get_inner_path_mut().unwrap().pop_received_challenge() {
                 let frame = frame::Frame::PathResponse { data: challenge };
 
                 if push_frame_to_pkt!(b, frames, frame, left) {
@@ -9047,7 +9072,7 @@ impl MulticorePath {
             }
 
             // Create PATH_CHALLENGE frame if needed.
-            if self.get_inner_path_mut().validation_requested() {
+            if self.get_inner_path_mut().unwrap().validation_requested() {
                 // TODO: ensure that data is unique over paths.
                 let data = rand::rand_u64().to_be_bytes();
 
@@ -9083,7 +9108,7 @@ impl MulticorePath {
             }
         }
 
-        if pkt_type == packet::Type::Short && !is_closing && self.get_inner_path_mut().active() {
+        if pkt_type == packet::Type::Short && !is_closing && self.get_inner_path_mut().unwrap().active() {
             // Create HANDSHAKE_DONE frame.
             // self.should_send_handshake_done() but without the need to borrow
             if self.handshake_completed &&
@@ -9154,7 +9179,7 @@ impl MulticorePath {
                 };
 
                 // Autotune the stream window size.
-                stream.recv.autotune_window(now, self.get_inner_path_mut().recovery.rtt());
+                stream.recv.autotune_window(now, self.get_inner_path_mut().unwrap().recovery.rtt());
 
                 let frame = frame::Frame::MaxStreamData {
                     stream_id,
@@ -9188,7 +9213,7 @@ impl MulticorePath {
                 flow_control.max_data() < flow_control.max_data_next()
             {
                 // Autotune the connection window size.
-                flow_control.autotune_window(now, self.get_inner_path_mut().recovery.rtt());
+                flow_control.autotune_window(now, self.get_inner_path_mut().unwrap().recovery.rtt());
 
                 let frame = frame::Frame::MaxData {
                     max: flow_control.max_data_next(),
@@ -9268,7 +9293,7 @@ impl MulticorePath {
                 // The sequence number specified in a RETIRE_CONNECTION_ID frame
                 // MUST NOT refer to the Destination Connection ID field of the
                 // packet in which the frame is contained.
-                let dcid_seq = self.get_inner_path_mut().active_dcid_seq.ok_or(Error::InvalidState)?;
+                let dcid_seq = self.get_inner_path_mut().unwrap().active_dcid_seq.ok_or(Error::InvalidState)?;
 
                 if seq_num == dcid_seq {
                     continue;
@@ -9291,7 +9316,7 @@ impl MulticorePath {
                 if pid != self.get_path_id(){
                     break;
                 }
-                let abandoned_path = self.get_inner_path_mut();
+                let abandoned_path = self.get_inner_path_mut().unwrap();
                 let dcid_seq_num =
                     abandoned_path.active_dcid_seq.ok_or(Error::InvalidState)?;
                 let (error_code, reason) =
@@ -9316,7 +9341,7 @@ impl MulticorePath {
                 if path_id != self.get_path_id(){
                     break;
                 }
-                let status_path = self.get_inner_path_mut();
+                let status_path = self.get_inner_path_mut().unwrap();
                 let dcid_seq_num =
                     status_path.active_dcid_seq.ok_or(Error::InvalidState)?;
                 let frame = if available {
@@ -9341,7 +9366,7 @@ impl MulticorePath {
             }
         }
 
-        let path = self.get_inner_path_mut();
+        let path = self.get_inner_path_mut().unwrap();
 
          // Create CONNECTION_CLOSE frame. Try to send this only on the active
         // path, unless it is the last one available.
@@ -9958,8 +9983,8 @@ impl MulticorePath {
 
         let mut left = cmp::min(out.len(), self.max_send_udp_payload_size());
 
-        if !self.inner_path.verified_peer_address && self.is_server {
-            left = cmp::min(left, self.inner_path.max_send_bytes);
+        if !self.get_inner_path_mut().unwrap().verified_peer_address && self.is_server {
+            left = cmp::min(left, self.get_inner_path_mut().unwrap().max_send_bytes);
         }
 
         // Generate coalesced packets.
@@ -9992,7 +10017,7 @@ impl MulticorePath {
             // When sending multiple PTO probes, don't coalesce them together,
             // so they are sent on separate UDP datagrams.
             if let Ok(epoch) = ty.to_epoch() {
-                if self.inner_path.recovery.loss_probes[epoch] > 0 {
+                if self.get_inner_path_mut().unwrap().recovery.loss_probes[epoch] > 0 {
                     break;
                 }
             }
@@ -10015,7 +10040,7 @@ impl MulticorePath {
             done += pad_len;
         }
         
-        let send_path = self.get_inner_path();
+        let send_path = self.get_inner_path().unwrap();
 
         let info = SendInfo {
             from: send_path.local_addr(),
@@ -10027,13 +10052,229 @@ impl MulticorePath {
         Ok((done, info))
     }
 
+    fn recv_single(
+        &mut self,
+        conn: &mut MulticoreConnection, 
+        buf: &mut [u8], 
+        info: &RecvInfo, 
+    ) -> Result<usize>{
+        let now = time::Instant::now();
+
+        if buf.is_empty() {
+            return Err(Error::Done);
+        }
+
+        if conn.is_closed() || conn.is_draining() {
+            return Err(Error::Done);
+        }
+
+        let is_closing = conn.local_error.is_some();
+
+        if is_closing {
+            return Err(Error::Done);
+        }
+
+        let buf_len = buf.len();
+
+        let mut b = octets::OctetsMut::with_slice(buf);
+
+        let mut hdr = Header::from_bytes(&mut b, conn.source_id().len())
+            .map_err(|e| {
+                drop_pkt_on_err(
+                    e,
+                    conn.recv_count(),
+                    self.is_server,
+                    &conn.trace_id,
+                )
+            })?;
+
+        if hdr.ty == packet::Type::VersionNegotiation {
+            // Version negotiation packets can only be sent by the server.
+            if self.is_server {
+                return Err(Error::Done);
+            }
+
+            // Ignore duplicate version negotiation.
+            if conn.did_version_negotiation {
+                return Err(Error::Done);
+            }
+
+            // Ignore version negotiation if any other packet has already been
+            // successfully processed.
+            if conn.recv_count > 0 {
+                return Err(Error::Done);
+            }
+
+            if hdr.dcid != conn.source_id() {
+                return Err(Error::Done);
+            }
+
+            if hdr.scid != conn.destination_id() {
+                return Err(Error::Done);
+            }
+
+            trace!("{} rx pkt {:?}", conn.trace_id, hdr);
+
+            let versions = hdr.versions.ok_or(Error::Done)?;
+
+            // Ignore version negotiation if the version already selected is
+            // listed.
+            if versions.iter().any(|&v| v == conn.version) {
+                return Err(Error::Done);
+            }
+
+            let supported_versions =
+                versions.iter().filter(|&&v| version_is_supported(v));
+
+            let mut found_version = false;
+
+            for &v in supported_versions {
+                found_version = true;
+
+                // The final version takes precedence over draft ones.
+                if v == PROTOCOL_VERSION_V1 {
+                    conn.version = v;
+                    break;
+                }
+
+                conn.version = cmp::max(conn.version, v);
+            }
+
+            if !found_version {
+                // We don't support any of the versions offered.
+                //
+                // While a man-in-the-middle attacker might be able to
+                // inject a version negotiation packet that triggers this
+                // failure, the window of opportunity is very small and
+                // this error is quite useful for debugging, so don't just
+                // ignore the packet.
+                return Err(Error::UnknownVersion);
+            }
+
+            conn.did_version_negotiation = true;
+
+            // Derive Initial secrets based on the new version.
+            let (aead_open, aead_seal) = crypto::derive_initial_key_material(
+                &conn.destination_id(),
+                conn.version,
+                conn.is_server,
+            )?;
+
+            // Reset connection state to force sending another Initial packet.
+            conn.drop_epoch_state(packet::Epoch::Initial, now, &mut self);
+            conn.got_peer_conn_id = false;
+            conn.handshake.clear()?;
+
+            conn.pkt_num_spaces
+                .crypto
+                .get_mut(packet::Epoch::Initial)
+                .crypto_open = Some(aead_open);
+            conn.pkt_num_spaces
+                .crypto
+                .get_mut(packet::Epoch::Initial)
+                .crypto_seal = Some(aead_seal);
+
+            conn.handshake
+                .use_legacy_codepoint(self.version != PROTOCOL_VERSION_V1);
+
+            // Encode transport parameters again, as the new version might be
+            // using a different format.
+            conn.encode_transport_params()?;
+
+            return Err(Error::Done);
+        }
+        Ok(0)
+    }
+
+    /// Processes QUIC packets received from the peer.
+    ///
+    /// On success the number of bytes processed from the input buffer is
+    /// returned. On error the connection will be closed by calling [`close()`]
+    /// with the appropriate error code.
+    ///
+    /// Coalesced packets will be processed as necessary.
+    ///
+    /// Note that the contents of the input buffer `buf` might be modified by
+    /// this function due to, for example, in-place decryption.
     pub fn recv(
         &mut self, 
-        _conn_guard: &Arc<RwLock<MulticoreConnection>>, 
-        _out: &mut [u8], 
-        _info: RecvInfo
-    ) -> Result<()> {
-        Ok(())
+        conn_guard: &Arc<RwLock<MulticoreConnection>>, 
+        buf: &mut [u8], 
+        info: RecvInfo
+    ) -> Result<usize> {
+        let len = buf.len();
+
+        if len == 0 {
+            return Err(Error::BufferTooShort);
+        }
+
+        if let Some(_) = self.path_id {
+            let is_server = self.is_server;
+            let recv_path = self.get_inner_path_mut().unwrap();   
+            // Keep track of how many bytes we received from the client, so we
+            // can limit bytes sent back before address validation, to a
+            // multiple of this. The limit needs to be increased early on, so
+            // that if there is an error there is enough credit to send a
+            // CONNECTION_CLOSE.
+            //
+            // It doesn't matter if the packets received were valid or not, we
+            // only need to track the total amount of bytes received.
+            //
+            // Note that we also need to limit the number of bytes we sent on a
+            // path if we are not the host that initiated its usage.
+            if is_server && !recv_path.verified_peer_address {
+                recv_path.max_send_bytes += len * MAX_AMPLIFICATION_FACTOR;
+            }
+        } else if !self.is_server {
+            // If a client receives packets from an unknown server address,
+            // the client MUST discard these packets.
+            let conn = conn_guard.read().unwrap();
+            trace!(
+                "{} client received packet from unknown address {:?}, dropping",
+                conn.trace_id,
+                info,
+            );
+            return Ok(len);
+        }
+
+        let mut done = 0;
+        let mut left = len;
+
+        let mut conn = conn_guard.write().unwrap();
+
+        while left > 0 {
+            let read = match self.recv_single(
+                &mut conn,
+                &mut buf[len - left..len],
+                &info,
+            ) {
+                Ok(v) => v,
+
+                Err(Error::Done) => {
+                    // If the packet can't be processed or decrypted, check if
+                    // it's a stateless reset.
+                    if conn.is_stateless_reset(&buf[len - left..len]) {
+                        trace!("{} packet is a stateless reset", conn.trace_id);
+
+                        conn.closed = true;
+                    }
+
+                    left
+                },
+
+                Err(e) => {
+                    // In case of error processing the incoming packet, close
+                    // the connection.
+                    conn.close(false, e.to_wire(), b"").ok();
+                    return Err(e);
+                },
+            };
+
+            done += read;
+            left -= read;
+        }
+
+        Ok(done)
     }
 }
 
@@ -10072,9 +10313,9 @@ impl MulticoreConnection {
         path.set_path_state(PathState::Active);
 
         // If we did stateless retry assume the peer's address is verified.
-        path.inner_path.verified_peer_address = odcid.is_some();
+        path.get_inner_path_mut().unwrap().verified_peer_address = odcid.is_some();
         // Assume clients validate the server's address implicitly.
-        path.inner_path.peer_verified_local_address = is_server;
+        path.get_inner_path_mut().unwrap().peer_verified_local_address = is_server;
 
         let ids = cid::ConnectionIdentifiers::new(
             config.local_transport_params.active_conn_id_limit as usize,
@@ -10225,6 +10466,10 @@ impl MulticoreConnection {
 
             lowest_active_path_id: active_path_id, 
 
+            lowest_active_scid_seq: None,
+            
+            lowest_active_dcid_seq: None, 
+
             multipath: false, 
 
             per_path_unprocessed_events
@@ -10287,7 +10532,7 @@ impl MulticoreConnection {
             conn.derived_initial_secrets = true;
         }
 
-        path.get_inner_path_mut().recovery.on_init();
+        path.get_inner_path_mut().unwrap().recovery.on_init();
 
         Ok((conn, path))
     }
@@ -10311,7 +10556,7 @@ impl MulticoreConnection {
         path: &mut MulticorePath,
     ) -> Result<()> {
         self.ids.set_initial_dcid(cid, reset_token, Some(path.get_path_id()));
-        path.get_inner_path_mut().active_dcid_seq = Some(0);
+        path.get_inner_path_mut().unwrap().active_dcid_seq = Some(0);
 
         Ok(())
     }
@@ -10362,6 +10607,7 @@ impl MulticoreConnection {
         self.paths_stats.iter().filter(|(_, p)| !matches!(p.status, path::PathStatus::Standby)).count() == 0
     }
 
+    /// Returnds the number of active paths known by the connection
     pub fn nb_of_paths(&self) -> usize {
         self.addrs_to_paths.len()
     }
@@ -10398,8 +10644,8 @@ impl MulticoreConnection {
             )
         };
 
-        let path_pto = match path.get_inner_path().active() {
-            true => path.get_inner_path().recovery.pto(),
+        let path_pto = match path.get_inner_path().unwrap().active() {
+            true => path.get_inner_path().unwrap().recovery.pto(),
             false => time::Duration::ZERO,
         };
 
@@ -10425,7 +10671,7 @@ impl MulticoreConnection {
         // Note that this is equivalent to CheckIfApplicationLimited() from the
         // delivery rate draft. This is also separate from `recovery.app_limited`
         // and only applies to delivery rate calculation.
-        let cwin_available = path.get_inner_path().recovery.cwnd_available();
+        let cwin_available = path.get_inner_path().unwrap().recovery.cwnd_available();
 
         ((self.tx_buffered + self.dgram_send_queue_byte_size()) < cwin_available) &&
             (self.tx_data.saturating_sub(self.last_tx_data)) <
@@ -10478,12 +10724,8 @@ impl MulticoreConnection {
     /// Note that the value returned can change throughout the connection's
     /// lifetime.
     #[inline]
-    pub fn destination_id(&self, path: &MulticorePath) -> Result<ConnectionId> {
-        if !self.is_lowest_active_path_id(path) {
-            return Err(Error::InvalidState);
-        }
-        
-        if let Some(active_dcid_seq) = path.get_inner_path().active_dcid_seq {
+    pub fn destination_id(&self) -> ConnectionId {
+        if let Some(active_dcid_seq) = self.lowest_active_dcid_seq {
             if let Ok(e) = self.ids.get_dcid(active_dcid_seq) {
                 return Ok(ConnectionId::from_ref(e.cid.as_ref()));
             }
@@ -10503,7 +10745,7 @@ impl MulticoreConnection {
         }
         // Validate initial_source_connection_id.
         match &peer_params.initial_source_connection_id {
-            Some(v) if v != &self.destination_id(path)? =>
+            Some(v) if v != &self.destination_id() =>
                 return Err(Error::InvalidTransportParam),
 
             Some(_) => (),
@@ -10591,7 +10833,7 @@ impl MulticoreConnection {
 
         self.recovery_config.max_ack_delay = max_ack_delay;
 
-        let active_path = path.get_inner_path_mut();
+        let active_path = path.get_inner_path_mut().unwrap();
 
         active_path.recovery.max_ack_delay = max_ack_delay;
 
@@ -10642,7 +10884,7 @@ impl MulticoreConnection {
         let handshake_status = self.handshake_status();
         for (path_id, queue) in self.per_path_unprocessed_events.iter_mut() {
             if *path_id == path.get_path_id(){
-                path.get_inner_path_mut().recovery.on_pkt_num_space_discarded(epoch, handshake_status, now);
+                path.get_inner_path_mut().unwrap().recovery.on_pkt_num_space_discarded(epoch, handshake_status, now);
             } else {
                 queue.push_back(MulticorePathPendingEvent::PktNumSpaceDiscarded(epoch, handshake_status, now));
             }
@@ -10691,8 +10933,8 @@ impl MulticoreConnection {
     pub fn on_path_abandon_sent(
         &mut self, abandoned_path: &mut MulticorePath, now: time::Instant,
     ) -> Result<()> {
-        let mut innet_path = abandoned_path.get_inner_path_mut();
-        innet_path.closing_timer = Some(now + innet_path.recovery.pto());
+        let inner_path = abandoned_path.get_inner_path_mut().unwrap();
+        inner_path.closing_timer = Some(now + inner_path.recovery.pto());
         self.mark_path_abandon(abandoned_path.get_path_id(), false);
         Ok(())
     }
@@ -10706,6 +10948,30 @@ impl MulticoreConnection {
     /// status (PATH_STANDBY or PATH_AVAILABLE) that should be advertised next.
     pub fn path_status(&self) -> Option<(usize, u64, bool)> {
         self.path_status_to_advertise.front().copied()
+    }
+
+    /// Returns true if a QUIC packet is a stateless reset.
+    fn is_stateless_reset(&self, buf: &[u8]) -> bool {
+        // If the packet is too small, then we just throw it away.
+        let buf_len = buf.len();
+        if buf_len < 21 {
+            return false;
+        }
+
+        // TODO: we should iterate over all active destination connection IDs
+        // and check against their reset token.
+        match self.peer_transport_params.stateless_reset_token {
+            Some(token) => {
+                let token_len = 16;
+                ring::constant_time::verify_slices_are_equal(
+                    &token.to_be_bytes(),
+                    &buf[buf_len - token_len..buf_len],
+                )
+                .is_ok()
+            },
+
+            None => false,
+        }
     }
 
     /// Continues the handshake.
@@ -10793,6 +11059,89 @@ impl MulticoreConnection {
                    self.handshake.sigalg(),
                    self.handshake.is_resumed(),
                    self.peer_transport_params);
+        }
+
+        Ok(())
+    }
+
+    /// Returns the source connection ID.
+    ///
+    /// When there are multiple IDs, and if there is an active path, the ID used
+    /// on that path is returned. Otherwise the oldest ID is returned.
+    ///
+    /// Note that the value returned can change throughout the connection's
+    /// lifetime.
+    #[inline]
+    pub fn source_id(&self) -> ConnectionId {
+        if let Some(active_scid_seq) = self.lowest_active_scid_seq {
+            if let Ok(e) = self.ids.get_scid(active_scid_seq) {
+                return ConnectionId::from_ref(e.cid.as_ref());
+            }
+        }
+
+        let e = self.ids.oldest_scid();
+        ConnectionId::from_ref(e.cid.as_ref())
+    }
+
+    fn recv_count(&self) -> usize {
+        self.paths_stats.values().map(|p| p.recv).sum()
+    }
+
+    /// Closes the connection with the given error and reason.
+    ///
+    /// The `app` parameter specifies whether an application close should be
+    /// sent to the peer. Otherwise a normal connection close is sent.
+    ///
+    /// If `app` is true but the connection is not in a state that is safe to
+    /// send an application error (not established nor in early data), in
+    /// accordance with [RFC
+    /// 9000](https://www.rfc-editor.org/rfc/rfc9000.html#section-10.2.3-3), the
+    /// error code is changed to APPLICATION_ERROR and the reason phrase is
+    /// cleared.
+    ///
+    /// Returns [`Done`] if the connection had already been closed.
+    ///
+    /// Note that the connection will not be closed immediately. An application
+    /// should continue calling the [`recv()`], [`send()`], [`timeout()`] and
+    /// [`on_timeout()`] methods as normal, until the [`is_closed()`] method
+    /// returns `true`.
+    ///
+    /// [`Done`]: enum.Error.html#variant.Done
+    /// [`recv()`]: struct.Connection.html#method.recv
+    /// [`send()`]: struct.Connection.html#method.send
+    /// [`timeout()`]: struct.Connection.html#method.timeout
+    /// [`on_timeout()`]: struct.Connection.html#method.on_timeout
+    /// [`is_closed()`]: struct.Connection.html#method.is_closed
+    pub fn close(&mut self, app: bool, err: u64, reason: &[u8]) -> Result<()> {
+        if self.is_closed() || self.is_draining() {
+            return Err(Error::Done);
+        }
+
+        if self.local_error.is_some() {
+            return Err(Error::Done);
+        }
+
+        let is_safe_to_send_app_data =
+            self.is_established() || self.is_in_early_data();
+
+        if app && !is_safe_to_send_app_data {
+            // Clear error information.
+            self.local_error = Some(ConnectionError {
+                is_app: false,
+                error_code: 0x0c,
+                reason: vec![],
+            });
+        } else {
+            self.local_error = Some(ConnectionError {
+                is_app: app,
+                error_code: err,
+                reason: reason.to_vec(),
+            });
+        }
+
+        // When no packet was successfully processed close connection immediately.
+        if self.paths_stats.values().all(|p| p.recv == 0) {
+            self.closed = true;
         }
 
         Ok(())
