@@ -10055,6 +10055,9 @@ impl MulticorePath {
             return Err(Error::Done);
         }
 
+        let path_id = self.get_path_id();
+        conn.paths_stats.insert(path_id, self.get_inner_path().unwrap().stats());
+
         // Pad UDP datagram if it contains a QUIC Initial packet.
         #[cfg(not(feature = "fuzzing"))]
         if has_initial && left > 0 && done < MIN_CLIENT_INITIAL_LEN {
@@ -11643,6 +11646,9 @@ impl MulticorePath {
             left -= read;
         }
 
+        let path_id = self.get_path_id();
+        conn.paths_stats.insert(path_id, self.get_inner_path().unwrap().stats());
+
         Ok(done)
     }
 }
@@ -12492,30 +12498,6 @@ impl MulticoreConnection {
     }
 
     /// Closes the connection with the given error and reason.
-    ///
-    /// The `app` parameter specifies whether an application close should be
-    /// sent to the peer. Otherwise a normal connection close is sent.
-    ///
-    /// If `app` is true but the connection is not in a state that is safe to
-    /// send an application error (not established nor in early data), in
-    /// accordance with [RFC
-    /// 9000](https://www.rfc-editor.org/rfc/rfc9000.html#section-10.2.3-3), the
-    /// error code is changed to APPLICATION_ERROR and the reason phrase is
-    /// cleared.
-    ///
-    /// Returns [`Done`] if the connection had already been closed.
-    ///
-    /// Note that the connection will not be closed immediately. An application
-    /// should continue calling the [`recv()`], [`send()`], [`timeout()`] and
-    /// [`on_timeout()`] methods as normal, until the [`is_closed()`] method
-    /// returns `true`.
-    ///
-    /// [`Done`]: enum.Error.html#variant.Done
-    /// [`recv()`]: struct.Connection.html#method.recv
-    /// [`send()`]: struct.Connection.html#method.send
-    /// [`timeout()`]: struct.Connection.html#method.timeout
-    /// [`on_timeout()`]: struct.Connection.html#method.on_timeout
-    /// [`is_closed()`]: struct.Connection.html#method.is_closed
     pub fn close(&mut self, app: bool, err: u64, reason: &[u8]) -> Result<()> {
         if self.is_closed() || self.is_draining() {
             return Err(Error::Done);
@@ -19233,6 +19215,8 @@ mod tests {
             Err(Error::Done)
         );
 
+        info!("closed {}", pipe.client.is_closed());
+
         let (len, _) = pipe.client.send(&mut buf).unwrap();
 
         let frames =
@@ -21934,6 +21918,48 @@ pub mod multicore_testing{
             }
             Ok(())
         }
+
+        pub fn send_pkt_to_server(
+            &mut self, pkt_type: packet::Type, frames: &[frame::Frame],
+            buf: &mut [u8],
+        ) -> Result<usize> {
+            let written = encode_pkt_on_path(&self.client, &mut self.client_paths, pkt_type, frames, buf)?;
+            recv_send(&mut self.server, buf, written)
+        }
+
+        pub fn server_recv(&mut self, buf: &mut [u8]) -> Result<usize> {
+            let client_path = &self.client_paths.get(0).unwrap();
+            let info = RecvInfo {
+                to: client_path.peer_addr(),
+                from: client_path.local_addr(),
+            };
+
+            self.server.recv(buf, info)
+        }
+    }
+
+    pub fn recv_send(
+        conn: &mut Connection, buf: &mut [u8], len: usize,
+    ) -> Result<usize> {
+        let active_path = conn.paths.get_active()?;
+        let info = RecvInfo {
+            to: active_path.local_addr(),
+            from: active_path.peer_addr(),
+        };
+
+        conn.recv(&mut buf[..len], info)?;
+
+        let mut off = 0;
+
+        match conn.send(&mut buf[off..]) {
+            Ok((write, _)) => off += write,
+
+            Err(Error::Done) => (),
+
+            Err(e) => return Err(e),
+        }
+
+        Ok(off)
     }
 
     pub fn process_flight(
@@ -22070,6 +22096,210 @@ pub mod multicore_testing{
         }
         Ok(())
     }
+
+    pub fn encode_pkt_on_path(
+        conn_guard: &Arc<RwLock<MulticoreConnection>>,
+        paths: &mut Slab<MulticorePath>, 
+        pkt_type: packet::Type, frames: &[frame::Frame],
+        buf: &mut [u8],
+    ) -> Result<usize> {
+        let mut conn = conn_guard.write().unwrap();
+        let send_path = paths.get(0).unwrap();
+        let mut b = octets::OctetsMut::with_slice(buf);
+
+        let epoch = pkt_type.to_epoch()?;
+
+        let multipath_multiple_spaces = conn.is_multipath_enabled();
+        let pn = conn.pkt_num_spaces.spaces.get(epoch, 0)?.next_pkt_num;
+        let pn_len = 4;
+
+        let active_dcid_seq = send_path.get_inner_path().unwrap()
+            .active_dcid_seq
+            .as_ref()
+            .ok_or(Error::InvalidState)?;
+        let active_scid_seq = send_path.get_inner_path().unwrap()
+            .active_scid_seq
+            .as_ref()
+            .ok_or(Error::InvalidState)?;
+
+        let hdr = Header {
+            ty: pkt_type,
+            version: conn.version,
+            dcid: ConnectionId::from_ref(
+                conn.ids.get_dcid(*active_dcid_seq)?.cid.as_ref(),
+            ),
+            scid: ConnectionId::from_ref(
+                conn.ids.get_scid(*active_scid_seq)?.cid.as_ref(),
+            ),
+            pkt_num: 0,
+            pkt_num_len: pn_len,
+            token: conn.token.clone(),
+            versions: None,
+            key_phase: conn.key_phase,
+        };
+
+        hdr.to_bytes(&mut b)?;
+
+        let payload_len = frames.iter().fold(0, |acc, x| acc + x.wire_len());
+
+        if pkt_type != packet::Type::Short {
+            let len = pn_len +
+                payload_len +
+                conn.pkt_num_spaces
+                    .crypto
+                    .get(epoch)
+                    .crypto_overhead()
+                    .unwrap();
+            b.put_varint(len as u64)?;
+        }
+
+        // Always encode packet number in 4 bytes, to allow encoding packets
+        // with empty payloads.
+        b.put_u32(pn as u32)?;
+
+        let payload_offset = b.off();
+
+        for frame in frames {
+            frame.to_bytes(&mut b)?;
+        }
+
+        let aead = match conn.pkt_num_spaces.crypto.get(epoch).crypto_seal {
+            Some(ref v) => v,
+            None => return Err(Error::InvalidState),
+        };
+
+        // We don't support multipath in this method.
+        assert!(!multipath_multiple_spaces);
+        let path_seq = packet::INITIAL_PACKET_NUMBER_SPACE_ID as u32;
+
+        let written = packet::encrypt_pkt(
+            &mut b,
+            path_seq,
+            pn,
+            pn_len,
+            payload_len,
+            payload_offset,
+            None,
+            aead,
+        )?;
+
+        conn.pkt_num_spaces.spaces.get_mut(epoch, 0)?.next_pkt_num += 1;
+
+        Ok(written)
+    }
+
+    pub fn multicore_decode_pkt(
+        conn: &mut MulticoreConnection, buf: &mut [u8],
+    ) -> Result<Vec<frame::Frame>> {
+        let mut b = octets::OctetsMut::with_slice(buf);
+
+        let mut hdr = Header::from_bytes(&mut b, conn.source_id().len()).unwrap();
+
+        let epoch = hdr.ty.to_epoch()?;
+
+        let aead = conn
+            .pkt_num_spaces
+            .crypto
+            .get(epoch)
+            .crypto_open
+            .as_ref()
+            .unwrap();
+
+        let payload_len = b.cap();
+
+        packet::decrypt_hdr(&mut b, &mut hdr, aead).unwrap();
+
+        let pn = packet::decode_pkt_num(
+            conn.pkt_num_spaces.spaces.get(epoch, 0)?.largest_rx_pkt_num,
+            hdr.pkt_num,
+            hdr.pkt_num_len,
+        );
+
+        let space_seq = if conn.is_multipath_enabled() {
+            conn.ids
+                .find_scid_seq(&hdr.dcid)
+                .map(|(seq, _)| seq)
+                .unwrap() as u32
+        } else {
+            packet::INITIAL_PACKET_NUMBER_SPACE_ID as u32
+        };
+
+        let mut payload = packet::decrypt_pkt(
+            &mut b,
+            space_seq,
+            pn,
+            hdr.pkt_num_len,
+            payload_len,
+            aead,
+        )
+        .unwrap();
+
+        let mut frames = Vec::new();
+
+        while payload.cap() > 0 {
+            let frame = frame::Frame::from_bytes(&mut payload, hdr.ty)?;
+            frames.push(frame);
+        }
+
+        Ok(frames)
+    }
+
+    pub fn decode_pkt(
+        conn: &mut Connection, buf: &mut [u8],
+    ) -> Result<Vec<frame::Frame>> {
+        let mut b = octets::OctetsMut::with_slice(buf);
+
+        let mut hdr = Header::from_bytes(&mut b, conn.source_id().len()).unwrap();
+
+        let epoch = hdr.ty.to_epoch()?;
+
+        let aead = conn
+            .pkt_num_spaces
+            .crypto
+            .get(epoch)
+            .crypto_open
+            .as_ref()
+            .unwrap();
+
+        let payload_len = b.cap();
+
+        packet::decrypt_hdr(&mut b, &mut hdr, aead).unwrap();
+
+        let pn = packet::decode_pkt_num(
+            conn.pkt_num_spaces.spaces.get(epoch, 0)?.largest_rx_pkt_num,
+            hdr.pkt_num,
+            hdr.pkt_num_len,
+        );
+
+        let space_seq = if conn.is_multipath_enabled() {
+            conn.ids
+                .find_scid_seq(&hdr.dcid)
+                .map(|(seq, _)| seq)
+                .unwrap() as u32
+        } else {
+            packet::INITIAL_PACKET_NUMBER_SPACE_ID as u32
+        };
+
+        let mut payload = packet::decrypt_pkt(
+            &mut b,
+            space_seq,
+            pn,
+            hdr.pkt_num_len,
+            payload_len,
+            aead,
+        )
+        .unwrap();
+
+        let mut frames = Vec::new();
+
+        while payload.cap() > 0 {
+            let frame = frame::Frame::from_bytes(&mut payload, hdr.ty)?;
+            frames.push(frame);
+        }
+
+        Ok(frames)
+    }
+
 }
 
 #[cfg(test)]
@@ -22173,6 +22403,184 @@ mod multicore_tests {
 
         assert!(pipe.server.is_established());
         assert!(pipe.server.handshake_confirmed);
+    }
+
+    #[test]
+    fn path_challenge() {
+        let mut buf = [0; 65535];
+
+        let mut pipe = multicore_testing::Pipe::new().unwrap();
+        assert_eq!(pipe.handshake(), Ok(()));
+
+        let frames = [frame::Frame::PathChallenge { data: [0xba; 8] }];
+
+        let pkt_type = packet::Type::Short;
+
+        let len = pipe
+            .send_pkt_to_server(pkt_type, &frames, &mut buf)
+            .unwrap();
+
+        assert!(len > 0);
+
+        let frames = multicore_testing::multicore_decode_pkt(&mut pipe.client.write().unwrap(), &mut buf[..len]).unwrap();
+        let mut iter = frames.iter();
+
+        // Ignore ACK.
+        iter.next().unwrap();
+
+        assert_eq!(
+            iter.next(),
+            Some(&frame::Frame::PathResponse { data: [0xba; 8] })
+        );
+    }
+
+    // TODO test delayed 1RTT
+    
+    #[test]
+    /// Tests that invalid packets don't cause the connection to be closed.
+    fn invalid_packet() {
+        let mut buf = [0; 65535];
+
+        let mut pipe = multicore_testing::Pipe::new().unwrap();
+        assert_eq!(pipe.handshake(), Ok(()));
+
+        let frames = [frame::Frame::Padding { len: 10 }];
+
+        let written = multicore_testing::encode_pkt_on_path(
+            &mut pipe.client,
+            &mut pipe.client_paths,
+            packet::Type::Short,
+            &frames,
+            &mut buf,
+        )
+        .unwrap();
+
+        // Corrupt the packets's last byte to make decryption fail (the last
+        // byte is part of the AEAD tag, so changing it means that the packet
+        // cannot be authenticated during decryption).
+        buf[written - 1] = !buf[written - 1];
+
+        assert_eq!(pipe.server_recv(&mut buf[..written]), Ok(written));
+
+        // Corrupt the packets's first byte to make the header fail decoding.
+        buf[0] = 255;
+
+        assert_eq!(pipe.server_recv(&mut buf[..written]), Ok(written));
+    }
+
+
+    #[test]
+    fn close() {
+        let mut buf = [0; 65535];
+
+        let mut pipe = multicore_testing::Pipe::new().unwrap();
+        assert_eq!(pipe.handshake(), Ok(()));
+
+        assert_eq!(pipe.client.write().unwrap().close(false, 0x1234, b"hello?"), Ok(()));
+
+        assert_eq!(
+            pipe.client.write().unwrap().close(false, 0x4321, b"hello?"),
+            Err(Error::Done)
+        );
+        let active_path = pipe.client_paths.get_mut(0).unwrap();
+
+        let (len, _) = active_path.send_on_path(&pipe.client, &mut buf).unwrap();
+
+        let frames =
+            multicore_testing::decode_pkt(&mut pipe.server, &mut buf[..len]).unwrap();
+
+        assert_eq!(
+            frames.first(),
+            Some(&frame::Frame::ConnectionClose {
+                error_code: 0x1234,
+                frame_type: 0,
+                reason: b"hello?".to_vec(),
+            })
+        );
+    }
+
+    #[test]
+    /// Simulates reception of an early 1-RTT packet on the server, by
+    /// delaying the client's Handshake packet that completes the handshake.
+    fn early_1rtt_packet() {
+        let mut buf = [0; 65535];
+
+        let mut pipe = multicore_testing::Pipe::new().unwrap();
+
+        // Client sends initial flight
+        let flight = multicore_testing::multicore_emit_flight(&mut pipe.client, &mut pipe.client_paths).unwrap();
+        multicore_testing::process_flight(&mut pipe.server, flight).unwrap();
+
+        // Server sends initial flight.
+        let flight = multicore_testing::emit_flight(&mut pipe.server).unwrap();
+        multicore_testing::multicore_process_flight(&mut pipe.client, &mut pipe.client_paths, flight).unwrap();
+
+        // Client sends Handshake packet.
+        let flight = multicore_testing::multicore_emit_flight(&mut pipe.client, &mut pipe.client_paths).unwrap();
+
+        // Emulate handshake packet delay by not making server process client
+        // packet.
+        let delayed = flight;
+
+        multicore_testing::emit_flight(&mut pipe.server).ok();
+
+        assert!(pipe.client.read().unwrap().is_established());
+
+        // Send 1-RTT packet #0.
+        let frames = [frame::Frame::Stream {
+            stream_id: 0,
+            data: stream::RangeBuf::from(b"hello, world", 0, true),
+        }];
+
+        let pkt_type = packet::Type::Short;
+        let written =
+            multicore_testing::encode_pkt_on_path(&mut pipe.client, &mut pipe.client_paths, pkt_type, &frames, &mut buf)
+                .unwrap();
+
+        assert_eq!(pipe.server_recv(&mut buf[..written]), Ok(written));
+
+        // Send 1-RTT packet #1.
+        let frames = [frame::Frame::Stream {
+            stream_id: 4,
+            data: stream::RangeBuf::from(b"hello, world", 0, true),
+        }];
+
+        let written =
+            multicore_testing::encode_pkt_on_path(&mut pipe.client, &mut pipe.client_paths, pkt_type, &frames, &mut buf)
+                .unwrap();
+
+        assert_eq!(pipe.server_recv(&mut buf[..written]), Ok(written));
+
+        assert!(!pipe.server.is_established());
+
+        // Client sent 1-RTT packets 0 and 1, but server hasn't received them.
+        //
+        // Note that `largest_rx_pkt_num` is initialized to 0, so we need to
+        // send another 1-RTT packet to make this check meaningful.
+        assert_eq!(
+            pipe.server
+                .pkt_num_spaces
+                .spaces
+                .get(packet::Epoch::Application, 0)
+                .unwrap()
+                .largest_rx_pkt_num,
+            0
+        );
+
+        // Process delayed packet.
+        multicore_testing::process_flight(&mut pipe.server, delayed).unwrap();
+
+        assert!(pipe.server.is_established());
+
+        assert_eq!(
+            pipe.server
+                .pkt_num_spaces
+                .spaces
+                .get(packet::Epoch::Application, 0)
+                .unwrap()
+                .largest_rx_pkt_num,
+            0
+        );
     }
 }
 

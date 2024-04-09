@@ -1213,6 +1213,7 @@ pub struct PathStats {
     /// The size of the connection's congestion window in bytes.
     pub cwnd: usize,
 
+    /// The congestion window available on the path
     pub cwnd_available: usize,
 
     /// The number of sent bytes.
@@ -1230,6 +1231,7 @@ pub struct PathStats {
     /// The current PMTU for the connection.
     pub pmtu: usize,
 
+    /// The current path status of the path
     pub status: PathStatus,
 
     /// The most recent data delivery rate estimate in bytes/s.
