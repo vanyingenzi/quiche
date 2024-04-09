@@ -264,7 +264,7 @@ pub struct Path {
     pub needs_ack_eliciting: bool,
 
     /// The expected sequence number of the PATH_STATUS to be received.
-    expected_path_status_seq_num: u64,
+    pub(crate) expected_path_status_seq_num: u64,
 }
 
 impl Path {

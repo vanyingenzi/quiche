@@ -36,6 +36,7 @@ use crate::Error;
 use crate::Result;
 
 use crate::packet;
+use std::fmt;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -126,6 +127,7 @@ impl Algorithm {
     }
 }
 
+#[derive(Debug)]
 pub struct Open {
     alg: Algorithm,
 
@@ -238,6 +240,7 @@ impl Open {
     }
 }
 
+#[derive(Debug)]
 pub struct Seal {
     alg: Algorithm,
 
@@ -389,6 +392,22 @@ impl HeaderProtectionKey {
         derive_hdr_key(aead, secret, &mut hp_key)?;
 
         Self::new(aead, &hp_key)
+    }
+}
+
+impl fmt::Debug for HeaderProtectionKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HeaderProtectionKey")
+            .field("hp_key", &self.hp_key)
+            .finish()
+    }
+}
+
+impl fmt::Debug for PacketKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PacketKey")
+            .field("nonce", &self.nonce)
+            .finish()
     }
 }
 
