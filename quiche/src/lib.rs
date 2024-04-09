@@ -1696,6 +1696,17 @@ pub fn accept(
     Ok(conn)
 }
 
+/// A multicore version of accept
+#[inline]
+pub fn multicore_accept(
+    scid: &ConnectionId, odcid: Option<&ConnectionId>, local: SocketAddr,
+    peer: SocketAddr, config: &mut Config,
+) -> Result<(MulticoreConnection, MulticorePath)>{
+    let conn = MulticoreConnection::new(scid, odcid, local, peer, config, true)?;
+
+    Ok(conn)
+}
+
 /// Creates a new client-side connection.
 ///
 /// The `scid` parameter is used as the connection's source connection ID,
@@ -2784,6 +2795,8 @@ impl Connection {
                     self.undecryptable_pkts.push_back((pkt, *info));
                     return Ok(pkt_len);
                 }
+
+                info!("No useable keys");
 
                 let e = drop_pkt_on_err(
                     Error::CryptoFail,
@@ -4085,6 +4098,8 @@ impl Connection {
             cwnd_available.saturating_sub(left_before_packing_ack_frame - left),
         );
 
+        info!("TOREMOVE left {}", left);
+
         let mut challenge_data = None;
 
         if pkt_type == packet::Type::Short {
@@ -4443,6 +4458,7 @@ impl Connection {
             path.active()
         {
             let crypto_off = crypto_space.crypto_stream.send.off_front();
+            info!("TOREMOVE crypto_off {}", crypto_off);
 
             // Encode the frame.
             //
@@ -4458,13 +4474,17 @@ impl Connection {
             // Finally we go back and encode the frame header with the now
             // available information.
             let hdr_off = b.off();
+            info!("TOREMOVE hdr_off {}", hdr_off);
             let hdr_len = 1 + // frame type
                 octets::varint_len(crypto_off) + // offset
                 2; // length, always encode as 2-byte varint
+            info!("TOREMOVE hdr_len {}", hdr_len);
 
             if let Some(max_len) = left.checked_sub(hdr_len) {
                 let (mut crypto_hdr, mut crypto_payload) =
                     b.split_at(hdr_off + hdr_len)?;
+
+                info!("TOREMOVE crypto_hdr {:?}, crypto_payload {:?}", crypto_hdr.len(), crypto_payload.len());
 
                 // Write stream data into the packet buffer.
                 let (len, _) = crypto_space
@@ -7144,6 +7164,7 @@ impl Connection {
             let peer_params =
                 TransportParams::decode(raw_params, self.is_server)?;
 
+            info!("Peer TransportParams : {:?}", peer_params);
             self.parse_peer_transport_params(peer_params)?;
         }
 
@@ -8379,10 +8400,6 @@ pub struct MulticorePath {
     path_id: Option<usize>,
     /// Whether this manager serves a connection as a server.
     is_server: bool,
-    /// Peer's transport parameters.
-    peer_transport_params: TransportParams, // * Clonable
-    /// Local transport parameters.
-    local_transport_params: TransportParams, // * Clonable
     //// A resusable buffer used by Recovery
     // newly_acked: Vec<recovery::Acked>,
 }
@@ -8391,7 +8408,7 @@ impl MulticorePath {
 
     /// Creates a new multipath connection
     pub fn new(
-        local_addr: SocketAddr, peer_addr: SocketAddr, config: &Config, 
+        local_addr: SocketAddr, peer_addr: SocketAddr, _config: &Config, 
         recovery_config: &recovery::RecoveryConfig, is_initial: bool,
         path_id: usize, is_server: bool,
     ) -> Self {
@@ -8400,8 +8417,6 @@ impl MulticorePath {
             events: VecDeque::new(),
             path_id: Some(path_id), 
             is_server, 
-            peer_transport_params: TransportParams::default(),
-            local_transport_params: config.local_transport_params.clone(),
             local_addr, 
             peer_addr,
             //newly_acked: Vec::new(),
@@ -8410,7 +8425,7 @@ impl MulticorePath {
 
     /// Creates a new multipath connection that has no inner path
     pub fn default(
-        config: &Config, is_server: bool,
+        _config: &Config, is_server: bool,
         local_addr: SocketAddr, peer_addr: SocketAddr,
     ) -> Self {
         Self {
@@ -8418,8 +8433,6 @@ impl MulticorePath {
             events: VecDeque::new(),
             path_id: None, 
             is_server, 
-            peer_transport_params: TransportParams::default(),
-            local_transport_params: config.local_transport_params.clone(),
             local_addr, 
             peer_addr,
             // newly_acked: Vec::new(),
@@ -8513,7 +8526,7 @@ impl MulticorePath {
     /// frame size.
     #[inline]
     pub fn dgram_max_writable_len(&self, conn: &mut MulticoreConnection) -> Option<usize> {
-        match self.peer_transport_params.max_datagram_frame_size {
+        match conn.peer_transport_params.max_datagram_frame_size {
             None => None,
             Some(peer_frame_len) => {
                 let dcid = conn.destination_id();
@@ -8946,7 +8959,7 @@ impl MulticorePath {
 
             let ack_delay = ack_delay.as_micros() as u64 /
                 2_u64
-                    .pow(self.local_transport_params.ack_delay_exponent as u32);
+                    .pow(conn.local_transport_params.ack_delay_exponent as u32);
 
             let frame = frame::Frame::ACK {
                 ack_delay,
@@ -8987,7 +9000,7 @@ impl MulticorePath {
 
                     let ack_delay = ack_delay.as_micros() as u64 /
                         2_u64.pow(
-                            self.local_transport_params.ack_delay_exponent as u32,
+                            conn.local_transport_params.ack_delay_exponent as u32,
                         );
 
                     let frame = frame::Frame::ACKMP {
@@ -9037,7 +9050,7 @@ impl MulticorePath {
 
                             let ack_delay = ack_delay.as_micros() as u64 /
                                 2_u64.pow(
-                                    self.local_transport_params.ack_delay_exponent
+                                    conn.local_transport_params.ack_delay_exponent
                                         as u32,
                                 );
 
@@ -9077,6 +9090,8 @@ impl MulticorePath {
             // Bytes consumed by ACK frames.
             cwnd_available.saturating_sub(left_before_packing_ack_frame - left),
         );
+
+        info!("TOREMOVE left {}", left);
 
         let mut challenge_data = None;
 
@@ -9441,6 +9456,7 @@ impl MulticorePath {
             path.active()
         {
             let crypto_off = crypto_space.crypto_stream.send.off_front();
+            info!("TOREMOVE crypto_off {}", crypto_off);
 
             // Encode the frame.
             //
@@ -9456,19 +9472,25 @@ impl MulticorePath {
             // Finally we go back and encode the frame header with the now
             // available information.
             let hdr_off = b.off();
+            info!("TOREMOVE hdr_off {}", hdr_off);
+
             let hdr_len = 1 + // frame type
                 octets::varint_len(crypto_off) + // offset
                 2; // length, always encode as 2-byte varint
+            info!("TOREMOVE hdr_len {}", hdr_len);
 
             if let Some(max_len) = left.checked_sub(hdr_len) {
                 let (mut crypto_hdr, mut crypto_payload) =
                     b.split_at(hdr_off + hdr_len)?;
+
+                info!("TOREMOVE crypto_hdr {:?}, crypto_payload {:?}", crypto_hdr.len(), crypto_payload.len());
 
                 // Write stream data into the packet buffer.
                 let (len, _) = crypto_space
                     .crypto_stream
                     .send
                     .emit(&mut crypto_payload.as_mut()[..max_len])?;
+
 
                 // Encode the frame's header.
                 //
@@ -10098,7 +10120,7 @@ impl MulticorePath {
             } => {
                 let ack_delay = ack_delay
                     .checked_mul(2_u64.pow(
-                        self.peer_transport_params.ack_delay_exponent as u32,
+                        conn.peer_transport_params.ack_delay_exponent as u32,
                     ))
                     .ok_or(Error::InvalidFrame)?;
 
@@ -10555,7 +10577,7 @@ impl MulticorePath {
                 }
                 let ack_delay = ack_delay
                     .checked_mul(2_u64.pow(
-                        self.peer_transport_params.ack_delay_exponent as u32,
+                        conn.peer_transport_params.ack_delay_exponent as u32,
                     ))
                     .ok_or(Error::InvalidFrame)?;
 
@@ -11219,7 +11241,7 @@ impl MulticorePath {
             // the one supplied by the server.
             conn.set_initial_dcid(
                 hdr.scid.clone(),
-                self.peer_transport_params.stateless_reset_token,
+                conn.peer_transport_params.stateless_reset_token,
                 self,
             )?;
 
@@ -11230,7 +11252,7 @@ impl MulticorePath {
             conn.set_initial_dcid(hdr.scid.clone(), None, self)?;
 
             if !conn.did_retry {
-                self.local_transport_params
+                conn.local_transport_params
                     .original_destination_connection_id =
                     Some(hdr.dcid.to_vec().into());
 
@@ -11327,7 +11349,7 @@ impl MulticorePath {
         if conn.is_established() {
             qlog_with_type!(QLOG_PARAMS_SET, conn.qlog, q, {
                 if !conn.qlog.logged_peer_params {
-                    let ev_data = self
+                    let ev_data = conn
                         .peer_transport_params
                         .to_qlog(TransportOwner::Remote, conn.handshake.cipher());
 
@@ -11532,6 +11554,8 @@ impl MulticorePath {
         // Update send capacity.
         conn.update_tx_cap();
 
+        info!("[recv_single] check recv count", );
+
         self.get_inner_path_mut().unwrap().recv_count += 1;
 
         let read = b.off() + aead_tag_len;
@@ -11547,6 +11571,7 @@ impl MulticorePath {
             self.get_inner_path_mut().unwrap().verified_peer_address = true;
         }
 
+        conn.paths_stats.insert(self.path_id.unwrap(), self.get_inner_path().unwrap().stats());
         conn.ack_eliciting_sent = false;
 
         Ok(read)
@@ -11641,13 +11666,9 @@ impl MulticorePath {
 
             info!("Recv_single read: {}", read);
 
-
             done += read;
             left -= read;
         }
-
-        let path_id = self.get_path_id();
-        conn.paths_stats.insert(path_id, self.get_inner_path().unwrap().stats());
 
         Ok(done)
     }
@@ -12443,6 +12464,7 @@ impl MulticoreConnection {
         if !self.parsed_peer_transport_params && !raw_params.is_empty() {
             let peer_params =
                 TransportParams::decode(raw_params, self.is_server)?;
+            info!("Peer TransportParams : {:?}", peer_params);
 
             self.parse_peer_transport_params(peer_params, path)?;
         }
@@ -21792,7 +21814,8 @@ pub mod multicore_testing{
     pub struct Pipe {
         pub client: Arc<RwLock<MulticoreConnection>>,
         pub client_paths: Slab<MulticorePath>,
-        pub server: Connection, // The server is still the initial one
+        pub server: Arc<RwLock<MulticoreConnection>>, // The server is still the initial one
+        pub server_paths: Slab<MulticorePath>,
     }
 
     impl Pipe {
@@ -21843,17 +21866,22 @@ pub mod multicore_testing{
     
             let mut client_paths = Slab::new();
             client_paths.insert(path);
+
+            let (server, path) = multicore_accept(
+                &server_scid,
+                None,
+                server_addr,
+                client_addr,
+                config,
+            )?;
+            let mut server_paths = Slab::new();
+            server_paths.insert(path);
     
             Ok(Pipe {
                 client: Arc::new(RwLock::new(client)),
                 client_paths,
-                server: accept(
-                    &server_scid,
-                    None,
-                    server_addr,
-                    client_addr,
-                    config,
-                )?,
+                server: Arc::new(RwLock::new(server)),
+                server_paths,
             })
         }
 
@@ -21890,30 +21918,36 @@ pub mod multicore_testing{
             let mut client_paths = Slab::new();
             client_paths.insert(path);
 
+            let (server, path) = multicore_accept(
+                &server_scid,
+                None,
+                server_addr,
+                client_addr,
+                &mut config,
+            )?;
+
+            let mut server_paths = Slab::new();
+            server_paths.insert(path);
+
             Ok(Pipe {
                 client: Arc::new(RwLock::new(client)),
                 client_paths,
-                server: accept(
-                    &server_scid,
-                    None,
-                    server_addr,
-                    client_addr,
-                    &mut config,
-                )?,
+                server: Arc::new(RwLock::new(server)),
+                server_paths
             })
         }
 
         pub fn handshake(&mut self) -> Result<()> {
 
-            while !self.client.read().unwrap().is_established() || !self.server.is_established() {
+            while !self.client.read().unwrap().is_established() || !self.server.read().unwrap().is_established() {
                 let flight = multicore_emit_flight(&self.client, &mut self.client_paths)?;
-                //let sizes: Vec<usize> = flight.iter().map(|(p, _)| p.len()).collect();
-                //info!("[handshake] client emitted flight: {}", sizes.iter().sum::<usize>());
-                process_flight(&mut self.server, flight)?;
+                let sizes: Vec<usize> = flight.iter().map(|(p, _)| p.len()).collect();
+                info!("[handshake] client emitted flight: {}", sizes.iter().sum::<usize>());
+                multicore_process_flight(&self.server, &mut self.server_paths, flight)?;
 
-                let flight = emit_flight(&mut self.server)?;
-                //let sizes: Vec<usize> = flight.iter().map(|(p, _)| p.len()).collect();
-                //info!("[handshake] server emitted flight: {}", sizes.iter().sum::<usize>());
+                let flight = multicore_emit_flight(& self.server, &mut self.server_paths)?;
+                let sizes: Vec<usize> = flight.iter().map(|(p, _)| p.len()).collect();
+                info!("[handshake] server emitted flight: {}", sizes.iter().sum::<usize>());
                 multicore_process_flight(&self.client, &mut self.client_paths, flight)?;
             }
             Ok(())
@@ -21924,34 +21958,62 @@ pub mod multicore_testing{
             buf: &mut [u8],
         ) -> Result<usize> {
             let written = encode_pkt_on_path(&self.client, &mut self.client_paths, pkt_type, frames, buf)?;
-            recv_send(&mut self.server, buf, written)
+            recv_send(&mut self.server, &mut self.server_paths, buf, written)
         }
 
         pub fn server_recv(&mut self, buf: &mut [u8]) -> Result<usize> {
-            let client_path = &self.client_paths.get(0).unwrap();
+            let client_path = get_active_path(&self.client, &mut self.client_paths)?;
             let info = RecvInfo {
-                to: client_path.peer_addr(),
-                from: client_path.local_addr(),
+                to: client_path.peer_addr,
+                from: client_path.local_addr,
             };
 
-            self.server.recv(buf, info)
+            let server_path = get_receiving_path( &mut self.server_paths, &info)?;
+            server_path.recv(&self.server, buf, info)
         }
     }
 
+    pub fn get_active_path<'a>(
+        conn_guard: &Arc<RwLock<MulticoreConnection>>, 
+        paths: &'a mut Slab<MulticorePath>,
+    ) -> Result<&'a mut MulticorePath> {
+        for (_, path) in paths.iter_mut(){
+            if path.get_path_id() == conn_guard.read().unwrap().lowest_active_path_id {
+                return Ok(path);
+            }   
+        }
+        Err(Error::InvalidState)
+    }
+
+
+    pub fn get_receiving_path<'a>(
+        paths: &'a mut Slab<MulticorePath>,
+        info: &RecvInfo
+    ) -> Result<&'a mut MulticorePath> {
+        for (_, path) in paths.iter_mut(){
+            if path.local_addr == info.to && path.peer_addr == info.from {
+                return Ok(path);
+            }   
+        }
+        Err(Error::InvalidState)
+    }
+
     pub fn recv_send(
-        conn: &mut Connection, buf: &mut [u8], len: usize,
+        conn_guard: &Arc<RwLock<MulticoreConnection>>, 
+        paths: &mut Slab<MulticorePath>,
+        buf: &mut [u8], len: usize,
     ) -> Result<usize> {
-        let active_path = conn.paths.get_active()?;
+        let active_path = get_active_path(conn_guard, paths)?;
         let info = RecvInfo {
-            to: active_path.local_addr(),
-            from: active_path.peer_addr(),
+            to: active_path.local_addr,
+            from: active_path.peer_addr,
         };
 
-        conn.recv(&mut buf[..len], info)?;
+        active_path.recv(conn_guard, &mut buf[..len], info)?;
 
         let mut off = 0;
 
-        match conn.send(&mut buf[off..]) {
+        match active_path.send_on_path(conn_guard, &mut buf[off..]) {
             Ok((write, _)) => off += write,
 
             Err(Error::Done) => (),
@@ -22307,7 +22369,7 @@ mod multicore_tests {
     use super::*;
     use test_log;
 
-    #[test]
+    #[test_log::test]
     fn unknown_version() {
         let mut config = Config::new(0xbabababa).unwrap();
         config
@@ -22327,10 +22389,10 @@ mod multicore_tests {
 
         assert_eq!(
             pipe.client.read().unwrap().application_proto(),
-            pipe.server.application_proto()
+            pipe.server.read().unwrap().application_proto()
         );
 
-        assert_eq!(pipe.server.server_name(), Some("quic.tech"));
+        assert_eq!(pipe.server.read().unwrap().handshake.server_name(), Some("quic.tech"));
     }
 
     #[test]
@@ -22339,11 +22401,11 @@ mod multicore_tests {
 
         // Disable session tickets on the server (SSL_OP_NO_TICKET) to avoid
         // triggering 1-RTT packet send with a CRYPTO frame.
-        pipe.server.handshake.set_options(0x0000_4000);
+        pipe.server.write().unwrap().handshake.set_options(0x0000_4000);
 
         assert_eq!(pipe.handshake(), Ok(()));
 
-        assert!(pipe.server.handshake_done_sent);
+        assert!(pipe.server.read().unwrap().handshake_done_sent);
     }
 
     #[test_log::test]
@@ -22352,16 +22414,16 @@ mod multicore_tests {
 
         // Client sends initial flight.
         let flight = multicore_testing::multicore_emit_flight(&pipe.client, &mut pipe.client_paths).unwrap();
-        testing::process_flight(&mut pipe.server, flight).unwrap();
+        multicore_testing::multicore_process_flight(&mut pipe.server, &mut pipe.server_paths, flight).unwrap();
 
         // Server sends initial flight.
-        let flight = multicore_testing::emit_flight(&mut pipe.server).unwrap();
+        let flight = multicore_testing::multicore_emit_flight(&mut pipe.server, &mut pipe.server_paths,).unwrap();
 
         assert!(!pipe.client.read().unwrap().is_established());
         assert!(!pipe.client.read().unwrap().handshake_confirmed);
 
-        assert!(!pipe.server.is_established());
-        assert!(!pipe.server.handshake_confirmed);
+        assert!(!pipe.server.read().unwrap().is_established());
+        assert!(!pipe.server.read().unwrap().handshake_confirmed);
 
         multicore_testing::multicore_process_flight(&pipe.client, &mut pipe.client_paths, flight).unwrap();
 
@@ -22371,19 +22433,19 @@ mod multicore_tests {
         assert!(pipe.client.read().unwrap().is_established());
         assert!(!pipe.client.read().unwrap().handshake_confirmed);
 
-        assert!(!pipe.server.is_established());
-        assert!(!pipe.server.handshake_confirmed);
+        assert!(!pipe.server.read().unwrap().is_established());
+        assert!(!pipe.server.read().unwrap().handshake_confirmed);
 
-        testing::process_flight(&mut pipe.server, flight).unwrap();
+        multicore_testing::multicore_process_flight(&mut pipe.server,  &mut pipe.server_paths, flight).unwrap();
 
         // Server completes and confirms handshake, and sends HANDSHAKE_DONE.
-        let flight = testing::emit_flight(&mut pipe.server).unwrap();
+        let flight = multicore_testing::multicore_emit_flight(&mut pipe.server, &mut pipe.server_paths).unwrap();
 
         assert!(pipe.client.read().unwrap().is_established());
         assert!(!pipe.client.read().unwrap().handshake_confirmed);
 
-        assert!(pipe.server.is_established());
-        assert!(pipe.server.handshake_confirmed);
+        assert!(pipe.server.read().unwrap().is_established());
+        assert!(pipe.server.read().unwrap().handshake_confirmed);
 
         multicore_testing::multicore_process_flight(&pipe.client, &mut pipe.client_paths, flight).unwrap();
 
@@ -22393,16 +22455,16 @@ mod multicore_tests {
         assert!(pipe.client.read().unwrap().is_established());
         assert!(pipe.client.read().unwrap().handshake_confirmed);
 
-        assert!(pipe.server.is_established());
-        assert!(pipe.server.handshake_confirmed);
+        assert!(pipe.server.read().unwrap().is_established());
+        assert!(pipe.server.read().unwrap().handshake_confirmed);
 
-        testing::process_flight(&mut pipe.server, flight).unwrap();
+        multicore_testing::multicore_process_flight(&mut pipe.server, &mut pipe.server_paths, flight).unwrap();
 
         assert!(pipe.client.read().unwrap().is_established());
         assert!(pipe.client.read().unwrap().handshake_confirmed);
 
-        assert!(pipe.server.is_established());
-        assert!(pipe.server.handshake_confirmed);
+        assert!(pipe.server.read().unwrap().is_established());
+        assert!(pipe.server.read().unwrap().handshake_confirmed);
     }
 
     #[test]
@@ -22487,7 +22549,7 @@ mod multicore_tests {
         let (len, _) = active_path.send_on_path(&pipe.client, &mut buf).unwrap();
 
         let frames =
-            multicore_testing::decode_pkt(&mut pipe.server, &mut buf[..len]).unwrap();
+            multicore_testing::multicore_decode_pkt(&mut pipe.server.write().unwrap(), &mut buf[..len]).unwrap();
 
         assert_eq!(
             frames.first(),
@@ -22509,10 +22571,10 @@ mod multicore_tests {
 
         // Client sends initial flight
         let flight = multicore_testing::multicore_emit_flight(&mut pipe.client, &mut pipe.client_paths).unwrap();
-        multicore_testing::process_flight(&mut pipe.server, flight).unwrap();
+        multicore_testing::multicore_process_flight(&mut pipe.server,  &mut pipe.server_paths, flight).unwrap();
 
         // Server sends initial flight.
-        let flight = multicore_testing::emit_flight(&mut pipe.server).unwrap();
+        let flight = multicore_testing::multicore_emit_flight(&mut pipe.server, &mut pipe.server_paths).unwrap();
         multicore_testing::multicore_process_flight(&mut pipe.client, &mut pipe.client_paths, flight).unwrap();
 
         // Client sends Handshake packet.
@@ -22522,7 +22584,7 @@ mod multicore_tests {
         // packet.
         let delayed = flight;
 
-        multicore_testing::emit_flight(&mut pipe.server).ok();
+        multicore_testing::multicore_emit_flight(&mut pipe.server, &mut pipe.server_paths).ok();
 
         assert!(pipe.client.read().unwrap().is_established());
 
@@ -22551,14 +22613,14 @@ mod multicore_tests {
 
         assert_eq!(pipe.server_recv(&mut buf[..written]), Ok(written));
 
-        assert!(!pipe.server.is_established());
+        assert!(!pipe.server.read().unwrap().is_established());
 
         // Client sent 1-RTT packets 0 and 1, but server hasn't received them.
         //
         // Note that `largest_rx_pkt_num` is initialized to 0, so we need to
         // send another 1-RTT packet to make this check meaningful.
         assert_eq!(
-            pipe.server
+            pipe.server.read().unwrap()
                 .pkt_num_spaces
                 .spaces
                 .get(packet::Epoch::Application, 0)
@@ -22568,12 +22630,12 @@ mod multicore_tests {
         );
 
         // Process delayed packet.
-        multicore_testing::process_flight(&mut pipe.server, delayed).unwrap();
+        multicore_testing::multicore_process_flight(&mut pipe.server, &mut pipe.server_paths, delayed).unwrap();
 
-        assert!(pipe.server.is_established());
+        assert!(pipe.server.read().unwrap().is_established());
 
         assert_eq!(
-            pipe.server
+            pipe.server.read().unwrap()
                 .pkt_num_spaces
                 .spaces
                 .get(packet::Epoch::Application, 0)
@@ -22582,6 +22644,7 @@ mod multicore_tests {
             0
         );
     }
+
 }
 
 pub use crate::packet::ConnectionId;
