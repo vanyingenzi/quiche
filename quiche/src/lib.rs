@@ -4098,8 +4098,6 @@ impl Connection {
             cwnd_available.saturating_sub(left_before_packing_ack_frame - left),
         );
 
-        info!("TOREMOVE left {}", left);
-
         let mut challenge_data = None;
 
         if pkt_type == packet::Type::Short {
@@ -4458,7 +4456,6 @@ impl Connection {
             path.active()
         {
             let crypto_off = crypto_space.crypto_stream.send.off_front();
-            info!("TOREMOVE crypto_off {}", crypto_off);
 
             // Encode the frame.
             //
@@ -4474,17 +4471,14 @@ impl Connection {
             // Finally we go back and encode the frame header with the now
             // available information.
             let hdr_off = b.off();
-            info!("TOREMOVE hdr_off {}", hdr_off);
             let hdr_len = 1 + // frame type
                 octets::varint_len(crypto_off) + // offset
                 2; // length, always encode as 2-byte varint
-            info!("TOREMOVE hdr_len {}", hdr_len);
 
             if let Some(max_len) = left.checked_sub(hdr_len) {
                 let (mut crypto_hdr, mut crypto_payload) =
                     b.split_at(hdr_off + hdr_len)?;
 
-                info!("TOREMOVE crypto_hdr {:?}, crypto_payload {:?}", crypto_hdr.len(), crypto_payload.len());
 
                 // Write stream data into the packet buffer.
                 let (len, _) = crypto_space
@@ -6354,7 +6348,6 @@ impl Connection {
 
                 self.ids.link_dcid_to_path_id(dcid_seq, pid)?;
                 path.active_dcid_seq = Some(dcid_seq);
-
                 dcid_seq
             };
 
@@ -8100,11 +8093,12 @@ impl Connection {
         info: &RecvInfo,
     ) -> Result<usize> {
         let (in_scid_seq, mut in_scid_pid) =
-            self.ids.find_scid_seq(dcid).ok_or(Error::InvalidState)?;
+        self.ids.find_scid_seq(dcid).ok_or(Error::InvalidState)?;
 
         if let Some(recv_pid) = recv_pid {
             // If the path observes a change of SCID used, note it.
             let recv_path = self.paths.get_mut(recv_pid)?;
+
 
             let cid_entry = recv_path
                 .active_scid_seq
@@ -8659,6 +8653,7 @@ impl MulticorePath {
         out: &mut [u8], has_initial: bool,
         now: time::Instant,
     ) -> Result<(packet::Type, usize)> {
+        
         if out.is_empty() {
             return Err(Error::BufferTooShort);
         }
@@ -8803,7 +8798,8 @@ impl MulticorePath {
 
         let mut left = b.cap();
 
-        let dcid_seq = self.get_inner_path_mut().unwrap().active_dcid_seq.ok_or(Error::OutOfIdentifiers)?;
+        let dcid_seq = self.get_inner_path_mut().unwrap()
+            .active_dcid_seq.ok_or(Error::OutOfIdentifiers)?;
 
         let space_id = if multiple_application_data_pkt_num_spaces {
             dcid_seq
@@ -9090,8 +9086,6 @@ impl MulticorePath {
             // Bytes consumed by ACK frames.
             cwnd_available.saturating_sub(left_before_packing_ack_frame - left),
         );
-
-        info!("TOREMOVE left {}", left);
 
         let mut challenge_data = None;
 
@@ -9456,7 +9450,6 @@ impl MulticorePath {
             path.active()
         {
             let crypto_off = crypto_space.crypto_stream.send.off_front();
-            info!("TOREMOVE crypto_off {}", crypto_off);
 
             // Encode the frame.
             //
@@ -9472,18 +9465,14 @@ impl MulticorePath {
             // Finally we go back and encode the frame header with the now
             // available information.
             let hdr_off = b.off();
-            info!("TOREMOVE hdr_off {}", hdr_off);
 
             let hdr_len = 1 + // frame type
                 octets::varint_len(crypto_off) + // offset
                 2; // length, always encode as 2-byte varint
-            info!("TOREMOVE hdr_len {}", hdr_len);
 
             if let Some(max_len) = left.checked_sub(hdr_len) {
                 let (mut crypto_hdr, mut crypto_payload) =
                     b.split_at(hdr_off + hdr_len)?;
-
-                info!("TOREMOVE crypto_hdr {:?}, crypto_payload {:?}", crypto_hdr.len(), crypto_payload.len());
 
                 // Write stream data into the packet buffer.
                 let (len, _) = crypto_space
@@ -9992,6 +9981,7 @@ impl MulticorePath {
         out: &mut [u8]
     ) -> Result<(usize, SendInfo)> {
         let mut conn = conn_guard.write().unwrap();
+
         if out.is_empty() {
             return Err(Error::BufferTooShort);
         }
@@ -10002,8 +9992,10 @@ impl MulticorePath {
             return Err(Error::Done);
         }
 
-        if conn.local_error.is_none() && conn.is_lowest_active_path_id(self) {
-            conn.do_handshake(now.unwrap(), self)?;
+        if conn.local_error.is_none() && !self.path_id.is_none() {
+            if conn.is_lowest_active_path_id(self) {
+                conn.do_handshake(now.unwrap(), self)?;
+            }
         }
 
         let now = match now {
@@ -10507,7 +10499,15 @@ impl MulticorePath {
             },
 
             frame::Frame::PathResponse { data } => {
-                self.get_inner_path_mut().unwrap().on_response_received(data);
+                if self.get_inner_path_mut().unwrap().on_response_received(data) {
+                    let local_addr = self.local_addr;
+                    let peer_addr = self.peer_addr;
+
+                    // TODO multicore Handle Migrating
+
+                    // Notifies the application.
+                    self.notify_event(PathEvent::Validated(local_addr, peer_addr));
+                }
             },
 
             frame::Frame::ConnectionClose {
@@ -11362,7 +11362,7 @@ impl MulticorePath {
 
         // Process acked frames. Note that several packets from several paths
         // might have been acked by the received packet.
-        let path_id = self.path_id.unwrap().clone();
+        let path_id = self.path_id.clone();
         let p = self.get_inner_path_mut().unwrap();
 
         for acked in p.recovery.acked[epoch].drain(..) {
@@ -11501,12 +11501,16 @@ impl MulticorePath {
 
         // Now that we processed all the frames, if there is a path that has no
         // Destination CID, try to allocate one.
-        if conn.ids.zero_length_dcid() {
-            p.active_dcid_seq = Some(0);
-        }
-
-        if let Some(dcid_seq) = conn.ids.lowest_available_dcid_seq(){
-            update_dcid(&mut conn.ids, path_id, p, Some(dcid_seq))?;
+        if p.active_dcid_seq.is_none() {
+            if conn.ids.zero_length_dcid() {
+                p.active_dcid_seq = Some(0);
+            }
+    
+            if let Some(dcid_seq) = conn.ids.lowest_available_dcid_seq(){
+                if let Some(path_id) = path_id {
+                    update_dcid(&mut conn.ids, path_id, p, Some(dcid_seq))?;
+                }
+            }
         }
 
         let multipath_enabled = conn.is_multipath_enabled();
@@ -11541,7 +11545,7 @@ impl MulticorePath {
                 recv_pid != active_path_id &&
                 pkt_num_space.largest_rx_non_probing_pkt_num == pn
             {
-                // TODO multipath
+                // TODO multicore
                 return Err(Error::InvalidState);
                 // conn.on_peer_migrated(recv_pid, conn.disable_dcid_reuse, now)?;
             }
@@ -11553,8 +11557,6 @@ impl MulticorePath {
 
         // Update send capacity.
         conn.update_tx_cap();
-
-        info!("[recv_single] check recv count", );
 
         self.get_inner_path_mut().unwrap().recv_count += 1;
 
@@ -11571,7 +11573,9 @@ impl MulticorePath {
             self.get_inner_path_mut().unwrap().verified_peer_address = true;
         }
 
-        conn.paths_stats.insert(self.path_id.unwrap(), self.get_inner_path().unwrap().stats());
+        if let Some(path_id) = self.path_id {
+            conn.paths_stats.insert(path_id, self.get_inner_path().unwrap().stats());
+        }
         conn.ack_eliciting_sent = false;
 
         Ok(read)
@@ -11598,8 +11602,6 @@ impl MulticorePath {
         if len == 0 {
             return Err(Error::BufferTooShort);
         }
-
-        info!("Recv: {}", buf.len());
 
         if let Some(_) = self.path_id {
             let is_server = self.is_server;
@@ -11672,6 +11674,31 @@ impl MulticorePath {
 
         Ok(done)
     }
+
+    /// Requests the stack to perform path validation of the proposed 4-tuple.
+    pub fn probe_path(
+        &mut self, 
+        conn_guard: &Arc<RwLock<MulticoreConnection>>, 
+    ) -> Result<u64> {
+        match self.path_id {
+            Some(_) => {},
+            None => {
+                let mut conn = conn_guard.write().unwrap();
+                conn.create_path_on_client(self)?;
+            },
+        };
+
+        // Automatically probes the new path.
+        self.get_inner_path_mut().unwrap().request_validation();
+        let path = self.get_inner_path_mut().unwrap();
+
+        path.active_dcid_seq.ok_or(Error::InvalidState)
+    }
+
+    /// Pops the next path event
+    pub fn path_event_next(&mut self) -> Option<path::PathEvent> {
+        self.events.pop_front()
+    }
 }
 
 impl MulticoreConnection {
@@ -11699,7 +11726,7 @@ impl MulticoreConnection {
             None
         };
 
-        let mut path_counter = 1;
+        let mut path_counter = 0;
         let active_path_id = path_counter;
         path_counter += 1;
 
@@ -12077,6 +12104,15 @@ impl MulticoreConnection {
             cwin_available > 0
     }
 
+    /// Returns the number of spare Destination Connection IDs, i.e.,
+    /// Destination Connection IDs that are still unused.
+    ///
+    /// Note that this function returns 0 if the host uses zero length
+    /// Destination Connection IDs.
+    pub fn available_dcids(&self) -> usize {
+        self.ids.available_dcids()
+    }
+
     /// Returns true if the connection is draining.
     ///
     /// If this returns `true`, the connection object cannot yet be dropped, but
@@ -12338,6 +12374,51 @@ impl MulticoreConnection {
         !self.path_status_to_advertise.is_empty()
     }
 
+    /// Creates a new client-side path.
+    fn create_path_on_client(
+        &mut self, path: &mut MulticorePath
+    ) -> Result<()> {
+        if self.is_server {
+            return Err(Error::InvalidState);
+        }
+
+        // If we use zero-length SCID and go over our local active CID limit,
+        // the `insert_path()` call will raise an error.
+        if !self.ids.zero_length_scid() && self.ids.available_scids() == 0 {
+            return Err(Error::OutOfIdentifiers);
+        }
+
+        // Do we have a spare DCID? If we are using zero-length DCID, just use
+        // the default having sequence 0 (note that if we exceed our local CID
+        // limit, the `insert_path()` call will raise an error.
+        let dcid_seq = if self.ids.zero_length_dcid() {
+            0
+        } else {
+            self.ids
+                .lowest_available_dcid_seq()
+                .ok_or(Error::OutOfIdentifiers)?
+        };
+
+        let pid = self.path_id_counter;
+        self.path_id_counter += 1;
+
+        path.inner_path =
+            Some(path::Path::new(path.local_addr, path.peer_addr, &self.recovery_config, false));
+        path.path_id = Some(pid);
+
+        if self.is_server {
+            path.notify_event(PathEvent::New(path.local_addr, path.peer_addr));
+        }
+
+        self.paths_stats.insert(path.get_path_id(), path.stats()); 
+        self.addrs_to_paths.insert((path.local_addr(), path.peer_addr()), path.get_path_id());
+
+        let path = path.get_inner_path_mut().unwrap();
+        update_dcid(&mut self.ids, pid, path, Some(dcid_seq))?;
+
+        Ok(())
+    }
+
     /// Returns true if there are any paths that need to send PATH_ABANDON
     /// frames.
     fn has_path_abandon(&self) -> bool {
@@ -12566,6 +12647,7 @@ impl MulticoreConnection {
             // If the path observes a change of SCID used, note it.
             let recv_path = path.get_inner_path_mut().unwrap();
 
+
             let cid_entry = recv_path
                 .active_scid_seq
                 .and_then(|v| self.ids.get_scid(v).ok());
@@ -12648,10 +12730,13 @@ impl MulticoreConnection {
 
         // Automatically probes the new path.
         path.get_inner_path_mut().unwrap().request_validation();
+        if self.is_server {
+            path.notify_event(PathEvent::New(path.local_addr, path.peer_addr));
+        }
 
         let pid = self.path_id_counter;
         self.path_id_counter += 1;
-
+        path.path_id = Some(pid);
 
         let path = path.get_inner_path_mut().unwrap();
         update_scid(&mut self.ids, pid, path, in_scid_seq)?;
@@ -12659,6 +12744,18 @@ impl MulticoreConnection {
         Ok(pid)
     }
 
+    /// New source id
+    pub fn new_source_cid(
+        &mut self, scid: &ConnectionId, reset_token: u128, retire_if_needed: bool,
+    ) -> Result<u64> {
+        self.ids.new_scid(
+            scid.to_vec().into(),
+            Some(reset_token),
+            true,
+            None,
+            retire_if_needed,
+        )
+    }
 }
 /// Maps an `Error` to `Error::Done`, or itself.
 ///
@@ -13489,7 +13586,11 @@ pub mod testing {
 
             while !client_done || !server_done {
                 match emit_flight(&mut self.client) {
-                    Ok(flight) => process_flight(&mut self.server, flight)?,
+                    Ok(flight) => {
+                        let sizes: Vec<usize> = flight.iter().map(|(p, _)| p.len()).collect();
+                        info!("[advance] client emitted flight: {}", sizes.iter().sum::<usize>());
+                        process_flight(&mut self.server, flight)?
+                    },
 
                     Err(Error::Done) => client_done = true,
 
@@ -13497,7 +13598,11 @@ pub mod testing {
                 };
 
                 match emit_flight(&mut self.server) {
-                    Ok(flight) => process_flight(&mut self.client, flight)?,
+                    Ok(flight) => {
+                        let sizes: Vec<usize> = flight.iter().map(|(p, _)| p.len()).collect();
+                        info!("[advance] server emitted flight: {}", sizes.iter().sum::<usize>());
+                        process_flight(&mut self.client, flight)?
+                    },
 
                     Err(Error::Done) => server_done = true,
 
@@ -20122,7 +20227,7 @@ mod tests {
         pipe
     }
 
-    #[test]
+    #[test_log::test]
     fn path_validation() {
         let mut config = Config::new(crate::PROTOCOL_VERSION).unwrap();
         config
@@ -20175,10 +20280,10 @@ mod tests {
         assert_eq!(pipe.server.path_event_next(), None);
         assert_eq!(pipe.client.available_dcids(), 1);
         assert_eq!(pipe.client.path_event_next(), None);
-
+        
         // Now the path probing can work.
         assert_eq!(pipe.client.probe_path(client_addr_2, server_addr), Ok(1));
-
+        
         // But the server cannot probe a yet-unseen path.
         assert_eq!(
             pipe.server.probe_path(server_addr, client_addr_2),
@@ -20199,15 +20304,16 @@ mod tests {
             pipe.server.path_event_next(),
             Some(PathEvent::New(server_addr, client_addr_2)),
         );
+
         assert_eq!(
             pipe.server.path_event_next(),
             Some(PathEvent::Validated(server_addr, client_addr_2)),
         );
         assert_eq!(pipe.server.path_event_next(), None);
-
+        
         // The server can later probe the path again.
         assert_eq!(pipe.server.probe_path(server_addr, client_addr_2), Ok(1));
-
+        
         // This should not trigger any event at client side.
         assert_eq!(pipe.client.path_event_next(), None);
         assert_eq!(pipe.server.path_event_next(), None);
@@ -21953,6 +22059,39 @@ pub mod multicore_testing{
             Ok(())
         }
 
+        pub fn advance(&mut self) -> Result<()> {
+            let mut client_done = false;
+            let mut server_done = false;
+
+            while !client_done || !server_done {
+                match multicore_emit_flight(&self.client, &mut self.client_paths) {
+                    Ok(flight) => {
+                        let sizes: Vec<usize> = flight.iter().map(|(p, _)| p.len()).collect();
+                        info!("[advance] client emitted flight: {}", sizes.iter().sum::<usize>());
+                        multicore_process_flight(&self.server, &mut self.server_paths, flight)?
+                    },
+
+                    Err(Error::Done) => client_done = true,
+
+                    Err(e) => return Err(e),
+                };
+
+                match multicore_emit_flight(&self.server, &mut self.server_paths) {
+                    Ok(flight) => {
+                        let sizes: Vec<usize> = flight.iter().map(|(p, _)| p.len()).collect();
+                        info!("[advance] server emitted flight: {}", sizes.iter().sum::<usize>());
+                        multicore_process_flight(&self.client, &mut self.client_paths, flight)?
+                    },
+
+                    Err(Error::Done) => server_done = true,
+
+                    Err(e) => return Err(e),
+                };
+            }
+
+            Ok(())
+        }
+
         pub fn send_pkt_to_server(
             &mut self, pkt_type: packet::Type, frames: &[frame::Frame],
             buf: &mut [u8],
@@ -22124,15 +22263,28 @@ pub mod multicore_testing{
         paths: &mut Slab<MulticorePath>
     ) -> Result<Vec<(Vec<u8>, SendInfo)>> {
         let mut to_return = Vec::new();
+        let mut done_on_all_path = Vec::new();
         for (_, path) in paths.iter_mut() {
-            to_return.extend(multicore_emit_flight_on_path(conn, path)?)
+            match multicore_emit_flight_on_path(conn, path) {
+                Ok(v) => {
+                    done_on_all_path.push(false);
+                    to_return.extend(v);
+                }, 
+                Err(Error::Done) => {
+                    done_on_all_path.push(true);
+                }, 
+                Err(e) => return Err(e)
+            }
+        }
+        if to_return.len() == 0 && done_on_all_path.iter().all(|&x| x) {
+            return Err(Error::Done);
         }
         Ok(to_return)
     }
 
     pub fn multicore_process_flight_on_path(
         conn: &Arc<RwLock<MulticoreConnection>>,
-        path: &mut MulticorePath, 
+        path: &mut MulticorePath,
         buf: &mut [u8], info: SendInfo,
     ) -> Result<()> {
         let info = RecvInfo {
@@ -22645,6 +22797,107 @@ mod multicore_tests {
         );
     }
 
+    #[test_log::test]
+    fn path_validation() {
+        let mut config = Config::new(crate::PROTOCOL_VERSION).unwrap();
+        config
+            .load_cert_chain_from_pem_file("examples/cert.crt")
+            .unwrap();
+        config
+            .load_priv_key_from_pem_file("examples/cert.key")
+            .unwrap();
+        config
+            .set_application_protos(&[b"proto1", b"proto2"])
+            .unwrap();
+        config.verify_peer(false);
+        config.set_active_connection_id_limit(2);
+
+        let mut pipe = multicore_testing::Pipe::with_config(&mut config).unwrap();
+        assert_eq!(pipe.handshake(), Ok(()));
+
+        let server_addr = testing::Pipe::server_addr();
+        let client_addr_2 = "127.0.0.1:5678".parse().unwrap();
+        let mut client_addr_2_path = MulticorePath::default(&config, false, client_addr_2, server_addr);
+        
+        // We cannot probe a new path if there are not enough identifiers.
+        assert_eq!(
+            client_addr_2_path.probe_path(&mut pipe.client),
+            Err(Error::OutOfIdentifiers)
+        );
+        
+        let (c_cid, c_reset_token) = testing::create_cid_and_reset_token(16);
+
+        assert_eq!(
+            pipe.client.write().unwrap().new_source_cid(&c_cid, c_reset_token, true),
+            Ok(1)
+        );
+
+        let (s_cid, s_reset_token) = testing::create_cid_and_reset_token(16);
+        assert_eq!(
+            pipe.server.write().unwrap().new_source_cid(&s_cid, s_reset_token, true),
+            Ok(1)
+        );
+
+        // We need to exchange the CIDs first.
+        assert_eq!(
+            client_addr_2_path.probe_path(&mut pipe.client),
+            Err(Error::OutOfIdentifiers)
+        );
+
+        // Let exchange packets over the connection.
+        assert_eq!(pipe.advance(), Ok(()));
+        
+        assert_eq!(pipe.server.read().unwrap().available_dcids(), 1);
+        assert_eq!(pipe.server_paths.get_mut(0).unwrap().path_event_next(), None);
+        assert_eq!(pipe.client.read().unwrap().available_dcids(), 1);
+        assert_eq!(pipe.client_paths.get_mut(0).unwrap().path_event_next(), None);
+        
+        // Now the path probing can work.
+        assert_eq!(client_addr_2_path.probe_path(&mut pipe.client), Ok(1));
+        pipe.client_paths.insert(client_addr_2_path);
+
+        let mut server_client_addr_2_path = 
+            MulticorePath::default(&config, true, server_addr,  client_addr_2);
+
+        // But the server cannot probe a yet-unseen path.
+        assert_eq!(
+            server_client_addr_2_path.probe_path(&mut pipe.server),
+            Err(Error::InvalidState),
+        );
+
+        pipe.server_paths.insert(server_client_addr_2_path);
+        
+        assert_eq!(pipe.advance(), Ok(()));
+        
+        // The path should be validated at some point.
+        assert_eq!(
+            pipe.client_paths.get_mut(1).unwrap().path_event_next(),
+            Some(PathEvent::Validated(client_addr_2, server_addr)),
+        );
+        
+        assert_eq!(pipe.client_paths.get_mut(1).unwrap().path_event_next(), None);
+        
+        // The server should be notified of this new path.
+        assert_eq!(
+            pipe.server_paths.get_mut(1).unwrap().path_event_next(),
+            Some(PathEvent::New(server_addr, client_addr_2)),
+        );
+
+        assert_eq!(
+            pipe.server_paths.get_mut(1).unwrap().path_event_next(),
+            Some(PathEvent::Validated(server_addr, client_addr_2)),
+        );
+        assert_eq!(pipe.server_paths.get_mut(1).unwrap().path_event_next(), None);
+        
+        // The server can later probe the path again.
+        assert_eq!(pipe.server_paths.get_mut(1).unwrap().probe_path(&mut pipe.server), Ok(1));
+        
+        // This should not trigger any event at client side.
+        assert_eq!(pipe.client_paths.get_mut(0).unwrap().path_event_next(), None);
+        assert_eq!(pipe.client_paths.get_mut(1).unwrap().path_event_next(), None);
+        assert_eq!(pipe.server_paths.get_mut(0).unwrap().path_event_next(), None);
+        assert_eq!(pipe.server_paths.get_mut(1).unwrap().path_event_next(), None);
+    }
 }
 
 pub use crate::packet::ConnectionId;

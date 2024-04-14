@@ -399,7 +399,6 @@ impl ConnectionIdentifiers {
             }
             return Ok(e.seq);
         }
-
         self.scids.insert(ConnectionIdEntry {
             cid,
             seq,
@@ -441,6 +440,8 @@ impl ConnectionIdentifiers {
         &mut self, cid: ConnectionId<'static>, seq: u64, reset_token: u128,
         retire_prior_to: u64,
     ) -> Result<Vec<(u64, usize)>> {
+        info!("Entered new new_dcid");
+        
         if self.zero_length_dcid {
             return Err(Error::InvalidState);
         }
@@ -517,6 +518,7 @@ impl ConnectionIdentifiers {
             )?;
             self.largest_peer_retire_prior_to = retire_prior_to;
         } else {
+            info!("Inserted new entry: {:?}", new_entry);
             self.dcids.insert(new_entry)?;
         }
 
