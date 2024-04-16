@@ -131,7 +131,7 @@ impl Algorithm {
 pub struct Open {
     alg: Algorithm,
 
-    secret: Vec<u8>,
+    pub(crate) secret: Vec<u8>,
 
     header: HeaderProtectionKey,
 
@@ -244,7 +244,7 @@ impl Open {
 pub struct Seal {
     alg: Algorithm,
 
-    secret: Vec<u8>,
+    pub(crate) secret: Vec<u8>,
 
     header: HeaderProtectionKey,
 

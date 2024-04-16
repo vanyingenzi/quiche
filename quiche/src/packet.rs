@@ -863,6 +863,7 @@ pub struct KeyUpdate {
     pub timer: time::Instant,
 }
 
+#[derive(Clone)]
 pub struct PktNumSpace {
     pub largest_rx_pkt_num: u64,
 
@@ -965,6 +966,18 @@ impl PktNumSpaceCrypto {
     }
 }
 
+use std::fmt;
+
+impl fmt::Debug for PktNumSpaceCrypto {
+    fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt.debug_struct("PktNumSpaceCrypto")
+            .field("crypto_open", &self.crypto_open)
+            .field("crypto_seal", &self.crypto_seal)
+            .finish()
+    }
+}
+
+#[derive(Clone)]
 pub struct PktNumSpaceImplMap {
     pkt_num_spaces: [PktNumSpace; Epoch::Application as usize],
     application_pkt_num_spaces: BTreeMap<u64, PktNumSpace>,

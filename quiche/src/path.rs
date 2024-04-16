@@ -98,7 +98,7 @@ pub enum PathRequest {
 }
 
 impl PathRequest {
-    fn requested_state(self) -> PathState {
+    pub (crate) fn requested_state(self) -> PathState {
         match self {
             PathRequest::Unused => PathState::Unused,
             PathRequest::Active => PathState::Active,

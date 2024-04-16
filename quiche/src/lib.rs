@@ -1267,8 +1267,8 @@ pub struct Connection {
     trace_id: String, // * Clonable
 
     /// Packet number spaces.
-    pkt_num_spaces: packet::PktNumSpaceMap, // ! Can be referenced to Path after handshake
-    //* This camn move to since the initial 2 packet space numbers are deleted after jandshake */
+    pkt_num_spaces: packet::PktNumSpaceMap,
+    //* This can move to since the initial 2 packet space numbers are deleted after handshake */
 
     /// Peer's transport parameters.
     peer_transport_params: TransportParams, // * Clonable
@@ -1464,7 +1464,7 @@ pub struct MulticoreConnection {
     version: u32, // * Clonable
 
     /// Connection Identifiers.
-    ids: cid::ConnectionIdentifiers, // ! Concurrent Access
+    ids: cid::ConnectionIdentifiers, // ! Concurrent Access [* Cloned for reading only]
 
     /// Unique opaque ID for the connection that can be used for logging.
     trace_id: String, // * Clonable
@@ -1477,6 +1477,9 @@ pub struct MulticoreConnection {
 
     /// Local transport parameters.
     local_transport_params: TransportParams, // * Clonable
+
+    /// Stream Ids
+    stream_ids: stream::MulticoreStreamIds,
 
     /// TLS handshake state.
     handshake: tls::Handshake, // ! Referenced from Path after handshake, since on receive of CRYPTO frames it needs to work
@@ -1494,44 +1497,13 @@ pub struct MulticoreConnection {
     recovery_config: recovery::RecoveryConfig, // * Clonable
 
     /// List of supported application protocols.
-    application_protos: Vec<Vec<u8>>, //* Clonable, we only need HTTP3
+    application_protos: Vec<Vec<u8>>, //* Clonable, 
 
-    // TODO move later to stream
-    flow_control: flowcontrol::FlowControl, // ? Move to each stream as we are doing per stream flow control
-
-    /// Whether we send MAX_DATA frame.
-    almost_full: bool, // ? Moved to each stream
-
-    /// Number of stream data bytes that can be buffered.
-    tx_cap: usize, // ? Moved to each stream
-
-    // Number of bytes buffered in the send buffer.
-    tx_buffered: usize, // ? Moved to each stream
-
-    /// Total number of bytes sent to the peer.
-    tx_data: u64, // ? Moved to each stream
-
-    /// Total number of bytes received from the peer.
-    rx_data: u64, // ? Moved to each stream
-
-    /// Peer's flow control limit for the connection.
-    max_tx_data: u64, // ? Moved to each stream
-
-    /// Last tx_data before running a full send() loop.
-    last_tx_data: u64, // ? Moved to each stream
-
-    /// Total number of bytes retransmitted over the connection.
-    /// This counts only STREAM and CRYPTO data.
-    stream_retrans_bytes: u64, // ? Moved to path and aggregated from now and then
+    // TODO move later to path
 
     /// Idle timeout expiration time.
     idle_timer: Option<time::Instant>,
     
-    /// Streams map, indexed by stream ID.
-    // ! stream IDs have to be controlled by the Connection but the rest of the logic to the path
-    // ! In other words this structure has to be decoupled too.
-    streams: stream::StreamMap,
-
     /// Peer's original destination connection ID. Used by the client to
     /// validate the server's transport parameter.
     odcid: Option<ConnectionId<'static>>, // ! Clonable after handshake
@@ -1615,10 +1587,6 @@ pub struct MulticoreConnection {
 
     #[cfg(feature = "qlog")]
     qlog: QlogInfo, // ! Concurrent access
-
-    /// DATAGRAM queues.
-    dgram_recv_queue: dgram::DatagramQueue, // ? Moved to Path // TODO
-    dgram_send_queue: dgram::DatagramQueue, // ? Moved to Path // TODO
 
     /// Whether to emit DATAGRAM frames in the next packet.
     emit_dgram: bool, // ? Moved to Path
@@ -2355,8 +2323,6 @@ impl Connection {
     pub fn recv(&mut self, buf: &mut [u8], info: RecvInfo) -> Result<usize> {
         let len = buf.len();
 
-        info!("Recv: {}", buf.len());
-
         if len == 0 {
             return Err(Error::BufferTooShort);
         }
@@ -2424,7 +2390,7 @@ impl Connection {
                 },
             };
 
-            info!("Recv_single read: {}", read);
+            info!("recv_single read: {}", read);
 
             done += read;
             left -= read;
@@ -2746,7 +2712,7 @@ impl Connection {
                 self.version,
                 self.is_server,
             )?;
-
+    
             self.pkt_num_spaces
                 .crypto
                 .get_mut(packet::Epoch::Initial)
@@ -2795,8 +2761,6 @@ impl Connection {
                     self.undecryptable_pkts.push_back((pkt, *info));
                     return Ok(pkt_len);
                 }
-
-                info!("No useable keys");
 
                 let e = drop_pkt_on_err(
                     Error::CryptoFail,
@@ -3649,6 +3613,8 @@ impl Connection {
 
             at: send_path.recovery.get_packet_send_time(),
         };
+
+
 
         Ok((done, info))
     }
@@ -4855,6 +4821,7 @@ impl Connection {
             Some(ref v) => v,
             None => return Err(Error::InvalidState),
         };
+
 
         let written = packet::encrypt_pkt(
             &mut b,
@@ -8381,7 +8348,76 @@ pub enum MulticorePathPendingEvent {
     PacketOnACKReceived(usize, recovery::SpaceId, ranges::RangeSet, u64, packet::Epoch, recovery::HandshakeStatus, time::Instant, String)
 }
 
-/// Representes a multicore path
+/// A structured to be used to get connection information locally
+#[allow(dead_code)]
+pub struct ReducedMulticoreConnection {
+    /// Connection Identifiers.
+    ids: cid::ConnectionIdentifiers, // ! Concurrent Access [* Cloned for reading only] may change
+    /// Unique opaque ID for the connection that can be used for logging.
+    trace_id: String,
+    /// Peer's transport parameters.
+    peer_transport_params: TransportParams,
+    /// Local transport parameters.
+    local_transport_params: TransportParams,
+    /// Packet number spaces.
+    pkt_num_spaces: packet::PktNumSpaceMap,
+    /// Whether an ack-eliciting packet has been sent since last receiving a packet.
+    ack_eliciting_sent: bool,
+    /// The negotiated ALPN protocol.
+    alpn: Vec<u8>,
+    /// Whether the connection is closed.
+    closed: bool,
+    /// Whether multipath has been negotiated
+    multipath: bool,
+    /// QUIC wire version used for the connection.
+    version: u32,
+    /// Source ID len
+    source_id_len: usize, // ! This is might change upon path failure
+    /// Lowest active path id
+    lowest_active_path_id: usize, // ! This is might change upon path failure
+    handshake_status: crate::recovery::HandshakeStatus
+}
+
+impl ReducedMulticoreConnection {
+    #[allow(dead_code)]
+    fn new(conn: &MulticoreConnection) -> Result<Self> {
+        let mut pkt_num_spaces = packet::PktNumSpaceMap::new();
+        pkt_num_spaces.spaces = conn.pkt_num_spaces.spaces.clone();
+        let crypto_space = conn.pkt_num_spaces.crypto.get(packet::Epoch::Application);
+        let (aead_open, aead_seal) = {
+            (
+                crate::crypto::Open::from_secret(
+                    crypto_space.crypto_open.as_ref().expect("Can't find crypto open").alg(),
+                    &crypto_space.crypto_open.as_ref().expect("Can't find crypto open").secret,
+                )?,
+                crate::crypto::Seal::from_secret(
+                    crypto_space.crypto_seal.as_ref().expect("Can't find crypto seal").alg(),
+                    &crypto_space.crypto_seal.as_ref().expect("Can't find crypto seal").secret,
+                )?,
+            )
+        };
+        pkt_num_spaces.crypto.get_mut(packet::Epoch::Application).crypto_open = Some(aead_open);
+        pkt_num_spaces.crypto.get_mut(packet::Epoch::Application).crypto_seal = Some(aead_seal);
+    
+        Ok(Self {
+            trace_id: conn.trace_id.clone(), 
+            peer_transport_params: conn.peer_transport_params.clone(), 
+            local_transport_params: conn.local_transport_params.clone(), 
+            pkt_num_spaces, 
+            closed: conn.closed, 
+            alpn: conn.alpn.clone(),
+            multipath: conn.multipath, 
+            ack_eliciting_sent: conn.ack_eliciting_sent, 
+            version: conn.version, 
+            source_id_len: conn.source_id().len(), 
+            ids: conn.ids.clone(),
+            lowest_active_path_id: conn.lowest_active_path_id, 
+            handshake_status: conn.handshake_status(),
+        })
+    }
+} 
+
+/// Multicore representation of a path
 pub struct MulticorePath {
     inner_path: Option<path::Path>, 
     // Local address
@@ -8390,45 +8426,140 @@ pub struct MulticorePath {
     peer_addr: SocketAddr, 
     // Queue for path events
     events: VecDeque<path::PathEvent>, 
+    multicore_events: VecDeque<MulticorePathPendingEvent>,
     // The path ID assigned by the connection
     path_id: Option<usize>,
     /// Whether this manager serves a connection as a server.
     is_server: bool,
     //// A resusable buffer used by Recovery
     // newly_acked: Vec<recovery::Acked>,
+    // Whether the connection handshake has been complemented
+    completed_handshake: bool,
+    /// Receiver flow controller.
+    flow_control: flowcontrol::FlowControl, // ? Move to each stream as we are doing per stream flow control
+    /// Whether we send MAX_DATA frame.
+    almost_full: bool,
+    /// Total number of bytes received from the peer.
+    rx_data: u64,
+    /// Peer's flow control limit for the connection.
+    max_tx_data: u64,
+    /// Last tx_data before running a full send() loop.
+    last_tx_data: u64, 
+    /// Total number of bytes retransmitted over the connection.
+    /// This counts only STREAM and CRYPTO data.
+    stream_retrans_bytes: u64, 
+    // Number of bytes buffered in the send buffer.
+    tx_buffered: usize,
+    /// Total number of bytes sent to the peer.
+    tx_data: u64,
+    /// Number of stream data bytes that can be buffered.
+    tx_cap: usize,
+    /// The connection-level limit at which send blocking occurred.
+    blocked_limit: Option<u64>,
+    /// DATAGRAM queues.
+    dgram_recv_queue: dgram::DatagramQueue,
+    dgram_send_queue: dgram::DatagramQueue,
+    /// Streams map, indexed by stream ID.
+    // ! stream IDs have to be controlled by the Connection but the rest of the logic to the path
+    // ! In other words this structure has to be decoupled too.
+    streams: stream::MulticoreStreamMap,
+    local_transport_params: TransportParams,
+    peer_transport_params: TransportParams,
+    /// Whether the multipath extensions are enabled.
+    multipath: bool,
 }
 
 impl MulticorePath {
 
     /// Creates a new multipath connection
     pub fn new(
-        local_addr: SocketAddr, peer_addr: SocketAddr, _config: &Config, 
+        local_addr: SocketAddr, peer_addr: SocketAddr, config: &Config, 
         recovery_config: &recovery::RecoveryConfig, is_initial: bool,
         path_id: usize, is_server: bool,
     ) -> Self {
+        let max_rx_data = config.local_transport_params.initial_max_data;
+
         Self {
             inner_path: Some(path::Path::new(local_addr, peer_addr, recovery_config, is_initial)), 
             events: VecDeque::new(),
+            multicore_events: VecDeque::new(),
             path_id: Some(path_id), 
             is_server, 
             local_addr, 
             peer_addr,
+            completed_handshake: false, 
+            dgram_recv_queue: dgram::DatagramQueue::new(
+                config.dgram_recv_max_queue_len,
+            ),
+            dgram_send_queue: dgram::DatagramQueue::new(
+                config.dgram_send_max_queue_len,
+            ),
+            streams: stream::MulticoreStreamMap::new(
+                config.max_stream_window,
+            ),
+            peer_transport_params: TransportParams::default(),
+            local_transport_params: config.local_transport_params.clone(),
+            flow_control: flowcontrol::FlowControl::new(
+                max_rx_data,
+                cmp::min(max_rx_data / 2 * 3, DEFAULT_CONNECTION_WINDOW),
+                config.max_connection_window,
+            ),
+            almost_full: false,
+            tx_cap: 0,
+            tx_buffered: 0,
+            tx_data: 0,
+            rx_data: 0,
+            max_tx_data: 0,
+            last_tx_data: 0,
+            blocked_limit:None,
+
+            stream_retrans_bytes: 0,
+            multipath: false,
             //newly_acked: Vec::new(),
         }
     }
 
     /// Creates a new multipath connection that has no inner path
     pub fn default(
-        _config: &Config, is_server: bool,
+        config: &Config, is_server: bool,
         local_addr: SocketAddr, peer_addr: SocketAddr,
     ) -> Self {
+        let max_rx_data = config.local_transport_params.initial_max_data;
         Self {
             inner_path: None, 
             events: VecDeque::new(),
+            multicore_events: VecDeque::new(),
             path_id: None, 
             is_server, 
             local_addr, 
             peer_addr,
+            completed_handshake: false, 
+            dgram_recv_queue: dgram::DatagramQueue::new(
+                config.dgram_recv_max_queue_len,
+            ),
+            dgram_send_queue: dgram::DatagramQueue::new(
+                config.dgram_send_max_queue_len,
+            ),
+            streams: stream::MulticoreStreamMap::new(
+                config.max_stream_window,
+            ),
+            local_transport_params: config.local_transport_params.clone(),
+            peer_transport_params: TransportParams::default(),
+            flow_control: flowcontrol::FlowControl::new(
+                max_rx_data,
+                cmp::min(max_rx_data / 2 * 3, DEFAULT_CONNECTION_WINDOW),
+                config.max_connection_window,
+            ),
+            almost_full: false,
+            tx_cap: 0,
+            tx_buffered: 0,
+            tx_data: 0,
+            rx_data: 0,
+            max_tx_data: 0,
+            last_tx_data: 0,
+            blocked_limit:None,
+            multipath: false,
+            stream_retrans_bytes: 0,
             // newly_acked: Vec::new(),
         }
     }
@@ -8615,19 +8746,19 @@ impl MulticorePath {
         // Application epoch.
         if (conn.is_established() || conn.is_in_early_data()) &&
             (conn.should_send_handshake_done() ||
-                (conn.almost_full && conn.flow_control.max_data() < conn.flow_control.max_data_next()) ||
+                (self.almost_full && self.flow_control.max_data() < self.flow_control.max_data_next()) ||
                 conn.blocked_limit.is_some() ||
-                conn.dgram_send_queue.has_pending() ||
+                self.dgram_send_queue.has_pending() ||
                 conn.local_error
                     .as_ref()
                     .map_or(false, |conn_err| conn_err.is_app) ||
-                conn.streams.should_update_max_streams_bidi() ||
-                conn.streams.should_update_max_streams_uni() ||
-                conn.streams.has_flushable() ||
-                conn.streams.has_almost_full() ||
-                conn.streams.has_blocked() ||
-                conn.streams.has_reset() ||
-                conn.streams.has_stopped() ||
+                conn.stream_ids.should_update_max_streams_bidi() ||
+                conn.stream_ids.should_update_max_streams_uni() ||
+                self.streams.has_flushable() ||
+                self.streams.has_almost_full() ||
+                self.streams.has_blocked() ||
+                self.streams.has_reset() ||
+                self.streams.has_stopped() ||
                 conn.ids.has_new_scids() ||
                 conn.ids.has_retire_dcids() ||
                 conn.has_path_abandon() ||
@@ -8668,7 +8799,7 @@ impl MulticorePath {
 
         let pkt_type = self.write_pkt_type(conn)?;
 
-        let max_dgram_len = if !conn.dgram_send_queue.is_empty() {
+        let max_dgram_len = if !self.dgram_send_queue.is_empty() {
             self.dgram_max_writable_len(conn)
         } else {
             None
@@ -8676,7 +8807,7 @@ impl MulticorePath {
 
         let epoch = pkt_type.to_epoch()?;
         let multiple_application_data_pkt_num_spaces = conn.use_path_pkt_num_space(epoch);
-        let p = self.get_inner_path_mut().unwrap();
+        let p = self.inner_path.as_mut().unwrap();
         for lost in p.recovery.lost[epoch].drain(..) {
             match lost {
                 frame::Frame::CryptoHeader { offset, length } => {
@@ -8687,7 +8818,7 @@ impl MulticorePath {
                         .send
                         .retransmit(offset, length);
 
-                    conn.stream_retrans_bytes += length as u64;
+                    self.stream_retrans_bytes += length as u64;
                     p.stream_retrans_bytes += length as u64;
 
                     p.retrans_count += 1;
@@ -8699,7 +8830,7 @@ impl MulticorePath {
                     length,
                     fin,
                 } => {
-                    let stream = match conn.streams.get_mut(stream_id) {
+                    let stream = match self.streams.get_mut(stream_id) {
                         Some(v) => v,
 
                         None => continue,
@@ -8721,12 +8852,10 @@ impl MulticorePath {
                     if (stream.is_flushable() || empty_fin) && !was_flushable
                     {
                         let priority_key = Arc::clone(&stream.priority_key);
-                        conn.streams.insert_flushable(&priority_key);
+                        self.streams.insert_flushable(&priority_key);
                     }
 
-                    conn.stream_retrans_bytes += length as u64;
                     p.stream_retrans_bytes += length as u64;
-
                     p.retrans_count += 1;
                 },
 
@@ -8745,8 +8874,8 @@ impl MulticorePath {
                     error_code,
                     final_size,
                 } =>
-                    if conn.streams.get(stream_id).is_some() {
-                        conn.streams
+                    if self.streams.get(stream_id).is_some() {
+                        self.streams
                             .insert_reset(stream_id, error_code, final_size);
                     },
 
@@ -8757,13 +8886,13 @@ impl MulticorePath {
                 },
 
                 frame::Frame::MaxStreamData { stream_id, .. } => {
-                    if conn.streams.get(stream_id).is_some() {
-                        conn.streams.insert_almost_full(stream_id);
+                    if self.streams.get(stream_id).is_some() {
+                        self.streams.insert_almost_full(stream_id);
                     }
                 },
 
                 frame::Frame::MaxData { .. } => {
-                    conn.almost_full = true;
+                    self.almost_full = true;
                 },
 
                 frame::Frame::NewConnectionId { seq_num, .. } => {
@@ -8791,14 +8920,14 @@ impl MulticorePath {
         }
 
         let consider_standby_paths = conn.consider_standby_paths();
-        let is_app_limited = conn.delivery_rate_check_if_app_limited(self);
+        let is_app_limited = self.delivery_rate_check_if_app_limited();
         let n_paths = conn.nb_of_paths();
-        let flow_control = &mut conn.flow_control;
+        let flow_control = &mut self.flow_control;
         let crypto_space = conn.pkt_num_spaces.crypto.get_mut(epoch);
 
         let mut left = b.cap();
 
-        let dcid_seq = self.get_inner_path_mut().unwrap()
+        let dcid_seq = self.inner_path.as_mut().unwrap()
             .active_dcid_seq.ok_or(Error::OutOfIdentifiers)?;
 
         let space_id = if multiple_application_data_pkt_num_spaces {
@@ -8821,7 +8950,7 @@ impl MulticorePath {
         let dcid =
             ConnectionId::from_ref(conn.ids.get_dcid(dcid_seq)?.cid.as_ref());
 
-        let scid = if let Some(scid_seq) = self.get_inner_path_mut().unwrap().active_scid_seq {
+        let scid = if let Some(scid_seq) = self.inner_path.as_mut().unwrap().active_scid_seq {
             ConnectionId::from_ref(conn.ids.get_scid(scid_seq)?.cid.as_ref())
         } else if pkt_type == packet::Type::Short {
             ConnectionId::default()
@@ -8914,7 +9043,7 @@ impl MulticorePath {
 
         // Whether or not we should explicitly elicit an ACK via PING frame if we
         // implicitly elicit one otherwise.
-        let ack_elicit_required = self.get_inner_path_mut().unwrap().recovery.should_elicit_ack(epoch);
+        let ack_elicit_required = self.inner_path.as_mut().unwrap().recovery.should_elicit_ack(epoch);
 
         let header_offset = b.off();
 
@@ -8931,7 +9060,7 @@ impl MulticorePath {
         let payload_offset = b.off();
 
         let cwnd_available =
-        self.get_inner_path_mut().unwrap().recovery.cwnd_available().saturating_sub(overhead);
+        self.inner_path.as_mut().unwrap().recovery.cwnd_available().saturating_sub(overhead);
 
         let left_before_packing_ack_frame = left;
 
@@ -8949,7 +9078,7 @@ impl MulticorePath {
                     conn.local_error
                         .as_ref()
                         .map_or(false, |le| le.is_app))) &&
-            self.get_inner_path_mut().unwrap().active()
+                self.inner_path.as_mut().unwrap().active()
         {
             let ack_delay = pkt_space.largest_rx_pkt_time.elapsed();
 
@@ -8980,13 +9109,13 @@ impl MulticorePath {
         // Create ACK_MP frames if needed.
         if multiple_application_data_pkt_num_spaces &&
             !is_closing &&
-            self.get_inner_path_mut().unwrap().active()
+            self.inner_path.as_mut().unwrap().active()
         {
             // We first check if we should bundle the ACK_MP belonging to our
             // path. We only bundle additional ACK_MP from other paths if we
             // need to send one. This avoids sending ACK_MP frames endlessly.
             let mut wrote_ack_mp = false;
-            if let Some(active_scid_seq) = self.get_inner_path_mut().unwrap().active_scid_seq {
+            if let Some(active_scid_seq) = self.inner_path.as_mut().unwrap().active_scid_seq {
                 let pns =
                     conn.pkt_num_spaces.spaces.get_mut(epoch, active_scid_seq)?;
                 if pns.recv_pkt_need_ack.len() > 0 &&
@@ -9092,7 +9221,7 @@ impl MulticorePath {
         if pkt_type == packet::Type::Short {
             // Create PATH_RESPONSE frame if needed.
             // We do not try to ensure that these are really sent.
-            while let Some(challenge) = self.get_inner_path_mut().unwrap().pop_received_challenge() {
+            while let Some(challenge) = self.inner_path.as_mut().unwrap().pop_received_challenge() {
                 let frame = frame::Frame::PathResponse { data: challenge };
 
                 if push_frame_to_pkt!(b, frames, frame, left) {
@@ -9106,7 +9235,7 @@ impl MulticorePath {
             }
 
             // Create PATH_CHALLENGE frame if needed.
-            if self.get_inner_path_mut().unwrap().validation_requested() {
+            if self.inner_path.as_mut().unwrap().validation_requested() {
                 // TODO: ensure that data is unique over paths.
                 let data = rand::rand_u64().to_be_bytes();
 
@@ -9142,7 +9271,7 @@ impl MulticorePath {
             }
         }
 
-        if pkt_type == packet::Type::Short && !is_closing && self.get_inner_path_mut().unwrap().active() {
+        if pkt_type == packet::Type::Short && !is_closing && self.inner_path.as_mut().unwrap().active() {
             // Create HANDSHAKE_DONE frame.
             // self.should_send_handshake_done() but without the need to borrow
             if conn.handshake_completed &&
@@ -9160,13 +9289,13 @@ impl MulticorePath {
             }
 
             // Create MAX_STREAMS_BIDI frame.
-            if conn.streams.should_update_max_streams_bidi() {
+            if conn.stream_ids.should_update_max_streams_bidi() {
                 let frame = frame::Frame::MaxStreamsBidi {
-                    max: conn.streams.max_streams_bidi_next(),
+                    max: conn.stream_ids.max_streams_bidi_next(),
                 };
 
                 if push_frame_to_pkt!(b, frames, frame, left) {
-                    conn.streams.update_max_streams_bidi();
+                    conn.stream_ids.update_max_streams_bidi();
 
                     ack_eliciting = true;
                     in_flight = true;
@@ -9174,13 +9303,13 @@ impl MulticorePath {
             }
 
             // Create MAX_STREAMS_UNI frame.
-            if conn.streams.should_update_max_streams_uni() {
+            if conn.stream_ids.should_update_max_streams_uni() {
                 let frame = frame::Frame::MaxStreamsUni {
-                    max: conn.streams.max_streams_uni_next(),
+                    max: conn.stream_ids.max_streams_uni_next(),
                 };
 
                 if push_frame_to_pkt!(b, frames, frame, left) {
-                    conn.streams.update_max_streams_uni();
+                    conn.stream_ids.update_max_streams_uni();
 
                     ack_eliciting = true;
                     in_flight = true;
@@ -9200,20 +9329,20 @@ impl MulticorePath {
             }
 
             // Create MAX_STREAM_DATA frames as needed.
-            for stream_id in conn.streams.almost_full() {
-                let stream = match conn.streams.get_mut(stream_id) {
+            for stream_id in self.streams.almost_full() {
+                let stream = match self.streams.get_mut(stream_id) {
                     Some(v) => v,
 
                     None => {
                         // The stream doesn't exist anymore, so remove it from
                         // the almost full set.
-                        conn.streams.remove_almost_full(stream_id);
+                        self.streams.remove_almost_full(stream_id);
                         continue;
                     },
                 };
 
                 // Autotune the stream window size.
-                stream.recv.autotune_window(now, self.get_inner_path_mut().unwrap().recovery.rtt());
+                stream.recv.autotune_window(now, self.inner_path.as_mut().unwrap().recovery.rtt());
 
                 let frame = frame::Frame::MaxStreamData {
                     stream_id,
@@ -9225,7 +9354,7 @@ impl MulticorePath {
 
                     stream.recv.update_max_data(now);
 
-                    conn.streams.remove_almost_full(stream_id);
+                    self.streams.remove_almost_full(stream_id);
 
                     ack_eliciting = true;
                     in_flight = true;
@@ -9238,23 +9367,23 @@ impl MulticorePath {
 
                     // Also send MAX_DATA when MAX_STREAM_DATA is sent, to avoid a
                     // potential race condition.
-                    conn.almost_full = true;
+                    self.almost_full = true;
                 }
             }
 
             // Create MAX_DATA frame as needed.
-            if conn.almost_full &&
+            if self.almost_full &&
                 flow_control.max_data() < flow_control.max_data_next()
             {
                 // Autotune the connection window size.
-                flow_control.autotune_window(now, self.get_inner_path_mut().unwrap().recovery.rtt());
+                flow_control.autotune_window(now, self.inner_path.as_mut().unwrap().recovery.rtt());
 
                 let frame = frame::Frame::MaxData {
                     max: flow_control.max_data_next(),
                 };
 
                 if push_frame_to_pkt!(b, frames, frame, left) {
-                    conn.almost_full = false;
+                    self.almost_full = false;
 
                     // Commits the new max_rx_data limit.
                     flow_control.update_max_data(now);
@@ -9265,7 +9394,7 @@ impl MulticorePath {
             }
 
             // Create STOP_SENDING frames as needed.
-            for (stream_id, error_code) in conn
+            for (stream_id, error_code) in self
                 .streams
                 .stopped()
                 .map(|(&k, &v)| (k, v))
@@ -9277,7 +9406,7 @@ impl MulticorePath {
                 };
 
                 if push_frame_to_pkt!(b, frames, frame, left) {
-                    conn.streams.remove_stopped(stream_id);
+                    self.streams.remove_stopped(stream_id);
 
                     ack_eliciting = true;
                     in_flight = true;
@@ -9285,7 +9414,7 @@ impl MulticorePath {
             }
 
             // Create RESET_STREAM frames as needed.
-            for (stream_id, (error_code, final_size)) in conn
+            for (stream_id, (error_code, final_size)) in self
                 .streams
                 .reset()
                 .map(|(&k, &v)| (k, v))
@@ -9298,7 +9427,7 @@ impl MulticorePath {
                 };
 
                 if push_frame_to_pkt!(b, frames, frame, left) {
-                    conn.streams.remove_reset(stream_id);
+                    self.streams.remove_reset(stream_id);
 
                     ack_eliciting = true;
                     in_flight = true;
@@ -9306,7 +9435,7 @@ impl MulticorePath {
             }
 
             // Create STREAM_DATA_BLOCKED frames as needed.
-            for (stream_id, limit) in conn
+            for (stream_id, limit) in self
                 .streams
                 .blocked()
                 .map(|(&k, &v)| (k, v))
@@ -9315,7 +9444,7 @@ impl MulticorePath {
                 let frame = frame::Frame::StreamDataBlocked { stream_id, limit };
 
                 if push_frame_to_pkt!(b, frames, frame, left) {
-                    conn.streams.remove_blocked(stream_id);
+                    self.streams.remove_blocked(stream_id);
 
                     ack_eliciting = true;
                     in_flight = true;
@@ -9400,9 +9529,9 @@ impl MulticorePath {
             }
         }
 
-        let path = self.get_inner_path_mut().unwrap();
+        let path = self.inner_path.as_mut().unwrap();
 
-         // Create CONNECTION_CLOSE frame. Try to send this only on the active
+        // Create CONNECTION_CLOSE frame. Try to send this only on the active
         // path, unless it is the last one available.
         if path.active() || n_paths == 1 {
             if let Some(conn_err) = conn.local_error.as_ref() {
@@ -9518,7 +9647,7 @@ impl MulticorePath {
         // to the other type in order not to waste this function call.
         let mut dgram_emitted = false;
         let dgrams_to_emit = max_dgram_len.is_some();
-        let stream_to_emit = conn.streams.has_flushable();
+        let stream_to_emit = self.streams.has_flushable();
 
         let mut do_dgram = conn.emit_dgram && dgrams_to_emit;
         let do_stream = !conn.emit_dgram && stream_to_emit;
@@ -9535,14 +9664,14 @@ impl MulticorePath {
             do_dgram
         {
             if let Some(max_dgram_payload) = max_dgram_len {
-                while let Some(len) = conn.dgram_send_queue.peek_front_len() {
+                while let Some(len) = self.dgram_send_queue.peek_front_len() {
                     let hdr_off = b.off();
                     let hdr_len = 1 + // frame type
                         2; // length, always encode as 2-byte varint
 
                     if (hdr_len + len) <= left {
                         // Front of the queue fits this packet, send it.
-                        match conn.dgram_send_queue.pop() {
+                        match self.dgram_send_queue.pop() {
                             Some(data) => {
                                 // Encode the frame.
                                 //
@@ -9597,7 +9726,7 @@ impl MulticorePath {
                         };
                     } else if len > max_dgram_payload {
                         // This dgram frame will never fit. Let's purge it.
-                        conn.dgram_send_queue.pop();
+                        self.dgram_send_queue.pop();
                     } else {
                         break;
                     }
@@ -9613,16 +9742,16 @@ impl MulticorePath {
             !dgram_emitted &&
             (consider_standby_paths || !path.is_standby())
         {
-            while let Some(priority_key) = conn.streams.peek_flushable() {
+            while let Some(priority_key) = self.streams.peek_flushable() {
                 let stream_id = priority_key.id;
-                let stream = match conn.streams.get_mut(stream_id) {
+                let stream = match self.streams.get_mut(stream_id) {
                     // Avoid sending frames for streams that were already stopped.
                     //
                     // This might happen if stream data was buffered but not yet
                     // flushed on the wire when a STOP_SENDING frame is received.
                     Some(v) if !v.send.is_stopped() => v,
                     _ => {
-                        conn.streams.remove_flushable(&priority_key);
+                        self.streams.remove_flushable(&priority_key);
                         continue;
                     },
                 };
@@ -9652,7 +9781,7 @@ impl MulticorePath {
                     Some(v) => v,
                     None => {
                         let priority_key = Arc::clone(&stream.priority_key);
-                        conn.streams.remove_flushable(&priority_key);
+                        self.streams.remove_flushable(&priority_key);
 
                         continue;
                     },
@@ -9700,12 +9829,12 @@ impl MulticorePath {
                 let priority_key = Arc::clone(&stream.priority_key);
                 // If the stream is no longer flushable, remove it from the queue
                 if !stream.is_flushable() {
-                    conn.streams.remove_flushable(&priority_key);
+                    self.streams.remove_flushable(&priority_key);
                 } else if stream.incremental {
                     // Shuffle the incremental stream to the back of the the
                     // queue.
-                    conn.streams.remove_flushable(&priority_key);
-                    conn.streams.insert_flushable(&priority_key);
+                    self.streams.remove_flushable(&priority_key);
+                    self.streams.insert_flushable(&priority_key);
                 }
 
                 break;
@@ -9921,7 +10050,7 @@ impl MulticorePath {
         path.sent_count += 1;
         path.sent_bytes += written as u64;
 
-        if conn.dgram_send_queue.byte_size() > path.recovery.cwnd_available() {
+        if self.dgram_send_queue.byte_size() > path.recovery.cwnd_available() {
             path.recovery.update_app_limited(false);
         }
 
@@ -10065,7 +10194,7 @@ impl MulticorePath {
         }
 
         if done == 0 {
-            conn.last_tx_data = conn.tx_data;
+            self.last_tx_data = self.tx_data;
             return Err(Error::Done);
         }
 
@@ -10094,6 +10223,36 @@ impl MulticorePath {
         };
 
         Ok((done, info))
+    }
+
+    /// Returns the total size of all items in the DATAGRAM send queue.
+    #[inline]
+    pub fn dgram_send_queue_byte_size(&self) -> usize {
+        self.dgram_send_queue.byte_size()
+    }
+
+    fn delivery_rate_check_if_app_limited(&self) -> bool {
+        // Enter the app-limited phase of delivery rate when these conditions
+        // are met:
+        //
+        // - The remaining capacity is higher than available bytes in cwnd (there
+        //   is more room to send).
+        // - New data since the last send() is smaller than available bytes in
+        //   cwnd (we queued less than what we can send).
+        // - There is room to send more data in cwnd.
+        //
+        // In application-limited phases the transmission rate is limited by the
+        // application rather than the congestion control algorithm.
+        //
+        // Note that this is equivalent to CheckIfApplicationLimited() from the
+        // delivery rate draft. This is also separate from `recovery.app_limited`
+        // and only applies to delivery rate calculation.
+        let cwin_available = self.get_inner_path().unwrap().recovery.cwnd_available();
+
+        ((self.tx_buffered + self.dgram_send_queue_byte_size()) < cwin_available) &&
+            (self.tx_data.saturating_sub(self.last_tx_data)) <
+                cwin_available as u64 &&
+            cwin_available > 0
     }
 
     fn process_frame(
@@ -10130,7 +10289,7 @@ impl MulticorePath {
                         conn.ids.get_scid(0).ok().and_then(|e| e.path_id)
                     {
                         let is_app_limited =
-                            conn.delivery_rate_check_if_app_limited(self);
+                            self.delivery_rate_check_if_app_limited();
                         let p = self.get_inner_path_mut().unwrap();
                         if is_app_limited {
                             p.recovery.delivery_rate_update_app_limited(true);
@@ -10153,7 +10312,7 @@ impl MulticorePath {
                     for pid in pids {
                         if pid == recv_path_id {
                             let is_app_limited =
-                                conn.delivery_rate_check_if_app_limited(self);
+                                self.delivery_rate_check_if_app_limited();
                             let p = self.get_inner_path_mut().unwrap();
                             if is_app_limited {
                                 p.recovery.delivery_rate_update_app_limited(true);
@@ -10198,7 +10357,7 @@ impl MulticorePath {
                     return Err(Error::InvalidStreamState(stream_id));
                 }
 
-                let max_rx_data_left = conn.max_rx_data() - conn.rx_data;
+                let max_rx_data_left = self.max_rx_data() - self.rx_data;
 
                 // Get existing stream or create a new one, but if the stream
                 // has already been closed and collected, ignore the frame.
@@ -10210,7 +10369,7 @@ impl MulticorePath {
                 // Note that it makes it impossible to check if the frame is
                 // illegal, since we have no state, but since we ignore the
                 // frame, it should be fine.
-                let stream = match conn.get_or_create_stream(stream_id, false) {
+                let stream = match self.get_or_create_stream(conn, stream_id, false) {
                     Ok(v) => v,
 
                     Err(Error::Done) => return Ok(()),
@@ -10229,10 +10388,10 @@ impl MulticorePath {
                 }
 
                 if !was_readable && stream.is_readable() {
-                    conn.streams.insert_readable(&priority_key);
+                    self.streams.insert_readable(&priority_key);
                 }
 
-                conn.rx_data += max_off_delta;
+                self.rx_data += max_off_delta;
             },
 
             frame::Frame::StopSending {
@@ -10256,7 +10415,7 @@ impl MulticorePath {
                 // Note that it makes it impossible to check if the frame is
                 // illegal, since we have no state, but since we ignore the
                 // frame, it should be fine.
-                let stream = match conn.get_or_create_stream(stream_id, false) {
+                let stream = match self.get_or_create_stream(conn, stream_id, false) {
                     Ok(v) => v,
 
                     Err(Error::Done) => return Ok(()),
@@ -10276,15 +10435,15 @@ impl MulticorePath {
                     //
                     // Note that `tx_cap` will be updated later on, so no need
                     // to touch it here.
-                    conn.tx_data = conn.tx_data.saturating_sub(unsent);
+                    self.tx_data = self.tx_data.saturating_sub(unsent);
 
-                    conn.tx_buffered =
-                        conn.tx_buffered.saturating_sub(unsent as usize);
+                    self.tx_buffered =
+                        self.tx_buffered.saturating_sub(unsent as usize);
 
-                    conn.streams.insert_reset(stream_id, error_code, final_size);
+                    self.streams.insert_reset(stream_id, error_code, final_size);
 
                     if !was_writable {
-                        conn.streams.insert_writable(&priority_key);
+                        self.streams.insert_writable(&priority_key);
                     }
                 }
             },
@@ -10328,7 +10487,7 @@ impl MulticorePath {
                     return Err(Error::InvalidStreamState(stream_id));
                 }
 
-                let max_rx_data_left = conn.max_rx_data() - conn.rx_data;
+                let max_rx_data_left = self.max_rx_data() - self.rx_data;
 
                 // Get existing stream or create a new one, but if the stream
                 // has already been closed and collected, ignore the frame.
@@ -10340,7 +10499,7 @@ impl MulticorePath {
                 // Note that it makes it impossible to check if the frame is
                 // illegal, since we have no state, but since we ignore the
                 // frame, it should be fine.
-                let stream = match conn.get_or_create_stream(stream_id, false) {
+                let stream = match self.get_or_create_stream(conn, stream_id, false) {
                     Ok(v) => v,
 
                     Err(Error::Done) => return Ok(()),
@@ -10364,20 +10523,20 @@ impl MulticorePath {
                 stream.recv.write(data)?;
 
                 if !was_readable && stream.is_readable() {
-                    conn.streams.insert_readable(&priority_key);
+                    self.streams.insert_readable(&priority_key);
                 }
 
-                conn.rx_data += max_off_delta;
+                self.rx_data += max_off_delta;
 
                 if was_draining {
                     // When a stream is in draining state it will not queue
                     // incoming data for the application to read, so consider
                     // the received data as consumed, which might trigger a flow
                     // control update.
-                    conn.flow_control.add_consumed(max_off_delta);
+                    self.flow_control.add_consumed(max_off_delta);
 
-                    if conn.should_update_max_data() {
-                        conn.almost_full = true;
+                    if self.should_update_max_data() {
+                        self.almost_full = true;
                     }
                 }
             },
@@ -10385,7 +10544,7 @@ impl MulticorePath {
             frame::Frame::StreamHeader { .. } => unreachable!(),
 
             frame::Frame::MaxData { max } => {
-                conn.max_tx_data = cmp::max(conn.max_tx_data, max);
+                self.max_tx_data = cmp::max(self.max_tx_data, max);
             },
 
             frame::Frame::MaxStreamData { stream_id, max } => {
@@ -10406,7 +10565,7 @@ impl MulticorePath {
                 // Note that it makes it impossible to check if the frame is
                 // illegal, since we have no state, but since we ignore the
                 // frame, it should be fine.
-                let stream = match conn.get_or_create_stream(stream_id, false) {
+                let stream = match self.get_or_create_stream(conn, stream_id, false) {
                     Ok(v) => v,
 
                     Err(Error::Done) => return Ok(()),
@@ -10426,11 +10585,11 @@ impl MulticorePath {
                 // but only if it wasn't already queued.
                 if stream.is_flushable() && !was_flushable {
                     let priority_key = Arc::clone(&stream.priority_key);
-                    conn.streams.insert_flushable(&priority_key);
+                    self.streams.insert_flushable(&priority_key);
                 }
 
                 if writable {
-                    conn.streams.insert_writable(&priority_key);
+                    self.streams.insert_writable(&priority_key);
                 }
             },
 
@@ -10439,7 +10598,7 @@ impl MulticorePath {
                     return Err(Error::InvalidFrame);
                 }
 
-                conn.streams.update_peer_max_streams_bidi(max);
+                conn.stream_ids.update_peer_max_streams_bidi(max);
             },
 
             frame::Frame::MaxStreamsUni { max } => {
@@ -10447,7 +10606,7 @@ impl MulticorePath {
                     return Err(Error::InvalidFrame);
                 }
 
-                conn.streams.update_peer_max_streams_uni(max);
+                conn.stream_ids.update_peer_max_streams_uni(max);
             },
 
             frame::Frame::DataBlocked { .. } => (),
@@ -10557,11 +10716,11 @@ impl MulticorePath {
                 }
 
                 // If recv queue is full, discard oldest
-                if conn.dgram_recv_queue.is_full() {
-                    conn.dgram_recv_queue.pop();
+                if self.dgram_recv_queue.is_full() {
+                    self.dgram_recv_queue.pop();
                 }
 
-                conn.dgram_recv_queue.push(data)?;
+                self.dgram_recv_queue.push(data)?;
             },
 
             frame::Frame::DatagramHeader { .. } => unreachable!(),
@@ -10608,7 +10767,7 @@ impl MulticorePath {
                 if let Ok(e) = conn.ids.get_dcid(space_identifier) {
                     if let Some(path_id) = e.path_id {
                         if path_id == self.path_id.unwrap(){
-                            let is_app_limited = conn.delivery_rate_check_if_app_limited(self);
+                            let is_app_limited = self.delivery_rate_check_if_app_limited();
                             let p = self.get_inner_path_mut().unwrap();
                             if is_app_limited {
                                 p.recovery.delivery_rate_update_app_limited(true);
@@ -10625,8 +10784,18 @@ impl MulticorePath {
                             )?;
                         } else {
                             // TODO multipath 
-                            info!("There packet space id that's no longer valid");
-                            return Err(Error::MulticoreNotDone);
+                            conn.per_path_unprocessed_events.get_mut(&path_id).unwrap().push_back(
+                                MulticorePathPendingEvent::PacketOnACKReceived(
+                                    path_id,
+                                    0,
+                                    ranges.clone(), 
+                                    ack_delay,
+                                    epoch, 
+                                    handshake_status,
+                                    now, 
+                                    conn.trace_id.clone(), 
+                                )
+                            );
                         }
                     }
                 }
@@ -10708,7 +10877,7 @@ impl MulticorePath {
 
     fn recv_single(
         &mut self,
-        conn: &mut MulticoreConnection, 
+        conn_guard: &Arc<RwLock<MulticoreConnection>>, 
         buf: &mut [u8], 
         info: &RecvInfo, 
     ) -> Result<usize>{
@@ -10718,11 +10887,28 @@ impl MulticorePath {
             return Err(Error::Done);
         }
 
-        if conn.is_closed() || conn.is_draining() {
-            return Err(Error::Done);
-        }
+        let recv_count;
+        let is_closing;
+        let trace_id;
+        let source_id_len;
+        let did_version_negotiation;
+        let version;
+        let derived_initial_secrets;
 
-        let is_closing = conn.local_error.is_some();
+        {
+            let conn = conn_guard.read().unwrap();
+            if conn.is_closed() || conn.is_draining() {
+                return Err(Error::Done);
+            }
+
+            is_closing = conn.local_error.is_some();
+            recv_count = conn.recv_count();
+            trace_id = conn.trace_id.clone(); 
+            source_id_len = conn.source_id().len();
+            did_version_negotiation = conn.did_version_negotiation;
+            version = conn.version;
+            derived_initial_secrets = conn.derived_initial_secrets;
+        }
 
         if is_closing {
             return Err(Error::Done);
@@ -10732,18 +10918,18 @@ impl MulticorePath {
 
         let mut b = octets::OctetsMut::with_slice(buf);
 
-        let mut hdr = Header::from_bytes(&mut b, conn.source_id().len())
+        let mut hdr = Header::from_bytes(&mut b, source_id_len)
             .map_err(|e| {
-                info!("Can't decrypt header");
                 drop_pkt_on_err(
                     e,
-                    conn.recv_count(),
+                    recv_count,
                     self.is_server,
-                    &conn.trace_id,
+                    &trace_id,
                 )
             })?;
 
         if hdr.ty == packet::Type::VersionNegotiation {
+            let mut conn = conn_guard.write().unwrap();
             // Version negotiation packets can only be sent by the server.
             if self.is_server {
                 return Err(Error::Done);
@@ -10831,7 +11017,7 @@ impl MulticorePath {
                 .crypto_seal = Some(aead_seal);
 
             conn.handshake
-                .use_legacy_codepoint(conn.version != PROTOCOL_VERSION_V1);
+                .use_legacy_codepoint(version != PROTOCOL_VERSION_V1);
 
             // Encode transport parameters again, as the new version might be
             // using a different format.
@@ -10841,6 +11027,7 @@ impl MulticorePath {
         }
 
         if hdr.ty == packet::Type::Retry {
+            let mut conn = conn_guard.write().unwrap();
             // Retry packets can only be sent by the server.
             if self.is_server {
                 return Err(Error::Done);
@@ -10903,7 +11090,8 @@ impl MulticorePath {
             return Err(Error::Done);
         }
 
-        if self.is_server && !conn.did_version_negotiation {
+        if self.is_server && !did_version_negotiation {
+            let mut conn = conn_guard.write().unwrap();
             if !version_is_supported(hdr.version) {
                 return Err(Error::UnknownVersion);
             }
@@ -10912,14 +11100,14 @@ impl MulticorePath {
             conn.did_version_negotiation = true;
 
             conn.handshake
-                .use_legacy_codepoint(conn.version != PROTOCOL_VERSION_V1);
+                .use_legacy_codepoint(version != PROTOCOL_VERSION_V1);
 
             // Encode transport parameters again, as the new version might be
             // using a different format.
             conn.encode_transport_params()?;
         }
 
-        if hdr.ty != packet::Type::Short && hdr.version != conn.version {
+        if hdr.ty != packet::Type::Short && hdr.version != version {
             // At this point version negotiation was already performed, so
             // ignore packets that don't match the connection's version.
             return Err(Error::Done);
@@ -10934,9 +11122,9 @@ impl MulticorePath {
                 info!("Can't get payload len");
                 drop_pkt_on_err(
                     e.into(),
-                    conn.recv_count(),
+                    recv_count,
                     self.is_server,
-                    &conn.trace_id,
+                    &trace_id,
                 )
             })? as usize
         };
@@ -10948,20 +11136,20 @@ impl MulticorePath {
 
             return Err(drop_pkt_on_err(
                 Error::InvalidPacket,
-                conn.recv_count(),
+                recv_count,
                 self.is_server,
-                &conn.trace_id,
+                &trace_id,
             ));
         }
 
         // Derive initial secrets on the server.
-        if !conn.derived_initial_secrets {
+        if !derived_initial_secrets {
+            let mut conn = conn_guard.write().unwrap();
             let (aead_open, aead_seal) = crypto::derive_initial_key_material(
                 &hdr.dcid,
                 conn.version,
                 self.is_server,
             )?;
-
 
             conn.pkt_num_spaces
                 .crypto
@@ -10978,14 +11166,12 @@ impl MulticorePath {
         // Select packet number space epoch based on the received packet's type.
         let epoch = hdr.ty.to_epoch()?;
 
+        // TODO this is here due to the aead outliving the connection. Copy pkt_num_spaces to path
+        let mut conn = conn_guard.write().unwrap();
         // Select AEAD context used to open incoming packet.
         let aead = if hdr.ty == packet::Type::ZeroRTT {
-            // Only use 0-RTT key if incoming packet is 0-RTT.
-            conn.pkt_num_spaces
-                .crypto
-                .get(epoch)
-                .crypto_0rtt_open
-                .as_ref()
+            return Err(Error::MulticoreNotDone);
+            // Not supported yet for multicore
         } else {
             // Otherwise use the packet number space's main key.
             conn.pkt_num_spaces.crypto.get(epoch).crypto_open.as_ref()
@@ -11012,8 +11198,6 @@ impl MulticorePath {
                     return Ok(pkt_len);
                 }
 
-                info!("No useable keys");
-
                 let e = drop_pkt_on_err(
                     Error::CryptoFail,
                     conn.recv_count(),
@@ -11028,7 +11212,6 @@ impl MulticorePath {
         let aead_tag_len = aead.alg().tag_len();
 
         packet::decrypt_hdr(&mut b, &mut hdr, aead).map_err(|e| {
-            info!("Can't decrypt header");
             drop_pkt_on_err(e, conn.recv_count(), self.is_server, &conn.trace_id)
         })?;
 
@@ -11129,7 +11312,6 @@ impl MulticorePath {
             aead,
         )
         .map_err(|e| {
-            info!("Can't decrypt payload");
             drop_pkt_on_err(e, conn.recv_count(), self.is_server, &conn.trace_id)
         })?;
 
@@ -11239,9 +11421,10 @@ impl MulticorePath {
 
             // Replace the randomly generated destination connection ID with
             // the one supplied by the server.
+            let stateless_reset_token = conn.peer_transport_params.stateless_reset_token;
             conn.set_initial_dcid(
                 hdr.scid.clone(),
-                conn.peer_transport_params.stateless_reset_token,
+                stateless_reset_token,
                 self,
             )?;
 
@@ -11291,7 +11474,7 @@ impl MulticorePath {
                 probing = false;
             }
 
-            if let Err(e) = self.process_frame(conn, frame, &hdr, recv_pid, epoch, now)
+            if let Err(e) = self.process_frame(&mut conn, frame, &hdr, recv_pid, epoch, now)
             {
                 frame_processing_err = Some(e);
                 break;
@@ -11346,24 +11529,12 @@ impl MulticorePath {
         // Only log the remote transport parameters once the connection is
         // established (i.e. after frames have been fully parsed) and only
         // once per connection.
-        if conn.is_established() {
-            qlog_with_type!(QLOG_PARAMS_SET, conn.qlog, q, {
-                if !conn.qlog.logged_peer_params {
-                    let ev_data = conn
-                        .peer_transport_params
-                        .to_qlog(TransportOwner::Remote, conn.handshake.cipher());
-
-                    q.add_event_data_with_instant(ev_data, now).ok();
-
-                    conn.qlog.logged_peer_params = true;
-                }
-            });
-        }
+        // TODO mutlicore support for qlog params
 
         // Process acked frames. Note that several packets from several paths
         // might have been acked by the received packet.
         let path_id = self.path_id.clone();
-        let p = self.get_inner_path_mut().unwrap();
+        let p = self.inner_path.as_mut().unwrap();
 
         for acked in p.recovery.acked[epoch].drain(..) {
             match acked {
@@ -11398,7 +11569,7 @@ impl MulticorePath {
                     length,
                     ..
                 } => {
-                    let stream = match conn.streams.get_mut(stream_id) {
+                    let stream = match self.streams.get_mut(stream_id) {
                         Some(v) => v,
 
                         None => continue,
@@ -11406,8 +11577,8 @@ impl MulticorePath {
 
                     stream.send.ack_and_drop(offset, length);
 
-                    conn.tx_buffered =
-                        conn.tx_buffered.saturating_sub(length);
+                    self.tx_buffered =
+                        self.tx_buffered.saturating_sub(length);
 
                     qlog_with_type!(QLOG_DATA_MV, conn.qlog, q, {
                         let ev_data = EventData::DataMoved(
@@ -11429,7 +11600,7 @@ impl MulticorePath {
                     // stream_recv() is used.
                     if stream.is_complete() && !stream.is_readable() {
                         let local = stream.local;
-                        conn.streams.collect(stream_id, local);
+                        conn.stream_ids.collect(&mut self.streams, stream_id, local);
                     }
                 },
 
@@ -11442,7 +11613,7 @@ impl MulticorePath {
                 },
 
                 frame::Frame::ResetStream { stream_id, .. } => {
-                    let stream = match conn.streams.get_mut(stream_id) {
+                    let stream = match self.streams.get_mut(stream_id) {
                         Some(v) => v,
 
                         None => continue,
@@ -11453,7 +11624,7 @@ impl MulticorePath {
                     // stream_recv() is used.
                     if stream.is_complete() && !stream.is_readable() {
                         let local = stream.local;
-                        conn.streams.collect(stream_id, local);
+                        conn.stream_ids.collect(&mut self.streams, stream_id, local);
                     }
                 },
 
@@ -11488,15 +11659,10 @@ impl MulticorePath {
             }
         }
 
-        for dcid_seq in conn.dcid_seq_to_abandon.drain(..) {
-            // The path might be already abandoned.
-            if let Ok(e) = conn.ids.get_dcid(dcid_seq) {
-                if let Some(_) = e.path_id {
-                    // TODO multicore
-                    info!("Handle path abandon on draining");
-                    return Err(Error::MulticoreNotDone);
-                }
-            }
+        if conn.dcid_seq_to_abandon.len() > 0 {
+            // TODO multicore
+            error!("Handle path abandon on draining");
+            return Err(Error::MulticoreNotDone);
         }
 
         // Now that we processed all the frames, if there is a path that has no
@@ -11514,6 +11680,7 @@ impl MulticorePath {
         }
 
         let multipath_enabled = conn.is_multipath_enabled();
+        let active_path_id = conn.lowest_active_path_id;
         let pkt_num_space = conn.pkt_num_spaces.spaces.get_mut(epoch, space_id)?;
 
         // We only record the time of arrival of the largest packet number
@@ -11538,7 +11705,6 @@ impl MulticorePath {
 
             // Did the peer migrate to another path? This only applies when
             // multipath extensions have not been negotiated.
-            let active_path_id = conn.lowest_active_path_id;
 
             if self.is_server &&
                 !multipath_enabled &&
@@ -11556,7 +11722,7 @@ impl MulticorePath {
         }
 
         // Update send capacity.
-        conn.update_tx_cap();
+        self.update_tx_cap();
 
         self.get_inner_path_mut().unwrap().recv_count += 1;
 
@@ -11598,7 +11764,7 @@ impl MulticorePath {
         info: RecvInfo
     ) -> Result<usize> {
         let len = buf.len();
-
+        
         if len == 0 {
             return Err(Error::BufferTooShort);
         }
@@ -11635,30 +11801,29 @@ impl MulticorePath {
         let mut done = 0;
         let mut left = len;
 
-        let mut conn = conn_guard.write().unwrap();
-
         while left > 0 {
             let read = match self.recv_single(
-                &mut conn,
+                conn_guard,
                 &mut buf[len - left..len],
                 &info,
             ) {
                 Ok(v) => v,
-
+                
                 Err(Error::Done) => {
+                    let mut conn = conn_guard.write().unwrap();
                     // If the packet can't be processed or decrypted, check if
                     // it's a stateless reset.
-                    info!("Recv_single return Done");
+                    info!("recv_single return Done");
                     if conn.is_stateless_reset(&buf[len - left..len]) {
                         trace!("{} packet is a stateless reset", conn.trace_id);
-
                         conn.closed = true;
                     }
-
                     left
                 },
 
                 Err(e) => {
+                    let mut conn = conn_guard.write().unwrap();
+
                     // In case of error processing the incoming packet, close
                     // the connection.
                     conn.close(false, e.to_wire(), b"").ok();
@@ -11666,13 +11831,59 @@ impl MulticorePath {
                 },
             };
 
-            info!("Recv_single read: {}", read);
+            info!("recv_single read: {}", read);
 
             done += read;
             left -= read;
         }
 
+        if !self.completed_handshake{
+            let conn = conn_guard.read().unwrap();
+            if conn.handshake_completed && 
+               conn.handshake_confirmed && 
+               conn.peer_verified_initial_address && 
+               self.get_inner_path().unwrap().validated()
+            {
+                self.completed_handshake = true;
+            }
+        }
+
+        
+
         Ok(done)
+    }
+
+    fn handle_pending_multicore_events(
+        &mut self
+    ) -> Result<()> {
+        if self.inner_path.is_none(){
+            return Ok(());
+        }
+        let p = self.inner_path.as_mut().unwrap();
+        for ev in self.multicore_events.iter(){
+            match ev {
+                MulticorePathPendingEvent::PacketOnACKReceived(
+                    _, space_id, ranges, ack_delay, epoch, handshake_status, now, trace_id
+                ) => {
+                    p.recovery.on_ack_received(
+                        *space_id,
+                        ranges,
+                        *ack_delay,
+                        *epoch,
+                        *handshake_status,
+                        *now,
+                        &trace_id,
+                        &mut Vec::new(),
+                    )?;
+                }, 
+                MulticorePathPendingEvent::PktNumSpaceDiscarded(
+                    epoch, handshake_status, now
+                ) => {
+                    p.recovery.on_pkt_num_space_discarded(*epoch, *handshake_status, *now)
+                }
+            }
+        };
+        Ok(())
     }
 
     /// Requests the stack to perform path validation of the proposed 4-tuple.
@@ -11695,10 +11906,316 @@ impl MulticorePath {
         path.active_dcid_seq.ok_or(Error::InvalidState)
     }
 
+    /// Request the usage of the provided 4-tuple to send non-probing packets.
+    pub fn set_active(
+        &mut self, 
+        active: bool
+    ) -> Result<()> {
+        if !self.multipath {
+            return Err(Error::InvalidState);
+        }
+        let request = if active {
+            path::PathRequest::Active
+        } else {
+            path::PathRequest::Unused
+        };
+
+        let requested_state = request.requested_state();
+        let path = self.inner_path.as_mut().unwrap();
+        path.set_state(requested_state)?;
+        if path.is_closing(){
+            return Err(Error::MulticoreNotDone);
+        }
+
+        // After any path state change, check for the transmission rate.
+        self.update_tx_cap();
+        Ok(())
+    }
+
     /// Pops the next path event
     pub fn path_event_next(&mut self) -> Option<path::PathEvent> {
         self.events.pop_front()
     }
+
+    /// Returns the mutable stream with the given ID if it exists, or creates
+    /// a new one otherwise.
+    fn get_or_create_stream(
+        &mut self, 
+        conn: &mut MulticoreConnection,
+        id: u64, local: bool,
+    ) -> Result<&mut stream::Stream> {
+        let has_stream = !self.streams.get(id).is_none();
+        match has_stream {
+            true => Ok(self.streams.get_mut(id).unwrap()), 
+            false => {
+                conn.stream_ids.create_stream(
+                    &mut self.streams,
+                    id,
+                    &self.local_transport_params,
+                    &self.peer_transport_params,
+                    local,
+                    self.is_server,
+                )?;
+                Ok(self.streams.get_mut(id).unwrap())
+            }
+        }
+    }
+
+    /// Returns the connection level flow control limit.
+    fn max_rx_data(&self) -> u64 {
+        self.flow_control.max_data()
+    }
+
+    /// Returns true if the connection-level flow control needs to be updated.
+    ///
+    /// This happens when the new max data limit is at least double the amount
+    /// of data that can be received before blocking.
+    fn should_update_max_data(&self) -> bool {
+        self.flow_control.should_update_max_data()
+    }
+
+    /// Updates send capacity.
+    fn update_tx_cap(&mut self) {
+        let cwin_available = self
+            .inner_path
+            .as_mut()
+            .unwrap()
+            .stats()
+            .cwnd_available;
+        let cwin_available = if cwin_available != std::usize::MAX { cwin_available } else { 0 };
+        self.tx_cap = cmp::min(
+            cwin_available,
+            (self.max_tx_data - self.tx_data)
+                .try_into()
+                .unwrap_or(usize::MAX),
+        );
+    }
+
+    /// Writes data to a stream
+    pub fn stream_send(
+        &mut self, conn_guard: &Arc<RwLock<MulticoreConnection>>,
+        stream_id: u64, buf: &[u8], fin: bool,
+    ) -> Result<usize> {
+        // We can't write on the peer's unidirectional streams.
+        if !stream::is_bidi(stream_id) &&
+            !stream::is_local(stream_id, self.is_server)
+        {
+            return Err(Error::InvalidStreamState(stream_id));
+        }
+
+        // Mark the connection as blocked if the connection-level flow control
+        // limit doesn't let us buffer all the data.
+        //
+        // Note that this is separate from "send capacity" as that also takes
+        // congestion control into consideration.
+        if self.max_tx_data - self.tx_data < buf.len() as u64 {
+            self.blocked_limit = Some(self.max_tx_data);
+        }
+
+        let cap = self.tx_cap;
+
+        // Get existing stream or create a new one.
+        let mut conn = conn_guard.write().unwrap();
+        let stream = self.get_or_create_stream(&mut conn, stream_id, true)?;
+
+        let was_writable = stream.is_writable();
+
+        let was_flushable = stream.is_flushable();
+
+        let priority_key = Arc::clone(&stream.priority_key);
+
+        // Truncate the input buffer based on the connection's send capacity if
+        // necessary.
+        //
+        // When the cap is zero, the method returns Ok(0) *only* when the passed
+        // buffer is empty. We return Error::Done otherwise.
+        if cap == 0 && !buf.is_empty() {
+            if was_writable {
+                // When `stream_writable_next()` returns a stream, the writable
+                // mark is removed, but because the stream is blocked by the
+                // connection-level send capacity it won't be marked as writable
+                // again once the capacity increases.
+                //
+                // Since the stream is writable already, mark it here instead.
+                self.streams.insert_writable(&priority_key);
+            }
+
+            return Err(Error::Done);
+        }
+
+        let (buf, fin, blocked_by_cap) = if cap < buf.len() {
+            (&buf[..cap], false, true)
+        } else {
+            (buf, fin, false)
+        };
+
+        let sent = match stream.send.write(buf, fin) {
+            Ok(v) => v,
+
+            Err(e) => {
+                self.streams.remove_writable(&priority_key);
+                return Err(e);
+            },
+        };
+
+        let incremental = stream.incremental;
+        let priority_key = Arc::clone(&stream.priority_key);
+
+        let flushable = stream.is_flushable();
+
+        let writable = stream.is_writable();
+
+        let empty_fin = buf.is_empty() && fin;
+
+        if sent < buf.len() {
+            let max_off = stream.send.max_off();
+
+            if stream.send.blocked_at() != Some(max_off) {
+                stream.send.update_blocked_at(Some(max_off));
+                self.streams.insert_blocked(stream_id, max_off);
+            }
+        } else {
+            stream.send.update_blocked_at(None);
+            self.streams.remove_blocked(stream_id);
+        }
+
+        // If the stream is now flushable push it to the flushable queue, but
+        // only if it wasn't already queued.
+        //
+        // Consider the stream flushable also when we are sending a zero-length
+        // frame that has the fin flag set.
+        if (flushable || empty_fin) && !was_flushable {
+            self.streams.insert_flushable(&priority_key);
+        }
+
+        if !writable {
+            self.streams.remove_writable(&priority_key);
+        } else if was_writable && blocked_by_cap {
+            // When `stream_writable_next()` returns a stream, the writable
+            // mark is removed, but because the stream is blocked by the
+            // connection-level send capacity it won't be marked as writable
+            // again once the capacity increases.
+            //
+            // Since the stream is writable already, mark it here instead.
+            self.streams.insert_writable(&priority_key);
+        }
+
+        self.tx_cap -= sent;
+        self.tx_data += sent as u64;
+        self.tx_buffered += sent;
+
+        // TODO add qlog
+
+        if sent == 0 && !buf.is_empty() {
+            return Err(Error::Done);
+        }
+
+        if incremental && writable {
+            // Shuffle the incremental stream to the back of the the queue.
+            self.streams.remove_writable(&priority_key);
+            self.streams.insert_writable(&priority_key);
+        }
+
+        Ok(sent)
+    }
+
+    /// Returns true if all the data has been read from the specified stream.
+    #[inline]
+    pub fn stream_finished(&self, 
+        stream_id: u64
+    ) -> bool {
+        let stream = match self.streams.get(stream_id) {
+            Some(v) => v,
+
+            None => return true,
+        };
+
+        stream.recv.is_fin()
+    }
+
+    /// Returns an iterator over streams that have outstanding data to read.
+    #[inline]
+    pub fn readable(&self) -> StreamIter {
+        self.streams.readable()
+    }
+
+    /// Reads contiguous data from a stream into the provided slice.
+    pub fn stream_recv(
+        &mut self, 
+        conn_guard: &Arc<RwLock<MulticoreConnection>>,
+        stream_id: u64, out: &mut [u8],
+    ) -> Result<(usize, bool)> {
+        // We can't read on our own unidirectional streams.
+        if !stream::is_bidi(stream_id) &&
+            stream::is_local(stream_id, self.is_server)
+        {
+            return Err(Error::InvalidStreamState(stream_id));
+        }
+
+        let stream = self
+            .streams
+            .get_mut(stream_id)
+            .ok_or(Error::InvalidStreamState(stream_id))?;
+
+        if !stream.is_readable() {
+            return Err(Error::Done);
+        }
+
+        let local = stream.local;
+        let priority_key = Arc::clone(&stream.priority_key);
+
+        let (read, fin) = match stream.recv.emit(out) {
+            Ok(v) => v,
+
+            Err(e) => {
+                // Collect the stream if it is now complete. This can happen if
+                // we got a `StreamReset` error which will now be propagated to
+                // the application, so we don't need to keep the stream's state
+                // anymore.
+                if stream.is_complete() {
+                    let mut conn = conn_guard.write().unwrap();
+                    conn.stream_ids.collect(&mut self.streams, stream_id, local);
+                }
+
+                self.streams.remove_readable(&priority_key);
+                return Err(e);
+            },
+        };
+
+        self.flow_control.add_consumed(read as u64);
+
+        let readable = stream.is_readable();
+
+        let complete = stream.is_complete();
+
+        if stream.recv.almost_full() {
+            self.streams.insert_almost_full(stream_id);
+        }
+
+        if !readable {
+            self.streams.remove_readable(&priority_key);
+        }
+
+        if complete {
+            let mut conn = conn_guard.write().unwrap();
+            conn.stream_ids.collect(&mut self.streams, stream_id, local);
+        }
+
+        // TODO multicore add qlog
+
+        if self.should_update_max_data() {
+            self.almost_full = true;
+        }
+
+        if priority_key.incremental && readable {
+            // Shuffle the incremental stream to the back of the the queue.
+            self.streams.remove_readable(&priority_key);
+            self.streams.insert_readable(&priority_key);
+        }
+
+        Ok((read, fin))
+    }
+
 }
 
 impl MulticoreConnection {
@@ -11715,7 +12232,6 @@ impl MulticoreConnection {
         scid: &ConnectionId, odcid: Option<&ConnectionId>, local: SocketAddr,
         peer: SocketAddr, config: &Config, tls: tls::Handshake, is_server: bool,
     ) -> Result<(MulticoreConnection, MulticorePath)> {
-        let max_rx_data = config.local_transport_params.initial_max_data;
 
         let scid_as_hex: Vec<String> =
             scid.iter().map(|b| format!("{b:02x}")).collect();
@@ -11775,36 +12291,18 @@ impl MulticoreConnection {
 
             session: None,
 
-            
+            stream_ids: stream::MulticoreStreamIds::new(
+                config.local_transport_params.initial_max_streams_bidi,
+                config.local_transport_params.initial_max_streams_uni,
+            ),
+
             recovery_config,
 
             application_protos: config.application_protos.clone(),
 
-            flow_control: flowcontrol::FlowControl::new(
-                max_rx_data,
-                cmp::min(max_rx_data / 2 * 3, DEFAULT_CONNECTION_WINDOW),
-                config.max_connection_window,
-            ),
-            almost_full: false,
-
-            tx_cap: 0,
-
-            tx_buffered: 0,
-
-            tx_data: 0,
-            rx_data: 0,
-            max_tx_data: 0,
-            last_tx_data: 0,
-
-            stream_retrans_bytes: 0,
+            
 
             ack_eliciting_sent: false,
-
-            streams: stream::StreamMap::new(
-                config.local_transport_params.initial_max_streams_bidi,
-                config.local_transport_params.initial_max_streams_uni,
-                config.max_stream_window,
-            ),
 
             odcid: None,
 
@@ -11860,14 +12358,6 @@ impl MulticoreConnection {
 
             #[cfg(feature = "qlog")]
             qlog: Default::default(),
-
-            dgram_recv_queue: dgram::DatagramQueue::new(
-                config.dgram_recv_max_queue_len,
-            ),
-
-            dgram_send_queue: dgram::DatagramQueue::new(
-                config.dgram_send_max_queue_len,
-            ),
 
             emit_dgram: true,
 
@@ -11992,6 +12482,19 @@ impl MulticoreConnection {
         self.handshake_completed
     }
 
+    /// Gets pending path multicore events 
+    /// Note: These are different from normal path events
+    pub fn get_multicore_pending_event(&mut self, path: &mut MulticorePath) {
+        if let Some(path_id) = path.path_id{
+            if let Some(queue) = self.per_path_unprocessed_events.get_mut(&path_id){
+                while let Some(e) = queue.pop_front(){
+                    info!("Got event {:?}", e);
+                    path.multicore_events.push_back(e);
+                }
+            }
+        }
+    }
+
     /// Returns whether the network path with local address `from` and remote
     /// address `peer` has been validated.
     ///
@@ -12037,12 +12540,6 @@ impl MulticoreConnection {
         self.addrs_to_paths.len()
     }
 
-    /// Returns the total size of all items in the DATAGRAM send queue.
-    #[inline]
-    pub fn dgram_send_queue_byte_size(&self) -> usize {
-        self.dgram_send_queue.byte_size()
-    }
-
     /// Returns the idle timeout value based on the calling path
     ///
     /// `None` is returned if both end-points disabled the idle timeout.
@@ -12078,30 +12575,6 @@ impl MulticoreConnection {
         let idle_timeout = cmp::max(idle_timeout, 3 * path_pto);
 
         Some(idle_timeout)
-    }
-
-    fn delivery_rate_check_if_app_limited(&self, path: &MulticorePath) -> bool {
-        // Enter the app-limited phase of delivery rate when these conditions
-        // are met:
-        //
-        // - The remaining capacity is higher than available bytes in cwnd (there
-        //   is more room to send).
-        // - New data since the last send() is smaller than available bytes in
-        //   cwnd (we queued less than what we can send).
-        // - There is room to send more data in cwnd.
-        //
-        // In application-limited phases the transmission rate is limited by the
-        // application rather than the congestion control algorithm.
-        //
-        // Note that this is equivalent to CheckIfApplicationLimited() from the
-        // delivery rate draft. This is also separate from `recovery.app_limited`
-        // and only applies to delivery rate calculation.
-        let cwin_available = path.get_inner_path().unwrap().recovery.cwnd_available();
-
-        ((self.tx_buffered + self.dgram_send_queue_byte_size()) < cwin_available) &&
-            (self.tx_data.saturating_sub(self.last_tx_data)) <
-                cwin_available as u64 &&
-            cwin_available > 0
     }
 
     /// Returns the number of spare Destination Connection IDs, i.e.,
@@ -12227,54 +12700,12 @@ impl MulticoreConnection {
         Ok(())
     }
 
-    /// Updates send capacity.
-    fn update_tx_cap(&mut self) {
-        let cwin_available = self
-            .paths_stats
-            .iter()
-            .filter(|(_, p)| p.active)
-            .map(|(_, p)| p.cwnd_available)
-            .filter(|cwnd| *cwnd != std::usize::MAX)
-            .sum();
-        self.tx_cap = cmp::min(
-            cwin_available,
-            (self.max_tx_data - self.tx_data)
-                .try_into()
-                .unwrap_or(usize::MAX),
-        );
-    }
 
-    /// Returns the mutable stream with the given ID if it exists, or creates
-    /// a new one otherwise.
-    fn get_or_create_stream(
-        &mut self, id: u64, local: bool,
-    ) -> Result<&mut stream::Stream> {
-        self.streams.get_or_create(
-            id,
-            &self.local_transport_params,
-            &self.peer_transport_params,
-            local,
-            self.is_server,
-        )
-    }
-
-    /// Returns the connection level flow control limit.
-    fn max_rx_data(&self) -> u64 {
-        self.flow_control.max_data()
-    }
 
     fn dgram_enabled(&self) -> bool {
         self.local_transport_params
             .max_datagram_frame_size
             .is_some()
-    }
-
-    /// Returns true if the connection-level flow control needs to be updated.
-    ///
-    /// This happens when the new max data limit is at least double the amount
-    /// of data that can be received before blocking.
-    fn should_update_max_data(&self) -> bool {
-        self.flow_control.should_update_max_data()
     }
 
     /// Note: Path has to be the lowest active Path ID
@@ -12285,14 +12716,16 @@ impl MulticoreConnection {
             return Err(Error::InvalidState);
         }
 
-        self.max_tx_data = peer_params.initial_max_data;
+        path.peer_transport_params = peer_params.clone();
+
+        path.max_tx_data = peer_params.initial_max_data;
 
         // Update send capacity.
-        self.update_tx_cap();
+        path.update_tx_cap();
 
-        self.streams
+        self.stream_ids
             .update_peer_max_streams_bidi(peer_params.initial_max_streams_bidi);
-        self.streams
+        self.stream_ids
             .update_peer_max_streams_uni(peer_params.initial_max_streams_uni);
 
         let max_ack_delay =
@@ -12316,6 +12749,7 @@ impl MulticoreConnection {
             peer_params.enable_multipath
         {
             self.multipath = true;
+            path.multipath = true;
         }
 
         self.peer_transport_params = peer_params;
@@ -12406,12 +12840,16 @@ impl MulticoreConnection {
             Some(path::Path::new(path.local_addr, path.peer_addr, &self.recovery_config, false));
         path.path_id = Some(pid);
 
+        path.peer_transport_params = self.peer_transport_params.clone();
+        path.multipath = self.multipath;
+
         if self.is_server {
             path.notify_event(PathEvent::New(path.local_addr, path.peer_addr));
         }
 
         self.paths_stats.insert(path.get_path_id(), path.stats()); 
         self.addrs_to_paths.insert((path.local_addr(), path.peer_addr()), path.get_path_id());
+        self.per_path_unprocessed_events.insert(path.get_path_id(), VecDeque::new());
 
         let path = path.get_inner_path_mut().unwrap();
         update_dcid(&mut self.ids, pid, path, Some(dcid_seq))?;
@@ -12545,7 +12983,6 @@ impl MulticoreConnection {
         if !self.parsed_peer_transport_params && !raw_params.is_empty() {
             let peer_params =
                 TransportParams::decode(raw_params, self.is_server)?;
-            info!("Peer TransportParams : {:?}", peer_params);
 
             self.parse_peer_transport_params(peer_params, path)?;
         }
@@ -12692,34 +13129,8 @@ impl MulticoreConnection {
         }
 
         if let Some(_) = in_scid_pid {
-
-            // TODO 
+            // TODO multicore doesn't support reused connection ids
             return Err(Error::InvalidState);
-            // // This CID has been used by another path. If we have the
-            // // room to do so, create a new `Path` structure holding this
-            // // new 4-tuple. Otherwise, drop the packet.
-            // let old_path = self.paths.get_mut(in_scid_pid)?;
-            // let old_local_addr = old_path.local_addr();
-            // let old_peer_addr = old_path.peer_addr();
-
-            // trace!(
-            //     "{} reused CID seq {} of ({},{}) (path {}) on ({},{})",
-            //     self.trace_id,
-            //     in_scid_seq,
-            //     old_local_addr,
-            //     old_peer_addr,
-            //     in_scid_pid,
-            //     info.to,
-            //     info.from
-            // );
- 
-            // // Notify the application.
-            // self.paths
-            //     .notify_event(path::PathEvent::ReusedSourceConnectionId(
-            //         in_scid_seq,
-            //         (old_local_addr, old_peer_addr),
-            //         (info.to, info.from),
-            //     ));
         }
 
         // This is a new path using an unassigned CID; create it!
@@ -12737,6 +13148,16 @@ impl MulticoreConnection {
         let pid = self.path_id_counter;
         self.path_id_counter += 1;
         path.path_id = Some(pid);
+
+        path.peer_transport_params = self.peer_transport_params.clone();
+        // On any path event update tx cap
+        path.max_tx_data = path.peer_transport_params.initial_max_data;
+        path.update_tx_cap();
+        path.multipath = self.multipath;
+
+        self.paths_stats.insert(path.get_path_id(), path.stats()); 
+        self.addrs_to_paths.insert((path.local_addr(), path.peer_addr()), path.get_path_id());
+        self.per_path_unprocessed_events.insert(path.get_path_id(), VecDeque::new());
 
         let path = path.get_inner_path_mut().unwrap();
         update_scid(&mut self.ids, pid, path, in_scid_seq)?;
@@ -13580,11 +14001,13 @@ pub mod testing {
             Ok(())
         }
 
+        
         pub fn advance(&mut self) -> Result<()> {
             let mut client_done = false;
             let mut server_done = false;
 
             while !client_done || !server_done {
+
                 match emit_flight(&mut self.client) {
                     Ok(flight) => {
                         let sizes: Vec<usize> = flight.iter().map(|(p, _)| p.len()).collect();
@@ -14603,7 +15026,7 @@ mod tests {
         assert_eq!(server_sent, client_sent * MAX_AMPLIFICATION_FACTOR);
     }
 
-    #[test]
+    #[test_log::test]
     fn stream() {
         let mut pipe = testing::Pipe::new().unwrap();
         assert_eq!(pipe.handshake(), Ok(()));
@@ -21684,7 +22107,7 @@ mod tests {
             .any(|path| path == client_addr_2));
     }
 
-    #[test]
+    #[test_log::test]
     fn multipath() {
         let mut config = Config::new(crate::PROTOCOL_VERSION).unwrap();
         config
@@ -22043,6 +22466,47 @@ pub mod multicore_testing{
             })
         }
 
+        pub fn with_config_and_scid_lengths(
+            config: &mut Config, client_scid_len: usize, server_scid_len: usize,
+        ) -> Result<Pipe> {
+            let mut client_scid = vec![0; client_scid_len];
+            rand::rand_bytes(&mut client_scid[..]);
+            let client_scid = ConnectionId::from_ref(&client_scid);
+            let client_addr = Pipe::client_addr();
+
+            let mut server_scid = vec![0; server_scid_len];
+            rand::rand_bytes(&mut server_scid[..]);
+            let server_scid = ConnectionId::from_ref(&server_scid);
+            let server_addr = Pipe::server_addr();
+
+            let (client, path) = multicore_connect(
+                Some("quic.tech"),
+                &client_scid,
+                client_addr,
+                server_addr,
+                config,
+            )?;
+            let mut client_paths = Slab::new();
+            client_paths.insert(path);
+
+            let (server, path) = multicore_accept(
+                &server_scid,
+                None,
+                server_addr,
+                client_addr,
+                config,
+            )?;
+            let mut server_paths = Slab::new();
+            server_paths.insert(path);
+
+            Ok(Pipe {
+                client: Arc::new(RwLock::new(client)),
+                client_paths,
+                server: Arc::new(RwLock::new(server)),
+                server_paths
+            })
+        }
+
         pub fn handshake(&mut self) -> Result<()> {
 
             while !self.client.read().unwrap().is_established() || !self.server.read().unwrap().is_established() {
@@ -22055,6 +22519,20 @@ pub mod multicore_testing{
                 let sizes: Vec<usize> = flight.iter().map(|(p, _)| p.len()).collect();
                 info!("[handshake] server emitted flight: {}", sizes.iter().sum::<usize>());
                 multicore_process_flight(&self.client, &mut self.client_paths, flight)?;
+            }
+            Ok(())
+        }
+
+        fn handle_pending_path_event(
+            &mut self
+        ) -> Result<()>{
+            for (_, mut path) in self.server_paths.iter_mut(){
+                self.server.write().unwrap().get_multicore_pending_event(&mut path);
+                path.handle_pending_multicore_events()?;
+            }
+            for (_, mut path) in self.client_paths.iter_mut(){
+                self.client.write().unwrap().get_multicore_pending_event(&mut path);
+                path.handle_pending_multicore_events()?;
             }
             Ok(())
         }
@@ -22076,6 +22554,8 @@ pub mod multicore_testing{
                     Err(e) => return Err(e),
                 };
 
+                self.handle_pending_path_event()?;
+
                 match multicore_emit_flight(&self.server, &mut self.server_paths) {
                     Ok(flight) => {
                         let sizes: Vec<usize> = flight.iter().map(|(p, _)| p.len()).collect();
@@ -22087,6 +22567,8 @@ pub mod multicore_testing{
 
                     Err(e) => return Err(e),
                 };
+
+                self.handle_pending_path_event()?;
             }
 
             Ok(())
@@ -22124,7 +22606,6 @@ pub mod multicore_testing{
         Err(Error::InvalidState)
     }
 
-
     pub fn get_receiving_path<'a>(
         paths: &'a mut Slab<MulticorePath>,
         info: &RecvInfo
@@ -22147,7 +22628,6 @@ pub mod multicore_testing{
             to: active_path.local_addr,
             from: active_path.peer_addr,
         };
-
         active_path.recv(conn_guard, &mut buf[..len], info)?;
 
         let mut off = 0;
@@ -22291,7 +22771,7 @@ pub mod multicore_testing{
             to: info.to, 
             from: info.from
         };
-        path.recv(conn, buf, info)?;
+        path.recv( conn, buf, info)?;
         Ok(())
     }
 
@@ -22617,9 +23097,12 @@ mod multicore_tests {
 
         assert!(pipe.server.read().unwrap().is_established());
         assert!(pipe.server.read().unwrap().handshake_confirmed);
+
+        assert!(pipe.client_paths.get(0).unwrap().completed_handshake);
+        assert!(pipe.server_paths.get(0).unwrap().completed_handshake);
     }
 
-    #[test]
+    #[test_log::test]
     fn path_challenge() {
         let mut buf = [0; 65535];
 
@@ -22648,8 +23131,6 @@ mod multicore_tests {
         );
     }
 
-    // TODO test delayed 1RTT
-    
     #[test]
     /// Tests that invalid packets don't cause the connection to be closed.
     fn invalid_packet() {
@@ -22819,6 +23300,9 @@ mod multicore_tests {
         let client_addr_2 = "127.0.0.1:5678".parse().unwrap();
         let mut client_addr_2_path = MulticorePath::default(&config, false, client_addr_2, server_addr);
         
+        assert!(pipe.client_paths.get(0).unwrap().completed_handshake);
+        assert!(pipe.server_paths.get(0).unwrap().completed_handshake);
+
         // We cannot probe a new path if there are not enough identifiers.
         assert_eq!(
             client_addr_2_path.probe_path(&mut pipe.client),
@@ -22897,7 +23381,335 @@ mod multicore_tests {
         assert_eq!(pipe.client_paths.get_mut(1).unwrap().path_event_next(), None);
         assert_eq!(pipe.server_paths.get_mut(0).unwrap().path_event_next(), None);
         assert_eq!(pipe.server_paths.get_mut(1).unwrap().path_event_next(), None);
+
+        assert!(pipe.client_paths.get(1).unwrap().completed_handshake);
+        assert!(pipe.server_paths.get(1).unwrap().completed_handshake);
     }
+
+    #[test]
+    fn empty_payload() {
+        let mut buf = [0; 65535];
+
+        let mut pipe = multicore_testing::Pipe::new().unwrap();
+        assert_eq!(pipe.handshake(), Ok(()));
+
+        // Send a packet with no frames.
+        let pkt_type = packet::Type::Short;
+        assert_eq!(
+            pipe.send_pkt_to_server(pkt_type, &[], &mut buf),
+            Err(Error::InvalidPacket)
+        );
+    }
+
+    #[test_log::test]
+    fn stream() {
+        let mut pipe = multicore_testing::Pipe::new().unwrap();
+        assert_eq!(pipe.handshake(), Ok(()));
+
+        let client_active_path = multicore_testing::get_active_path(&mut pipe.client, &mut pipe.client_paths).unwrap();
+        assert_eq!(client_active_path.stream_send(&mut pipe.client, 4, b"hello, world", true), Ok(12));
+        assert_eq!(pipe.advance(), Ok(()));
+
+        let server_active_path = multicore_testing::get_active_path(&mut pipe.server, &mut pipe.server_paths).unwrap();
+        assert!(!server_active_path.stream_finished(4));
+
+        let mut r = server_active_path.readable();
+        assert_eq!(r.next(), Some(4));
+        assert_eq!(r.next(), None);
+
+        let mut b = [0; 15];
+        assert_eq!(server_active_path.stream_recv(&mut pipe.server, 4, &mut b), Ok((12, true)));
+        assert_eq!(&b[..12], b"hello, world");
+    }
+
+    #[test]
+    /// Tests that receiving a MAX_STREAM_DATA frame for a receive-only
+    /// unidirectional stream is forbidden.
+    fn max_stream_data_receive_uni() {
+        let mut buf = [0; 65535];
+
+        let mut pipe = multicore_testing::Pipe::new().unwrap();
+        assert_eq!(pipe.handshake(), Ok(()));
+        let client_active_path = multicore_testing::get_active_path(&mut pipe.client, &mut pipe.client_paths).unwrap();
+
+        // Client opens unidirectional stream.
+        assert_eq!(client_active_path.stream_send(&mut pipe.client, 2, b"hello", false), Ok(5));
+        assert_eq!(pipe.advance(), Ok(()));
+
+        // Client sends MAX_STREAM_DATA on local unidirectional stream.
+        let frames = [frame::Frame::MaxStreamData {
+            stream_id: 2,
+            max: 1024,
+        }];
+
+        let pkt_type = packet::Type::Short;
+        assert_eq!(
+            pipe.send_pkt_to_server(pkt_type, &frames, &mut buf),
+            Err(Error::InvalidStreamState(2)),
+        );
+    }
+
+    #[test]
+    fn flow_control_limit() {
+        let mut buf = [0; 65535];
+
+        let mut pipe = multicore_testing::Pipe::new().unwrap();
+        assert_eq!(pipe.handshake(), Ok(()));
+
+        let frames = [
+            frame::Frame::Stream {
+                stream_id: 0,
+                data: stream::RangeBuf::from(b"aaaaaaaaaaaaaaa", 0, false),
+            },
+            frame::Frame::Stream {
+                stream_id: 4,
+                data: stream::RangeBuf::from(b"aaaaaaaaaaaaaaa", 0, false),
+            },
+            frame::Frame::Stream {
+                stream_id: 8,
+                data: stream::RangeBuf::from(b"a", 0, false),
+            },
+        ];
+
+        let pkt_type = packet::Type::Short;
+        assert_eq!(
+            pipe.send_pkt_to_server(pkt_type, &frames, &mut buf),
+            Err(Error::FlowControl),
+        );
+    }
+
+
+    #[test]
+    fn flow_control_update() {
+        let mut buf = [0; 65535];
+
+        let mut pipe = multicore_testing::Pipe::new().unwrap();
+        assert_eq!(pipe.handshake(), Ok(()));
+
+        let frames = [
+            frame::Frame::Stream {
+                stream_id: 0,
+                data: stream::RangeBuf::from(b"aaaaaaaaaaaaaaa", 0, false),
+            },
+            frame::Frame::Stream {
+                stream_id: 4,
+                data: stream::RangeBuf::from(b"a", 0, false),
+            },
+        ];
+
+        let pkt_type = packet::Type::Short;
+
+        assert!(pipe.send_pkt_to_server(pkt_type, &frames, &mut buf).is_ok());
+
+        let server_active_path = multicore_testing::get_active_path(&mut pipe.server, &mut pipe.server_paths).unwrap();
+
+        server_active_path.stream_recv(&mut pipe.server, 0, &mut buf).unwrap();
+        server_active_path.stream_recv(&mut pipe.server, 4, &mut buf).unwrap();
+
+        let frames = [frame::Frame::Stream {
+            stream_id: 4,
+            data: stream::RangeBuf::from(b"a", 1, false),
+        }];
+
+        let len = pipe
+            .send_pkt_to_server(pkt_type, &frames, &mut buf)
+            .unwrap();
+
+        assert!(len > 0);
+
+        let mut conn = &mut pipe.client.write().unwrap();
+        let frames =
+            multicore_testing::multicore_decode_pkt(&mut conn, &mut buf[..len]).unwrap();
+        let mut iter = frames.iter();
+
+        // Ignore ACK.
+        iter.next().unwrap();
+
+        assert_eq!(
+            iter.next(),
+            Some(&frame::Frame::MaxStreamData {
+                stream_id: 0,
+                max: 30
+            })
+        );
+        assert_eq!(iter.next(), Some(&frame::Frame::MaxData { max: 61 }));
+    }
+
+     // Utility function.
+     fn pipe_with_exchanged_cids(
+        config: &mut Config, client_scid_len: usize, server_scid_len: usize,
+        additional_cids: usize,
+    ) -> multicore_testing::Pipe {
+        let mut pipe = multicore_testing::Pipe::with_config_and_scid_lengths(
+            config,
+            client_scid_len,
+            server_scid_len,
+        )
+        .unwrap();
+        assert_eq!(pipe.handshake(), Ok(()));
+
+        let mut c_cids = Vec::new();
+        let mut c_reset_tokens = Vec::new();
+        let mut s_cids = Vec::new();
+        let mut s_reset_tokens = Vec::new();
+
+        for i in 0..additional_cids {
+            if client_scid_len > 0 {
+                let (c_cid, c_reset_token) =
+                    testing::create_cid_and_reset_token(client_scid_len);
+                c_cids.push(c_cid);
+                c_reset_tokens.push(c_reset_token);
+
+                assert_eq!(
+                    pipe.client.write().unwrap().new_source_cid(
+                        &c_cids[i],
+                        c_reset_tokens[i],
+                        true
+                    ),
+                    Ok(i as u64 + 1)
+                );
+            }
+
+            if server_scid_len > 0 {
+                let (s_cid, s_reset_token) =
+                    testing::create_cid_and_reset_token(server_scid_len);
+                s_cids.push(s_cid);
+                s_reset_tokens.push(s_reset_token);
+                assert_eq!(
+                    pipe.server.write().unwrap().new_source_cid(
+                        &s_cids[i],
+                        s_reset_tokens[i],
+                        true
+                    ),
+                    Ok(i as u64 + 1)
+                );
+            }
+        }
+
+        // Let exchange packets over the connection.
+        assert_eq!(pipe.advance(), Ok(()));
+
+        if client_scid_len > 0 {
+            assert_eq!(pipe.server.read().unwrap().available_dcids(), additional_cids);
+        }
+
+        if server_scid_len > 0 {
+            assert_eq!(pipe.client.read().unwrap().available_dcids(), additional_cids);
+        }
+
+        assert_eq!(pipe.server_paths.get_mut(0).unwrap().path_event_next(), None);
+        assert_eq!(pipe.client_paths.get_mut(0).unwrap().path_event_next(), None);
+
+        pipe
+    }
+
+    #[test_log::test]
+    fn multipath() {
+        let mut config = Config::new(crate::PROTOCOL_VERSION).unwrap();
+        config
+            .load_cert_chain_from_pem_file("examples/cert.crt")
+            .unwrap();
+        config
+            .load_priv_key_from_pem_file("examples/cert.key")
+            .unwrap();
+        config
+            .set_application_protos(&[b"proto1", b"proto2"])
+            .unwrap();
+        config.verify_peer(false);
+        config.set_active_connection_id_limit(3);
+        config.set_initial_max_data(100000);
+        config.set_initial_max_stream_data_uni(100000);
+        config.set_initial_max_streams_uni(2);
+        // To test with enabled datagrams.
+        config.enable_dgram(true, 10, 10);
+        config.set_multipath(true);
+
+        let initial_per_path_congestion_window = config.max_send_udp_payload_size * config.initial_congestion_window_packets;
+
+        let mut pipe = pipe_with_exchanged_cids(&mut config, 16, 16, 1);
+        assert_eq!(pipe.client.read().unwrap().multipath, true);
+        assert_eq!(pipe.server.read().unwrap().multipath, true);
+
+        //let client_addr = testing::Pipe::client_addr();
+        let server_addr = testing::Pipe::server_addr();
+        let client_addr_2 = "127.0.0.1:5678".parse().unwrap();
+
+        let mut client_addr_2_path = MulticorePath::default(&config, false, client_addr_2, server_addr);
+        assert_eq!(client_addr_2_path.probe_path(&mut pipe.client), Ok(1));
+        pipe.client_paths.insert(client_addr_2_path);
+
+        let server_client_addr_2_path = 
+            MulticorePath::default(&config, true, server_addr,  client_addr_2);
+        pipe.server_paths.insert(server_client_addr_2_path);
+
+        assert_eq!(pipe.advance(), Ok(()));
+        assert_eq!(
+            pipe.client_paths.get_mut(1).unwrap().path_event_next(),
+            Some(PathEvent::Validated(client_addr_2, server_addr)),
+        );
+
+        assert_eq!(pipe.client_paths.get_mut(1).unwrap().path_event_next(), None);
+
+        assert_eq!(pipe.client_paths.get_mut(0).unwrap().get_inner_path().unwrap().active(), true);
+        assert_eq!(pipe.client_paths.get_mut(1).unwrap().get_inner_path().unwrap().active(), false);
+        assert_eq!(pipe.server_paths.get_mut(0).unwrap().get_inner_path().unwrap().active(), true);
+        assert_eq!(pipe.server_paths.get_mut(1).unwrap().get_inner_path().unwrap().active(), false);
+
+        assert_eq!(pipe.client_paths.get_mut(1).unwrap().set_active(true), Ok(()));
+        assert_eq!(pipe.server_paths.get_mut(1).unwrap().set_active(true), Ok(()));
+
+        assert_eq!(pipe.client_paths.get_mut(0).unwrap().get_inner_path().unwrap().active(), true);
+        assert_eq!(pipe.client_paths.get_mut(1).unwrap().get_inner_path().unwrap().active(), true);
+        assert_eq!(pipe.server_paths.get_mut(0).unwrap().get_inner_path().unwrap().active(), true);
+        assert_eq!(pipe.server_paths.get_mut(1).unwrap().get_inner_path().unwrap().active(), true);
+
+        assert_eq!(pipe.server.read().unwrap().nb_of_paths(), 2);
+        assert_eq!(pipe.client.read().unwrap().nb_of_paths(), 2);
+
+        // Flush the ACK_MP on the newly active path.
+        assert_eq!(pipe.advance(), Ok(()));
+
+        const DATA_BYTES: usize = 24000;
+        let buf = [42; DATA_BYTES];
+        let mut recv_buf = [0; DATA_BYTES];
+        assert_eq!(initial_per_path_congestion_window * 2, DATA_BYTES);
+        
+        assert_eq!(pipe.server_paths.get_mut(0).unwrap().stream_send(&mut pipe.server, 3, &buf[..12000], true), Ok(12000));
+        assert_eq!(pipe.server_paths.get_mut(1).unwrap().stream_send(&mut pipe.server, 7, &buf[12000..], true), Ok(12000));
+        assert_eq!(pipe.advance(), Ok(()));
+
+        let (rcv_data, fin) = pipe.client_paths.get_mut(0).unwrap().stream_recv(&mut pipe.client, 3, &mut recv_buf).unwrap();
+        assert_eq!(fin, true);
+        assert_eq!(rcv_data, 12000);
+        
+        let (rcv_data, fin) = pipe.client_paths.get_mut(1).unwrap().stream_recv(&mut pipe.client, 7, &mut recv_buf).unwrap();
+        assert_eq!(fin, true);
+        assert_eq!(rcv_data, 12000);
+
+        let stats = pipe.server_paths.get_mut(0).unwrap().get_inner_path().unwrap().stats();
+        assert_eq!(
+            stats.cwnd,
+            stats.cwnd_available
+        );
+        let stats = pipe.server_paths.get_mut(1).unwrap().get_inner_path().unwrap().stats();
+        assert_eq!(
+            stats.cwnd,
+            stats.cwnd_available
+        );
+        let stats = pipe.client_paths.get_mut(0).unwrap().get_inner_path().unwrap().stats();
+        assert_eq!(
+            stats.cwnd,
+            stats.cwnd_available
+        );
+        let stats = pipe.client_paths.get_mut(1).unwrap().get_inner_path().unwrap().stats();
+        assert_eq!(
+            stats.cwnd,
+            stats.cwnd_available
+        );
+
+        // TODO multicore handle in path abandon while connection is active
+    }
+
 }
 
 pub use crate::packet::ConnectionId;
