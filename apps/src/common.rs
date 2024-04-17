@@ -78,7 +78,15 @@ pub struct PartialResponse {
     pub written: usize,
 }
 
+#[derive(Debug)]
+pub enum ClientError {
+    HandshakeFail,
+    HttpFail,
+    Other(String),
+}
+
 pub type ClientId = u64;
+
 
 pub struct Client {
     pub conn: quiche::Connection,

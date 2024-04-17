@@ -42,13 +42,6 @@ use slab::Slab;
 
 const MAX_DATAGRAM_SIZE: usize = 1350;
 
-#[derive(Debug)]
-pub enum ClientError {
-    HandshakeFail,
-    HttpFail,
-    Other(String),
-}
-
 pub fn connect(
     args: ClientArgs, conn_args: CommonArgs,
     output_sink: impl FnMut(String) + 'static,
@@ -262,7 +255,7 @@ pub fn connect(
 
         // Read incoming UDP packets from the socket and feed them to quiche,
         // until there are no more packets to read.
-        for event in &events {
+        for event in &events {  
             let token = event.token().into();
             let socket = &sockets[token];
             let local_addr = socket.local_addr().unwrap();

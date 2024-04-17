@@ -304,6 +304,7 @@ impl MulticoreStreamMap {
     }
 
     /// Creates an iterator over streams that can be written to.
+    #[allow(dead_code)]
     pub fn writable(&self) -> StreamIter {
         StreamIter {
             streams: self.writable.iter().map(|s| s.id).collect(),
@@ -337,6 +338,7 @@ impl MulticoreStreamMap {
     }
 
     /// Returns true if there are any streams that have data to read.
+    #[allow(dead_code)]
     pub fn has_readable(&self) -> bool {
         !self.readable.is_empty()
     }
@@ -364,6 +366,7 @@ impl MulticoreStreamMap {
 
     /// Returns the number of active streams in the map.
     #[cfg(test)]
+    #[allow(dead_code)]
     pub fn len(&self) -> usize {
         self.streams.len()
     }
@@ -545,7 +548,7 @@ impl MulticoreStreamIds{
                     stream_map.writable.insert(Arc::clone(&stream.priority_key));
                 }
             }, 
-            hash_map::Entry::Occupied(v) => {
+            hash_map::Entry::Occupied(..) => {
                 return Ok(());
             }
         };
@@ -569,6 +572,7 @@ impl MulticoreStreamIds{
     }
 
     /// Returns the current max_streams_bidi limit.
+    #[allow(dead_code)]
     pub fn max_streams_bidi(&self) -> u64 {
         self.local_max_streams_bidi
     }
@@ -590,12 +594,14 @@ impl MulticoreStreamIds{
 
     /// Returns the number of bidirectional streams that can be created
     /// before the peer's stream count limit is reached.
+    #[allow(dead_code)]
     pub fn peer_streams_left_bidi(&self) -> u64 {
         self.peer_max_streams_bidi - self.local_opened_streams_bidi
     }
 
     /// Returns the number of unidirectional streams that can be created
     /// before the peer's stream count limit is reached.
+    #[allow(dead_code)]
     pub fn peer_streams_left_uni(&self) -> u64 {
         self.peer_max_streams_uni - self.local_opened_streams_uni
     }
@@ -629,6 +635,7 @@ impl MulticoreStreamIds{
     }
 
     /// Returns true if the stream has been collected.
+    #[allow(dead_code)]
     pub fn is_collected(&self, stream_id: u64) -> bool {
         self.collected.contains(&stream_id)
     }
@@ -2868,6 +2875,7 @@ mod multicore_tests{
         );
     }
 
+    #[allow(dead_code)]
     fn cycle_stream_priority(stream_id: u64, streams: &mut MulticoreStreamMap) {
         let key = streams.get(stream_id).unwrap().priority_key.clone();
         streams.update_priority(&key.clone(), &key);

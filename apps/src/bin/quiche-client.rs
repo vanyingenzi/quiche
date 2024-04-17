@@ -25,10 +25,9 @@
 // SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 use quiche_apps::args::*;
-
 use quiche_apps::common::*;
-
 use quiche_apps::client::*;
+use quiche_apps::multicore_client::*;
 
 fn main() {
     env_logger::builder()
@@ -40,13 +39,27 @@ fn main() {
     let conn_args = CommonArgs::with_docopt(&docopt);
     let args = ClientArgs::with_docopt(&docopt);
 
-    match connect(args, conn_args, stdout_sink) {
-        Err(ClientError::HandshakeFail) => std::process::exit(-1),
+    if conn_args.multicore {
+        match multicore_connect(args, conn_args, stdout_sink) {
+    
+            Err(ClientError::HandshakeFail) => std::process::exit(-1),
 
-        Err(ClientError::HttpFail) => std::process::exit(-2),
+            Err(ClientError::HttpFail) => std::process::exit(-2),
 
-        Err(ClientError::Other(e)) => panic!("{}", e),
+            Err(ClientError::Other(e)) => panic!("{}", e),
 
-        Ok(_) => (),
+            Ok(_) => (),
+        }
+    } else {
+        // This is the deafult call that was made by the original quiche-client
+        match connect(args, conn_args, stdout_sink) {
+            Err(ClientError::HandshakeFail) => std::process::exit(-1),
+
+            Err(ClientError::HttpFail) => std::process::exit(-2),
+
+            Err(ClientError::Other(e)) => panic!("{}", e),
+
+            Ok(_) => (),
+        }
     }
 }

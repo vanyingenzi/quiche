@@ -1482,7 +1482,7 @@ pub struct MulticoreConnection {
     stream_ids: stream::MulticoreStreamIds,
 
     /// TLS handshake state.
-    handshake: tls::Handshake, // ! Referenced from Path after handshake, since on receive of CRYPTO frames it needs to work
+    handshake: tls::Handshake,
 
     /// The connection-level limit at which send blocking occurred.
     blocked_limit: Option<u64>,
@@ -1498,8 +1498,6 @@ pub struct MulticoreConnection {
 
     /// List of supported application protocols.
     application_protos: Vec<Vec<u8>>, //* Clonable, 
-
-    // TODO move later to path
 
     /// Idle timeout expiration time.
     idle_timer: Option<time::Instant>,
@@ -2390,7 +2388,7 @@ impl Connection {
                 },
             };
 
-            info!("recv_single read: {}", read);
+            debug!("recv_single read: {}", read);
 
             done += read;
             left -= read;
@@ -6958,6 +6956,7 @@ impl Connection {
     }
 
     fn encode_transport_params(&mut self) -> Result<()> {
+        info!("encode_transport_params: {:?}", self.local_transport_params);
         let mut raw_params = [0; 168];
 
         let raw_params = TransportParams::encode(
@@ -6974,6 +6973,7 @@ impl Connection {
     fn parse_peer_transport_params(
         &mut self, peer_params: TransportParams,
     ) -> Result<()> {
+        info!("Parse peer transport params");
         // Validate initial_source_connection_id.
         match &peer_params.initial_source_connection_id {
             Some(v) if v != &self.destination_id() =>
@@ -7027,6 +7027,8 @@ impl Connection {
     fn process_peer_transport_params(
         &mut self, peer_params: TransportParams,
     ) -> Result<()> {
+        info!("In process_peer_transport_params");
+
         self.max_tx_data = peer_params.initial_max_data;
 
         // Update send capacity.
@@ -7069,6 +7071,7 @@ impl Connection {
     ///
     /// If the connection is already established, it does nothing.
     fn do_handshake(&mut self, now: time::Instant) -> Result<()> {
+        info!("In do hanshake");
         let mut ex_data = tls::ExData {
             application_protos: &self.application_protos,
 
@@ -7086,6 +7089,7 @@ impl Connection {
         };
 
         if self.handshake_completed {
+            info!("Process post handshake");
             return self.handshake.process_post_handshake(&mut ex_data);
         }
 
@@ -7093,6 +7097,7 @@ impl Connection {
             Ok(_) => (),
 
             Err(Error::Done) => {
+                info!("do_handshake returned Done");
                 // Try to parse transport parameters as soon as the first flight
                 // of handshake data is processed.
                 //
@@ -7100,6 +7105,7 @@ impl Connection {
                 // completed yet, though it's required to be able to send data
                 // in 0.5 RTT.
                 let raw_params = self.handshake.quic_transport_params();
+                info!("raw_params : {:?}", raw_params);
 
                 if !self.parsed_peer_transport_params && !raw_params.is_empty() {
                     let peer_params =
@@ -7114,6 +7120,8 @@ impl Connection {
             Err(e) => return Err(e),
         };
 
+        info!("HERRRRRRRRRRRRRRREE");
+
         self.handshake_completed = self.handshake.is_completed();
 
         self.alpn = self.handshake.alpn_protocol().to_vec();
@@ -7124,7 +7132,6 @@ impl Connection {
             let peer_params =
                 TransportParams::decode(raw_params, self.is_server)?;
 
-            info!("Peer TransportParams : {:?}", peer_params);
             self.parse_peer_transport_params(peer_params)?;
         }
 
@@ -7473,12 +7480,14 @@ impl Connection {
                 let mut crypto_buf = [0; 512];
 
                 let level = crypto::Level::from_epoch(epoch);
+                info!("level: {:?}", level);
 
                 let stream =
                     &mut self.pkt_num_spaces.crypto.get_mut(epoch).crypto_stream;
 
                 while let Ok((read, _)) = stream.recv.emit(&mut crypto_buf) {
                     let recv_buf = &crypto_buf[..read];
+                    info!("Received : {:?}", recv_buf);
                     self.handshake.provide_data(level, recv_buf)?;
                 }
 
@@ -8466,7 +8475,7 @@ pub struct MulticorePath {
     local_transport_params: TransportParams,
     peer_transport_params: TransportParams,
     /// Whether the multipath extensions are enabled.
-    multipath: bool,
+    pub multipath: bool,
 }
 
 impl MulticorePath {
@@ -8597,13 +8606,13 @@ impl MulticorePath {
     /// Returns the local address on which this path operates.
     #[inline]
     pub fn local_addr(&self) -> SocketAddr {
-        self.get_inner_path().unwrap().local_addr()
+        self.local_addr
     }
 
     /// Returns the peer address on which this path operates.
     #[inline]
     pub fn peer_addr(&self) -> SocketAddr {
-        self.get_inner_path().unwrap().peer_addr()
+        self.peer_addr
     }
 
     #[inline]
@@ -10132,7 +10141,6 @@ impl MulticorePath {
             None => time::Instant::now()
         };
 
-        // TODO multicore
         // Forwarding the error value here could confuse
         // applications, as they may not expect getting a `recv()`
         // error when calling `send()`.
@@ -10462,12 +10470,14 @@ impl MulticorePath {
                 let mut crypto_buf = [0; 512];
 
                 let level = crypto::Level::from_epoch(epoch);
+                info!("level: {:?}", level);
 
                 let stream =
                     &mut conn.pkt_num_spaces.crypto.get_mut(epoch).crypto_stream;
 
                 while let Ok((read, _)) = stream.recv.emit(&mut crypto_buf) {
                     let recv_buf = &crypto_buf[..read];
+                    info!("Received : {:?}", recv_buf);
                     conn.handshake.provide_data(level, recv_buf)?;
                 }
 
@@ -11813,7 +11823,7 @@ impl MulticorePath {
                     let mut conn = conn_guard.write().unwrap();
                     // If the packet can't be processed or decrypted, check if
                     // it's a stateless reset.
-                    info!("recv_single return Done");
+                    debug!("recv_single return done");
                     if conn.is_stateless_reset(&buf[len - left..len]) {
                         trace!("{} packet is a stateless reset", conn.trace_id);
                         conn.closed = true;
@@ -11831,7 +11841,7 @@ impl MulticorePath {
                 },
             };
 
-            info!("recv_single read: {}", read);
+            debug!("recv_single read: {}", read);
 
             done += read;
             left -= read;
@@ -12452,7 +12462,15 @@ impl MulticoreConnection {
         Ok((conn, path))
     }
 
+    /// Sets keylog output to the designated [`Writer`].
+    #[inline]
+    pub fn set_keylog(&mut self, writer: Box<dyn std::io::Write + Send + Sync>) {
+        self.keylog = Some(writer);
+    }
+
     fn encode_transport_params(&mut self) -> Result<()> {
+
+        info!("encode_transport_params: {:?}", self.local_transport_params);
         let mut raw_params = [0; 168];
 
         let raw_params = TransportParams::encode(
@@ -12460,10 +12478,28 @@ impl MulticoreConnection {
             self.is_server,
             &mut raw_params,
         )?;
-
+        
         self.handshake.set_quic_transport_params(raw_params)?;
 
         Ok(())
+    }
+
+    /// Returns the number of source Connection IDs that are active. This is
+    /// only meaningful if the host uses non-zero length Source Connection IDs.
+    pub fn active_source_cids(&self) -> usize {
+        self.ids.active_source_cids()
+    }
+
+    /// Returns the number of source Connection IDs that should be provided
+    /// to the peer without exceeding the limit it advertised.
+    #[inline]
+    pub fn source_cids_left(&self) -> usize {
+        let max_active_source_cids = cmp::min(
+            self.peer_transport_params.active_conn_id_limit,
+            self.local_transport_params.active_conn_id_limit,
+        ) as usize;
+
+        max_active_source_cids - self.active_source_cids()
     }
 
     fn set_initial_dcid(
@@ -12647,6 +12683,7 @@ impl MulticoreConnection {
         &mut self, peer_params: TransportParams,
         path: &mut MulticorePath
     ) -> Result<()> {
+        info!("Parse peer transport params");
         if !self.is_lowest_active_path_id(path) {
             return Err(Error::InvalidState);
         }
@@ -12712,6 +12749,7 @@ impl MulticoreConnection {
     fn process_peer_transport_params(
         &mut self, peer_params: TransportParams, path: &mut MulticorePath
     ) -> Result<()> {
+        info!("In process_peer_transport_params");
         if !self.is_lowest_active_path_id(path) {
             return Err(Error::InvalidState);
         }
@@ -12929,6 +12967,7 @@ impl MulticoreConnection {
     /// If the connection is already established, it does nothing.
     /// The path allowed to call this function has to be the lowest active path_id
     fn do_handshake(&mut self, now: time::Instant, path: &mut MulticorePath) -> Result<()> {
+        info!("In do_handshake");
         let mut ex_data = tls::ExData {
             application_protos: &self.application_protos,
 
@@ -12945,7 +12984,10 @@ impl MulticoreConnection {
             is_server: self.is_server,
         };
 
+        info!("do_handshake");
+
         if self.handshake_completed {
+            info!("Process post handshake");
             return self.handshake.process_post_handshake(&mut ex_data);
         }
 
@@ -12953,6 +12995,7 @@ impl MulticoreConnection {
             Ok(_) => (),
 
             Err(Error::Done) => {
+                info!("do_handshake returned Done");
                 // Try to parse transport parameters as soon as the first flight
                 // of handshake data is processed.
                 //
@@ -12960,6 +13003,7 @@ impl MulticoreConnection {
                 // completed yet, though it's required to be able to send data
                 // in 0.5 RTT.
                 let raw_params = self.handshake.quic_transport_params();
+                info!("raw_params : {:?}", raw_params);
 
                 if !self.parsed_peer_transport_params && !raw_params.is_empty() {
                     let peer_params =
@@ -12973,6 +13017,8 @@ impl MulticoreConnection {
 
             Err(e) => return Err(e),
         };
+
+        info!("HERRRRRRRRRRRRRRREE");
 
         self.handshake_completed = self.handshake.is_completed();
 
@@ -13176,6 +13222,28 @@ impl MulticoreConnection {
             None,
             retire_if_needed,
         )
+    }
+
+    /// Configures the given session for resumption.
+    /// Path is the initial path
+    #[inline]
+    pub fn set_session(&mut self, session: &[u8], path: &mut MulticorePath) -> Result<()> {
+        let mut b = octets::Octets::with_slice(session);
+
+        let session_len = b.get_u64()? as usize;
+        let session_bytes = b.get_bytes(session_len)?;
+
+        self.handshake.set_session(session_bytes.as_ref())?;
+
+        let raw_params_len = b.get_u64()? as usize;
+        let raw_params_bytes = b.get_bytes(raw_params_len)?;
+
+        let peer_params =
+            TransportParams::decode(raw_params_bytes.as_ref(), self.is_server)?;
+
+        self.process_peer_transport_params(peer_params, path)?;
+
+        Ok(())
     }
 }
 /// Maps an `Error` to `Error::Done`, or itself.
@@ -23709,6 +23777,7 @@ mod multicore_tests {
 
         // TODO multicore handle in path abandon while connection is active
     }
+
 
 }
 
