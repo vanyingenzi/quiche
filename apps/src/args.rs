@@ -88,6 +88,7 @@ pub struct CommonArgs {
 /// --qpack-blocked-streams STREAMS  Limit of blocked streams while decoding.
 /// --initial-cwnd-packets      Size of initial congestion window, in packets.
 /// --multipath                 Enable multipath support.
+/// --multicore                 Enable multicore support. [Under development]
 ///
 /// [`Docopt`]: https://docs.rs/docopt/1.1.0/docopt/
 impl Args for CommonArgs {
@@ -106,12 +107,20 @@ impl Args for CommonArgs {
 
             ("HTTP/3", "oneway") => (alpns::HTTP_3.to_vec(), true),
 
-            ("all", "none") => (
-                [alpns::HTTP_3.as_slice(), &alpns::HTTP_09]
-                    .concat()
-                    .to_vec(),
-                false,
-            ),
+            ("all", "none") => {
+                let mut aplns_to_return = Vec::new();
+                if args.get_bool("--multicore") {
+                    aplns_to_return.push(alpns::MMPQUIC.as_slice());
+                }
+                aplns_to_return.push(alpns::HTTP_3.as_slice());
+                aplns_to_return.push(&alpns::HTTP_09);
+                (
+                    aplns_to_return
+                        .concat()
+                        .to_vec(),
+                    false
+                )
+            },
 
             (..) => panic!("Unsupported HTTP version and DATAGRAM protocol."),
         };
@@ -555,7 +564,7 @@ Options:
 ";
 
 // Application-specific arguments that compliment the `CommonArgs`.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ServerArgs {
     pub listen: String,
     pub no_retry: bool,

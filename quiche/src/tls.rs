@@ -462,7 +462,6 @@ impl Handshake {
     }
 
     pub fn use_legacy_codepoint(&mut self, use_legacy: bool) {
-        info!("use_legacy_codepoint");
         unsafe {
             SSL_set_quic_use_legacy_codepoint(
                 self.as_mut_ptr(),
@@ -534,7 +533,6 @@ impl Handshake {
     }
 
     pub fn set_quic_transport_params(&mut self, buf: &[u8]) -> Result<()> {
-        info!("set_quic_transport_params {:?}", buf);
         let rc = unsafe {
             SSL_set_quic_transport_params(
                 self.as_mut_ptr(),
@@ -1084,8 +1082,6 @@ extern fn add_handshake_data(
 
     let buf = unsafe { slice::from_raw_parts(data, len) };
 
-    info!("add_handshake_data: {:?}", buf);
-
     let space = match level {
         crypto::Level::Initial => ex_data
             .pkt_num_spaces
@@ -1211,7 +1207,6 @@ extern fn select_alpn(
 }
 
 extern fn new_session(ssl: *mut SSL, session: *mut SSL_SESSION) -> c_int {
-    info!("TOREMOVE new_session");
     let ex_data = match get_ex_data_from_ptr::<ExData>(ssl, *QUICHE_EX_DATA_INDEX)
     {
         Some(v) => v,

@@ -192,7 +192,7 @@ pub struct Path {
     /// The current validation state of the path.
     validation_state: PathValidationState,
     /// The usage state of this path.
-    state: PathState,
+    pub(crate) state: PathState,
 
     /// Loss recovery and congestion control state.
     pub recovery: recovery::Recovery,
@@ -254,7 +254,7 @@ pub struct Path {
     challenge_requested: bool,
 
     /// Whether the failure of this path was notified.
-    failure_notified: bool,
+    pub(crate) failure_notified: bool,
 
     /// Whether the connection tries to migrate to this path, but it still needs
     /// to be validated.
@@ -368,7 +368,7 @@ impl Path {
 
     /// Returns whether this path is closed.
     #[inline]
-    fn closed(&self) -> bool {
+    pub(crate) fn closed(&self) -> bool {
         matches!(self.state, PathState::Closed(_, _))
     }
 
@@ -388,7 +388,7 @@ impl Path {
 
     /// Returns whether this path failed its validation.
     #[inline]
-    fn validation_failed(&self) -> bool {
+    pub(crate) fn validation_failed(&self) -> bool {
         self.validation_state == PathValidationState::Failed
     }
 

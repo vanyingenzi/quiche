@@ -181,7 +181,7 @@ fn client_thread(
         multicore_initiate_connection(&conn_guard, &mut path, &mut out, &mut socket).unwrap();
     }
     
-    info!(
+    debug!(
         "[Path Thread]: Thread {:?}, started with path {} <-> {}",
         thread::current().id(),
         local_addr,
@@ -192,7 +192,9 @@ fn client_thread(
     let mut probed_my_path = initiate_connection;
 
     loop {
+        // TODO multicore
         poll.poll(&mut events, Some(Duration::from_millis(10))).unwrap();
+        
         if !events.is_empty() {
             match read_packets_on_socket(&conn_guard, &mut path, &mut buf, &socket, &events) {
                 Ok(()) => {},
@@ -206,6 +208,8 @@ fn client_thread(
                     return Err(e);
                 }
             }
+        } else {
+            path.on_timeout(&conn_guard);
         }
 
         handle_path_events(&mut path);
@@ -214,18 +218,16 @@ fn client_thread(
             let mut conn = conn_guard.write().unwrap();
             while conn.source_cids_left() > 0 {
                 let (scid, reset_token) = generate_cid_and_reset_token(&rng);
-    
                 if conn.new_source_cid(&scid, reset_token, false).is_err() {
                     break;
                 }
-    
                 scid_sent = true;
             }
         }
 
         if multipath_request &&
            !probed_my_path
-        {
+        {   // Done once per path
             let available_dcids;
             {
                 let conn = conn_guard.read().unwrap();
@@ -238,10 +240,9 @@ fn client_thread(
             }
         }
         
-        if probed_my_path{
+        if probed_my_path {
             write_packets_on_socket(&conn_guard, &mut path, &mut out, &socket)?;
         }
-
     }
 }
 
@@ -365,8 +366,7 @@ pub fn multicore_connect(
         local_addr,
         peer_addr,
         &mut config,
-    )
-    .unwrap();
+    ).unwrap();
 
     if let Some(keylog) = &mut keylog {
         if let Ok(keylog) = keylog.try_clone() {
@@ -387,12 +387,13 @@ pub fn multicore_connect(
     let mut threads_join = Vec::new();
     let cloned_conn_guard = conn_guard.clone();
     let multipath_requested = conn_args.multipath;
+
     threads_join.push(
         thread::spawn(move || {
             client_thread(
-                cloned_conn_guard, 
-                init_path, 
-                true, 
+                cloned_conn_guard,
+                init_path,
+                true,
                 multipath_requested
             )
         })
@@ -413,16 +414,16 @@ pub fn multicore_connect(
         threads_join.push(
             thread::spawn(move || {
                 client_thread(
-                    cloned_conn_guard, 
-                    path, 
-                    initiate_conn, 
+                    cloned_conn_guard,
+                    path,
+                    initiate_conn,
                     multipath_requested
                 )
             })
         );
     }
 
-    for join_handle in threads_join{
+    for join_handle in threads_join {
         match join_handle.join() {
             Ok(..) => {}, 
             Err(e) => {

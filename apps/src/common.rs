@@ -35,15 +35,15 @@ use std::collections::HashMap;
 
 #[cfg(feature = "sfv")]
 use std::convert::TryFrom;
-
 use std::fmt::Write as _;
-
 use std::rc::Rc;
-
 use std::cell::RefCell;
-
 use std::path;
+use std::sync::Arc;
+use std::sync::RwLock;
 
+use mio::Waker;
+use quiche::MulticoreConnection;
 use ring::rand::SecureRandom;
 
 use quiche::ConnectionId;
@@ -63,6 +63,7 @@ const H3_MESSAGE_ERROR: u64 = 0x10E;
 pub mod alpns {
     pub const HTTP_09: [&[u8]; 2] = [b"hq-interop", b"http/0.9"];
     pub const HTTP_3: [&[u8]; 1] = [b"h3"];
+    pub const MMPQUIC: [&[u8]; 1] = [b"mMPQUIC"];
 }
 
 pub struct PartialRequest {
@@ -110,6 +111,15 @@ pub struct Client {
 
 pub type ClientIdMap = HashMap<ConnectionId<'static>, ClientId>;
 pub type ClientMap = HashMap<ClientId, Client>;
+
+pub struct MulticoreClient {
+    /// The QUIC connection
+    pub conn: Arc<RwLock<MulticoreConnection>>, 
+    /// The waker to call by the final thread when it's done to allow new connections
+    pub on_done: Arc<Waker>,
+    /// The stream ids
+    pub next_stream_id: Arc<RwLock<u32>>
+}
 
 /// Makes a buffered writer for a resource with a target URL.
 ///

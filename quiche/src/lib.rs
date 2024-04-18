@@ -1575,7 +1575,7 @@ pub struct MulticoreConnection {
     closed: bool, // ! Concurrent access
 
     // Whether the connection was timed out
-    //timed_out: bool, // ! Concurrent access
+    timed_out: bool, // ! Concurrent access
 
     /// Whether to send GREASE.
     //grease: bool, // TODO : Ask as I didn't see this in the RFCs
@@ -6956,7 +6956,6 @@ impl Connection {
     }
 
     fn encode_transport_params(&mut self) -> Result<()> {
-        info!("encode_transport_params: {:?}", self.local_transport_params);
         let mut raw_params = [0; 168];
 
         let raw_params = TransportParams::encode(
@@ -6973,7 +6972,6 @@ impl Connection {
     fn parse_peer_transport_params(
         &mut self, peer_params: TransportParams,
     ) -> Result<()> {
-        info!("Parse peer transport params");
         // Validate initial_source_connection_id.
         match &peer_params.initial_source_connection_id {
             Some(v) if v != &self.destination_id() =>
@@ -7027,7 +7025,6 @@ impl Connection {
     fn process_peer_transport_params(
         &mut self, peer_params: TransportParams,
     ) -> Result<()> {
-        info!("In process_peer_transport_params");
 
         self.max_tx_data = peer_params.initial_max_data;
 
@@ -7071,7 +7068,6 @@ impl Connection {
     ///
     /// If the connection is already established, it does nothing.
     fn do_handshake(&mut self, now: time::Instant) -> Result<()> {
-        info!("In do hanshake");
         let mut ex_data = tls::ExData {
             application_protos: &self.application_protos,
 
@@ -7089,7 +7085,6 @@ impl Connection {
         };
 
         if self.handshake_completed {
-            info!("Process post handshake");
             return self.handshake.process_post_handshake(&mut ex_data);
         }
 
@@ -7097,7 +7092,6 @@ impl Connection {
             Ok(_) => (),
 
             Err(Error::Done) => {
-                info!("do_handshake returned Done");
                 // Try to parse transport parameters as soon as the first flight
                 // of handshake data is processed.
                 //
@@ -7105,7 +7099,6 @@ impl Connection {
                 // completed yet, though it's required to be able to send data
                 // in 0.5 RTT.
                 let raw_params = self.handshake.quic_transport_params();
-                info!("raw_params : {:?}", raw_params);
 
                 if !self.parsed_peer_transport_params && !raw_params.is_empty() {
                     let peer_params =
@@ -7119,8 +7112,6 @@ impl Connection {
 
             Err(e) => return Err(e),
         };
-
-        info!("HERRRRRRRRRRRRRRREE");
 
         self.handshake_completed = self.handshake.is_completed();
 
@@ -7480,14 +7471,12 @@ impl Connection {
                 let mut crypto_buf = [0; 512];
 
                 let level = crypto::Level::from_epoch(epoch);
-                info!("level: {:?}", level);
 
                 let stream =
                     &mut self.pkt_num_spaces.crypto.get_mut(epoch).crypto_stream;
 
                 while let Ok((read, _)) = stream.recv.emit(&mut crypto_buf) {
                     let recv_buf = &crypto_buf[..read];
-                    info!("Received : {:?}", recv_buf);
                     self.handshake.provide_data(level, recv_buf)?;
                 }
 
@@ -10470,14 +10459,12 @@ impl MulticorePath {
                 let mut crypto_buf = [0; 512];
 
                 let level = crypto::Level::from_epoch(epoch);
-                info!("level: {:?}", level);
 
                 let stream =
                     &mut conn.pkt_num_spaces.crypto.get_mut(epoch).crypto_stream;
 
                 while let Ok((read, _)) = stream.recv.emit(&mut crypto_buf) {
                     let recv_buf = &crypto_buf[..read];
-                    info!("Received : {:?}", recv_buf);
                     conn.handshake.provide_data(level, recv_buf)?;
                 }
 
@@ -10901,8 +10888,8 @@ impl MulticorePath {
         let is_closing;
         let trace_id;
         let source_id_len;
-        let did_version_negotiation;
-        let version;
+        let mut did_version_negotiation;
+        let mut version;
         let derived_initial_secrets;
 
         {
@@ -10910,7 +10897,6 @@ impl MulticorePath {
             if conn.is_closed() || conn.is_draining() {
                 return Err(Error::Done);
             }
-
             is_closing = conn.local_error.is_some();
             recv_count = conn.recv_count();
             trace_id = conn.trace_id.clone(); 
@@ -10989,6 +10975,7 @@ impl MulticorePath {
                 }
 
                 conn.version = cmp::max(conn.version, v);
+                version = conn.version;
             }
 
             if !found_version {
@@ -11003,6 +10990,7 @@ impl MulticorePath {
             }
 
             conn.did_version_negotiation = true;
+            did_version_negotiation = true;
 
             // Derive Initial secrets based on the new version.
             let (aead_open, aead_seal) = crypto::derive_initial_key_material(
@@ -11026,6 +11014,7 @@ impl MulticorePath {
                 .get_mut(packet::Epoch::Initial)
                 .crypto_seal = Some(aead_seal);
 
+            version = conn.version;
             conn.handshake
                 .use_legacy_codepoint(version != PROTOCOL_VERSION_V1);
 
@@ -11107,8 +11096,11 @@ impl MulticorePath {
             }
 
             conn.version = hdr.version;
+            version = hdr.version;
             conn.did_version_negotiation = true;
+            did_version_negotiation = !did_version_negotiation;
 
+            version = conn.version;
             conn.handshake
                 .use_legacy_codepoint(version != PROTOCOL_VERSION_V1);
 
@@ -11129,7 +11121,6 @@ impl MulticorePath {
             b.cap()
         } else {
             b.get_varint().map_err(|e| {
-                info!("Can't get payload len");
                 drop_pkt_on_err(
                     e.into(),
                     recv_count,
@@ -12226,6 +12217,133 @@ impl MulticorePath {
         Ok((read, fin))
     }
 
+    /// Returns the size of the send quantum, in bytes.
+    pub fn send_quantum(&self) -> usize {
+        match self.inner_path.as_ref() {
+            Some(p) => p.recovery.send_quantum(),
+            _ => 0,
+        }
+    }
+
+    /// Processes a timeout event.
+    ///
+    /// If no timeout has occurred it does nothing.
+    pub fn on_timeout(&mut self, conn_guard: &Arc<RwLock<MulticoreConnection>>) {
+        if self.inner_path.is_none() {
+            return;
+        }
+        let now = time::Instant::now();
+        let mut conn = conn_guard.write().unwrap();
+
+        // TODO multicore do better timeout handling
+
+        if let Some(draining_timer) = conn.draining_timer {
+            if draining_timer <= now {
+                trace!("{} draining timeout expired", conn.trace_id);
+
+                conn.closed = true;
+            }
+
+            // Draining timer takes precedence over all other timers. If it is
+            // set it means the connection is closing so there's no point in
+            // processing the other timers.
+            return;
+        }
+
+        if let Some(timer) = conn.idle_timer {
+            if timer <= now {
+                trace!("{} idle timeout expired", conn.trace_id);
+
+                conn.closed = true;
+                conn.timed_out = true;
+                return;
+            }
+        }
+
+        if let Some(timer) = conn
+            .pkt_num_spaces
+            .crypto
+            .get(packet::Epoch::Application)
+            .key_update
+            .as_ref()
+            .map(|key_update| key_update.timer)
+        {
+            if timer <= now {
+                // Discard previous key once key update timer expired.
+                let _ = conn
+                    .pkt_num_spaces
+                    .crypto
+                    .get_mut(packet::Epoch::Application)
+                    .key_update
+                    .take();
+            }
+        }
+
+        let handshake_status = conn.handshake_status();
+        let p = self.inner_path.as_mut().unwrap();
+        if let Some(timer) = p.closing_timer() {
+            if timer <= now {
+                trace!("{} path closing timeout expired", conn.trace_id);
+                if let Some(dcid_seq) = p.active_dcid_seq {
+                    conn.ids.retire_dcid(dcid_seq).ok();
+                    let min_dcid_seq = conn.ids.min_dcid_seq();
+                    conn.pkt_num_spaces
+                        .spaces
+                        .update_lowest_active_tx_id(min_dcid_seq);
+                }
+                p.on_closing_timeout();
+            }
+        }
+        if let Some(timer) = p.recovery.loss_detection_timer() {
+            if timer <= now {
+                trace!("{} loss detection timeout expired", conn.trace_id);
+
+                p.on_loss_detection_timeout(
+                    handshake_status,
+                    now,
+                    self.is_server,
+                    &conn.trace_id,
+                );
+            }
+        }
+
+        // Notify timeout events to the application.
+        self.notify_failed_validation();
+        self.notify_closed_path();
+
+        // If the active path failed, try to find a new candidate.
+        // TODO multicore failed path validation
+    }
+
+    fn notify_failed_validation(&mut self) {
+        let p = self.inner_path.as_ref().unwrap();
+        if p.validation_failed() && !p.failure_notified {
+            self.notify_event(PathEvent::FailedValidation(
+                self.local_addr,
+                self.peer_addr,
+            ));
+            let p = self.inner_path.as_mut().unwrap();
+            p.failure_notified = true;
+        }
+    }
+
+    fn notify_closed_path(&mut self) {
+        let p = self.inner_path.as_ref().unwrap();
+        if p.closed() && !p.failure_notified {
+            if let PathState::Closed(e, r) = &p.state {
+                self.notify_event(PathEvent::Closed(
+                    self.local_addr,
+                    self.peer_addr,
+                    *e,
+                    r.clone(),
+                ));
+                let p = self.inner_path.as_mut().unwrap();
+                p.failure_notified = true;
+            }
+        }
+    }
+
+
 }
 
 impl MulticoreConnection {
@@ -12360,7 +12478,7 @@ impl MulticoreConnection {
 
             closed: false,
 
-            // timed_out: false,
+            timed_out: false,
 
             // grease: config.grease,
 
@@ -12470,7 +12588,6 @@ impl MulticoreConnection {
 
     fn encode_transport_params(&mut self) -> Result<()> {
 
-        info!("encode_transport_params: {:?}", self.local_transport_params);
         let mut raw_params = [0; 168];
 
         let raw_params = TransportParams::encode(
@@ -12524,7 +12641,6 @@ impl MulticoreConnection {
         if let Some(path_id) = path.path_id{
             if let Some(queue) = self.per_path_unprocessed_events.get_mut(&path_id){
                 while let Some(e) = queue.pop_front(){
-                    info!("Got event {:?}", e);
                     path.multicore_events.push_back(e);
                 }
             }
@@ -12683,7 +12799,6 @@ impl MulticoreConnection {
         &mut self, peer_params: TransportParams,
         path: &mut MulticorePath
     ) -> Result<()> {
-        info!("Parse peer transport params");
         if !self.is_lowest_active_path_id(path) {
             return Err(Error::InvalidState);
         }
@@ -12749,7 +12864,6 @@ impl MulticoreConnection {
     fn process_peer_transport_params(
         &mut self, peer_params: TransportParams, path: &mut MulticorePath
     ) -> Result<()> {
-        info!("In process_peer_transport_params");
         if !self.is_lowest_active_path_id(path) {
             return Err(Error::InvalidState);
         }
@@ -12967,7 +13081,6 @@ impl MulticoreConnection {
     /// If the connection is already established, it does nothing.
     /// The path allowed to call this function has to be the lowest active path_id
     fn do_handshake(&mut self, now: time::Instant, path: &mut MulticorePath) -> Result<()> {
-        info!("In do_handshake");
         let mut ex_data = tls::ExData {
             application_protos: &self.application_protos,
 
@@ -12984,10 +13097,7 @@ impl MulticoreConnection {
             is_server: self.is_server,
         };
 
-        info!("do_handshake");
-
         if self.handshake_completed {
-            info!("Process post handshake");
             return self.handshake.process_post_handshake(&mut ex_data);
         }
 
@@ -12995,7 +13105,6 @@ impl MulticoreConnection {
             Ok(_) => (),
 
             Err(Error::Done) => {
-                info!("do_handshake returned Done");
                 // Try to parse transport parameters as soon as the first flight
                 // of handshake data is processed.
                 //
@@ -13003,7 +13112,6 @@ impl MulticoreConnection {
                 // completed yet, though it's required to be able to send data
                 // in 0.5 RTT.
                 let raw_params = self.handshake.quic_transport_params();
-                info!("raw_params : {:?}", raw_params);
 
                 if !self.parsed_peer_transport_params && !raw_params.is_empty() {
                     let peer_params =
@@ -13018,7 +13126,6 @@ impl MulticoreConnection {
             Err(e) => return Err(e),
         };
 
-        info!("HERRRRRRRRRRRRRRREE");
 
         self.handshake_completed = self.handshake.is_completed();
 
