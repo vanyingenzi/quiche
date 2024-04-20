@@ -39,11 +39,15 @@ use std::fmt::Write as _;
 use std::rc::Rc;
 use std::cell::RefCell;
 use std::path;
+use std::sync::mpsc::Receiver;
+use std::sync::mpsc::Sender;
+use std::sync::mpsc::TryRecvError;
 use std::sync::Arc;
 use std::sync::RwLock;
 
 use mio::Waker;
 use quiche::MulticoreConnection;
+use quiche::MulticorePath;
 use ring::rand::SecureRandom;
 
 use quiche::ConnectionId;
@@ -114,11 +118,60 @@ pub type ClientMap = HashMap<ClientId, Client>;
 
 pub struct MulticoreClient {
     /// The QUIC connection
-    pub conn: Arc<RwLock<MulticoreConnection>>, 
-    /// The waker to call by the final thread when it's done to allow new connections
-    pub on_done: Arc<Waker>,
+    pub conn: Arc<RwLock<MulticoreConnection>>,
     /// The stream ids
-    pub next_stream_id: Arc<RwLock<u32>>
+    pub next_stream_id: Arc<RwLock<u64>>
+}
+
+#[derive(Debug)]
+pub enum MulticoreStatus {
+    Success,
+    Error,
+/*     Timeout,
+    Closed, */
+}
+
+#[derive(Debug)]
+pub struct MulticorePathDoneInfo {
+    pub local: std::net::SocketAddr,
+    pub peer: std::net::SocketAddr,
+    pub status: MulticoreStatus,
+}
+
+pub fn handle_done_paths(
+    rx_finish_channel: Option<&mut Receiver<MulticorePathDoneInfo>>,
+    nb_active_paths: &mut usize,
+) -> Result<(), ClientError> {
+    if let Some(rx) = rx_finish_channel {
+        match rx.try_recv() {
+            Ok(v) => {
+                debug!("received message {:?}", v);
+                *nb_active_paths -= 1;
+            },
+            Err(TryRecvError::Empty) => {},
+            Err(TryRecvError::Disconnected) => {
+                *nb_active_paths = 1;
+            }
+        }
+    }
+    Ok(())
+}
+
+pub fn signal_path_done(
+    path: &mut MulticorePath, status: MulticoreStatus,
+    tx_finish_channel: Option<&mut Sender<MulticorePathDoneInfo>>,
+) -> bool {
+    if let Some(tx) = tx_finish_channel {
+        tx.send(MulticorePathDoneInfo {
+            local: path.local_addr(),
+            peer: path.peer_addr(),
+            status,
+        })
+        .unwrap();
+        true
+    } else {
+        false
+    }
 }
 
 /// Makes a buffered writer for a resource with a target URL.

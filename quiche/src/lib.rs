@@ -1521,9 +1521,6 @@ pub struct MulticoreConnection {
     /// frame.
     peer_error: Option<ConnectionError>, // ! Concurrent Acces in case of failure
 
-    /// Draining timeout expiration time.
-    draining_timer: Option<time::Instant>, // ! Concurrent Acces in closing connection
-
     /// Whether an ack-eliciting packet has been sent since last receiving a
     /// packet.
     ack_eliciting_sent: bool,
@@ -1630,6 +1627,8 @@ pub struct MulticoreConnection {
     multipath: bool, 
 
     per_path_unprocessed_events: BTreeMap<usize, VecDeque<MulticorePathPendingEvent>>, 
+    /// Whether the connection is in draining state
+    draining: bool
 }
  
 
@@ -8465,6 +8464,8 @@ pub struct MulticorePath {
     peer_transport_params: TransportParams,
     /// Whether the multipath extensions are enabled.
     pub multipath: bool,
+    /// Draining timeout expiration time.
+    draining_timer: Option<time::Instant>,
 }
 
 impl MulticorePath {
@@ -8514,6 +8515,7 @@ impl MulticorePath {
             stream_retrans_bytes: 0,
             multipath: false,
             //newly_acked: Vec::new(),
+            draining_timer: None,
         }
     }
 
@@ -8559,6 +8561,7 @@ impl MulticorePath {
             multipath: false,
             stream_retrans_bytes: 0,
             // newly_acked: Vec::new(),
+            draining_timer: None,
         }
     }
 
@@ -9527,11 +9530,12 @@ impl MulticorePath {
             }
         }
 
+        let path_id = self.path_id.unwrap();
         let path = self.inner_path.as_mut().unwrap();
 
         // Create CONNECTION_CLOSE frame. Try to send this only on the active
         // path, unless it is the last one available.
-        if path.active() || n_paths == 1 {
+        if path_id == conn.lowest_active_path_id && path.active() || n_paths == 1 {
             if let Some(conn_err) = conn.local_error.as_ref() {
                 if conn_err.is_app {
                     // Create ApplicationClose frame.
@@ -9543,7 +9547,7 @@ impl MulticorePath {
 
                         if push_frame_to_pkt!(b, frames, frame, left) {
                             let pto = path.recovery.pto();
-                            conn.draining_timer = Some(now + (pto * 3));
+                            self.draining_timer = Some(now + (pto * 3));
 
                             ack_eliciting = true;
                             in_flight = true;
@@ -9559,7 +9563,7 @@ impl MulticorePath {
 
                     if push_frame_to_pkt!(b, frames, frame, left) {
                         let pto = path.recovery.pto();
-                        conn.draining_timer = Some(now + (pto * 3));
+                        self.draining_timer = Some(now + (pto * 3));
 
                         ack_eliciting = true;
                         in_flight = true;
@@ -10676,7 +10680,7 @@ impl MulticorePath {
                 });
 
                 let path = self.get_inner_path_mut().unwrap();
-                conn.draining_timer = Some(now + (path.recovery.pto() * 3));
+                self.draining_timer = Some(now + (path.recovery.pto() * 3));
             },
 
             frame::Frame::ApplicationClose { error_code, reason } => {
@@ -10687,7 +10691,7 @@ impl MulticorePath {
                 });
 
                 let path = self.get_inner_path_mut().unwrap();
-                conn.draining_timer = Some(now + (path.recovery.pto() * 3));
+                self.draining_timer = Some(now + (path.recovery.pto() * 3));
             },
 
             frame::Frame::HandshakeDone => {
@@ -11098,7 +11102,7 @@ impl MulticorePath {
             conn.version = hdr.version;
             version = hdr.version;
             conn.did_version_negotiation = true;
-            did_version_negotiation = !did_version_negotiation;
+            did_version_negotiation = true;
 
             version = conn.version;
             conn.handshake
@@ -12134,6 +12138,18 @@ impl MulticorePath {
         stream.recv.is_fin()
     }
 
+    /// Returns an iterator over streams that can be written in priority order.
+    #[inline]
+    pub fn writable(&self) -> StreamIter {
+        // If there is not enough connection-level send capacity, none of the
+        // streams are writable, so return an empty iterator.
+        if self.tx_cap == 0 {
+            return StreamIter::default();
+        }
+
+        self.streams.writable()
+    }
+
     /// Returns an iterator over streams that have outstanding data to read.
     #[inline]
     pub fn readable(&self) -> StreamIter {
@@ -12237,7 +12253,7 @@ impl MulticorePath {
 
         // TODO multicore do better timeout handling
 
-        if let Some(draining_timer) = conn.draining_timer {
+        if let Some(draining_timer) = self.draining_timer {
             if draining_timer <= now {
                 trace!("{} draining timeout expired", conn.trace_id);
 
@@ -12310,9 +12326,6 @@ impl MulticorePath {
         // Notify timeout events to the application.
         self.notify_failed_validation();
         self.notify_closed_path();
-
-        // If the active path failed, try to find a new candidate.
-        // TODO multicore failed path validation
     }
 
     fn notify_failed_validation(&mut self) {
@@ -12354,6 +12367,26 @@ impl MulticoreConnection {
     ) -> Result<(MulticoreConnection, MulticorePath)> {
         let tls = config.tls_ctx.new_handshake()?;
         MulticoreConnection::with_tls(scid, odcid, local, peer, config, tls, is_server)
+    }
+
+    /// Returns true if the connection is draining.
+    ///
+    /// If this returns `true`, the connection object cannot yet be dropped, but
+    /// no new application data can be sent or received. An application should
+    /// continue calling the [`recv()`], [`timeout()`], and [`on_timeout()`]
+    /// methods as normal, until the [`is_closed()`] method returns `true`.
+    ///
+    /// In contrast, once `is_draining()` returns `true`, calling [`send()`]
+    /// is not required because no new outgoing packets will be generated.
+    ///
+    /// [`recv()`]: struct.Connection.html#method.recv
+    /// [`send()`]: struct.Connection.html#method.send
+    /// [`timeout()`]: struct.Connection.html#method.timeout
+    /// [`on_timeout()`]: struct.Connection.html#method.on_timeout
+    /// [`is_closed()`]: struct.Connection.html#method.is_closed
+    #[inline]
+    pub fn is_draining(&self) -> bool {
+        self.draining
     }
 
     fn with_tls(
@@ -12408,7 +12441,7 @@ impl MulticoreConnection {
             ids,
 
             trace_id: scid_as_hex.join(""),
-
+            draining: false, 
             pkt_num_spaces: packet::PktNumSpaceMap::new(),
 
             peer_transport_params: TransportParams::default(),
@@ -12443,9 +12476,6 @@ impl MulticoreConnection {
             local_error: None,
 
             peer_error: None,
-
-
-            draining_timer: None,
 
             undecryptable_pkts: VecDeque::new(),
 
@@ -12736,26 +12766,6 @@ impl MulticoreConnection {
     /// Destination Connection IDs.
     pub fn available_dcids(&self) -> usize {
         self.ids.available_dcids()
-    }
-
-    /// Returns true if the connection is draining.
-    ///
-    /// If this returns `true`, the connection object cannot yet be dropped, but
-    /// no new application data can be sent or received. An application should
-    /// continue calling the [`recv()`], [`timeout()`], and [`on_timeout()`]
-    /// methods as normal, until the [`is_closed()`] method returns `true`.
-    ///
-    /// In contrast, once `is_draining()` returns `true`, calling [`send()`]
-    /// is not required because no new outgoing packets will be generated.
-    ///
-    /// [`recv()`]: struct.Connection.html#method.recv
-    /// [`send()`]: struct.Connection.html#method.send
-    /// [`timeout()`]: struct.Connection.html#method.timeout
-    /// [`on_timeout()`]: struct.Connection.html#method.on_timeout
-    /// [`is_closed()`]: struct.Connection.html#method.is_closed
-    #[inline]
-    pub fn is_draining(&self) -> bool {
-        self.draining_timer.is_some()
     }
 
     /// Returns true if the connection is closed.
@@ -13192,7 +13202,7 @@ impl MulticoreConnection {
 
     /// Closes the connection with the given error and reason.
     pub fn close(&mut self, app: bool, err: u64, reason: &[u8]) -> Result<()> {
-        if self.is_closed() || self.is_draining() {
+        if self.is_closed() || self.draining {
             return Err(Error::Done);
         }
 
@@ -13351,6 +13361,12 @@ impl MulticoreConnection {
         self.process_peer_transport_params(peer_params, path)?;
 
         Ok(())
+    }
+
+    #[inline]
+    /// Returns the know stats about the paths
+    pub fn stats(&self) -> Vec<PathStats> {
+        self.paths_stats.values().map(|stat| stat.clone()).into_iter().collect::<Vec<PathStats>>()
     }
 }
 /// Maps an `Error` to `Error::Done`, or itself.

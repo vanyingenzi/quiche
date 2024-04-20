@@ -12,7 +12,7 @@ RUST_LOG=info ../target/release/quiche-server --root /tmp/www --multipath --mult
 
 client 
 ```bash
-RUST_LOG=info ../target/release/quiche-client https:127.0.0.1:4433/testfile --no-verify -A 127.0.0.1:6788 -A 127.0.0.1:6789 --multipath --multicore >/dev/null
+RUST_LOG=info ../target/release/quiche-client https:127.0.0.1:4433/testfile --no-verify -A 127.0.0.1:6788 -A 127.0.0.1:6789 --multipath --multicore --wire-version 1 >/dev/null
 ```
 
 ```bash

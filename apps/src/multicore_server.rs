@@ -1,26 +1,28 @@
-
-use std::io;
+use quiche::{Config, MulticoreConnection, MulticorePath};
+use ring::rand::*;
 use std::convert::TryFrom;
 use std::fs::File;
+use std::io;
+use std::sync::Arc;
 use std::sync::RwLock;
 use std::thread;
 use std::time::Duration;
-use quiche::{MulticorePath, MulticoreConnection, Config};
-use ring::rand::*;
-use std::sync::Arc;
 
-use mio::{Events, Poll, Token, Waker, Interest};
 use crate::args::*;
 use crate::common::*;
 use crate::sendto::*;
+
+use mio::{Interest, Token};
+use std::sync::mpsc::{channel, Receiver, Sender};
 
 const MAX_BUF_SIZE: usize = 65507;
 const MAX_DATAGRAM_SIZE: usize = 1350;
 
 fn server_thread(
-    client: Arc<MulticoreClient>,
-    mut path: MulticorePath, 
-    args: ServerArgs
+    client: Arc<MulticoreClient>, mut path: MulticorePath, args: ServerArgs,
+    nb_initiated_paths: usize,
+    mut tx_finish_channel: Option<Sender<MulticorePathDoneInfo>>,
+    mut rx_finish_channel: Option<Receiver<MulticorePathDoneInfo>>,
 ) -> () {
     let mut buf = [0; MAX_BUF_SIZE];
     let mut out = [0; MAX_BUF_SIZE];
@@ -29,26 +31,36 @@ fn server_thread(
     let mut events = mio::Events::with_capacity(1024);
 
     let local_addr = path.local_addr();
-    let peer_addr: std::net::SocketAddr = path.peer_addr();
-    let (socket, pacing, enable_gso) = 
-        multicore_create_socket(&local_addr,&peer_addr, &mut poll, args.disable_pacing, args.disable_gso);
-    
+    let peer_addr = path.peer_addr();
+    let (socket, pacing, enable_gso) = multicore_create_socket(
+        &local_addr,
+        &peer_addr,
+        &mut poll,
+        args.disable_pacing,
+        args.disable_gso,
+    );
+
     // All the followings are one time flags. They switch from false to true
     let mut continue_write = false;
-    let mut loss_rate ;
-    let max_datagram_size = MAX_DATAGRAM_SIZE; 
+    let mut loss_rate;
+    let max_datagram_size = MAX_DATAGRAM_SIZE;
     let mut max_send_burst = MAX_BUF_SIZE;
 
     let mut create_send_stream = false;
     let mut is_established = false;
     let mut is_in_early_data = false;
 
-    // let to_send = (2 as usize).pow(29); // 500MB to send
+    let to_send = (2 as usize).pow(29); // 500MB to send
     let mut stream_id = None;
+    let body: Vec<u8> = std::iter::repeat(255).take(to_send).collect();
+    let mut sent = 0;
+    let mut nb_active_paths = nb_initiated_paths;
+    let mut can_close_conn = false;
+
     loop {
         let timeout = match continue_write {
-            true => Some(Duration::ZERO), 
-            false => Some(Duration::from_millis(10))
+            true => Some(Duration::ZERO),
+            false => Some(Duration::from_millis(10)), // TODO multicore timeout
         };
 
         poll.poll(&mut events, timeout).unwrap();
@@ -56,6 +68,15 @@ fn server_thread(
         'read: loop {
             if events.is_empty() && !continue_write {
                 trace!("timed out");
+
+                if rx_finish_channel.is_some() {
+                    handle_done_paths(
+                        rx_finish_channel.as_mut(),
+                        &mut nb_active_paths,
+                    )
+                    .unwrap();
+                }
+
                 // TODO multicore timeout
                 path.on_timeout(&client.conn);
                 break 'read;
@@ -94,38 +115,84 @@ fn server_thread(
             };
 
             trace!("[Path Thread] processed {} bytes", read);
-            
-            if !create_send_stream  {
-                let conn = client.conn.read().unwrap();
-                if !(is_in_early_data || is_established){
-                    let app_proto = conn.application_proto();
-                    
-                    #[allow(clippy::box_default)]
-                    if alpns::MMPQUIC.contains(&app_proto) {
-                        create_send_stream = true;
-                        {
-                            let mut next_stream_id = client.next_stream_id.write().unwrap();
-                            stream_id = Some(next_stream_id.clone());
-                            *next_stream_id += 1;
-                        }
-                    } else if alpns::HTTP_3.contains(&app_proto) {
-                        let mut conn = client.conn.write().unwrap();
-                        error!("APLN not mMPQUIC");
-                        conn.close(true, 0, b"APLN not mMPQUIC".as_slice()).unwrap();
+
+            if !create_send_stream {
+                if is_in_early_data || is_established {
+                    let app_proto;
+                    {
+                        let conn = client.conn.read().unwrap();
+                        app_proto = conn.application_proto().to_vec();
                     }
 
+                    #[allow(clippy::box_default)]
+                    if alpns::MMPQUIC.contains(&app_proto.as_slice()) {
+                        create_send_stream = true;
+                        {
+                            let mut next_stream_id =
+                                client.next_stream_id.write().unwrap();
+                            stream_id = Some(next_stream_id.clone());
+                            *next_stream_id += 4; // We are using server unidirectional streams
+                                                  // Create the stream
+                        }
+                        path.stream_send(
+                            &client.conn,
+                            stream_id.unwrap(),
+                            &[0u8; 0],
+                            false,
+                        )
+                        .unwrap();
+                    } else {
+                        let mut conn = client.conn.write().unwrap();
+                        error!("APLN not mMPQUIC");
+                        conn.close(true, 0, b"APLN not mMPQUIC".as_slice())
+                            .unwrap();
+                    }
                 } else {
+                    let conn = client.conn.read().unwrap();
                     is_in_early_data = conn.is_in_early_data();
                     is_established = conn.is_established();
                 }
             }
 
-            if stream_id.is_some() && create_send_stream {
-
+            if stream_id.is_some() && create_send_stream && !can_close_conn {
+                for stream_id in path.writable() {
+                    let written = match path.stream_send(
+                        &client.conn,
+                        stream_id,
+                        &body[sent..],
+                        sent == to_send,
+                    ) {
+                        Ok(v) => v,
+                        Err(quiche::Error::Done) => 0,
+                        Err(e) => {
+                            error!(
+                                "An error occured on stream id {:?}: {:?}",
+                                stream_id, e
+                            );
+                            0
+                        },
+                    };
+                    trace!("Written {} to stream id {}", written, stream_id);
+                    sent += written;
+                    if sent == to_send {
+                        info!(
+                            "path {:?} <-> {:?} done sending",
+                            local_addr, peer_addr
+                        );
+                        can_close_conn = true;
+                        if tx_finish_channel.is_some() {
+                            if signal_path_done(
+                                &mut path,
+                                MulticoreStatus::Success,
+                                tx_finish_channel.as_mut(),
+                            ) {
+                                return;
+                            }
+                        }
+                    }
+                }
             }
         }
-
-
 
         handle_path_events(&mut path, &client.conn);
 
@@ -137,14 +204,15 @@ fn server_thread(
             max_send_burst = max_send_burst.max(max_datagram_size * 10);
         }
 
-        let max_send_burst =
-            path.send_quantum().min(max_send_burst) / max_datagram_size * max_datagram_size;
+        let max_send_burst = path.send_quantum().min(max_send_burst)
+            / max_datagram_size
+            * max_datagram_size;
         let mut total_write = 0;
         let mut dst_info: Option<quiche::SendInfo> = None;
 
         while total_write < max_send_burst {
             let res = path.send_on_path(
-                &client.conn, 
+                &client.conn,
                 &mut out[total_write..max_send_burst],
             );
 
@@ -152,12 +220,21 @@ fn server_thread(
                 Ok(v) => v,
 
                 Err(quiche::Error::Done) => {
-                    trace!("{} <-> {} done writing", path.local_addr(), path.peer_addr());
+                    trace!(
+                        "{} <-> {} done writing",
+                        path.local_addr(),
+                        path.peer_addr()
+                    );
                     break;
                 },
 
                 Err(e) => {
-                    error!("{} <-> {} send failed: {:?}",  path.local_addr(), path.peer_addr(), e);
+                    error!(
+                        "{} <-> {} send failed: {:?}",
+                        path.local_addr(),
+                        path.peer_addr(),
+                        e
+                    );
                     let mut conn = client.conn.write().unwrap();
                     conn.close(false, 0x1, b"fail").ok();
                     break;
@@ -198,18 +275,31 @@ fn server_thread(
                 continue_write = true;
             }
         }
+
+        if can_close_conn && nb_active_paths == 1 {
+            let conn = client.conn.read().unwrap();
+            if conn.is_closed() {
+                info!(
+                    "connection collected {:?}",
+                    conn.stats(),
+                );
+
+                return
+            }
+        }
     }
 }
 
-pub fn multicore_start_server(args: ServerArgs, conn_args: CommonArgs){
+pub fn multicore_start_server(args: ServerArgs, conn_args: CommonArgs) {
     env_logger::builder()
-    .default_format_timestamp_nanos(true)
-    .init();
+        .default_format_timestamp_nanos(true)
+        .init();
 
     let mut pacing = false;
 
-    // Dumy socket used for detecting gso 
-    let socket = mio::net::UdpSocket::bind("127.0.0.1:0".parse().unwrap()).unwrap(); 
+    // Dumy socket used for detecting gso
+    let socket =
+        mio::net::UdpSocket::bind("127.0.0.1:0".parse().unwrap()).unwrap();
 
     // Set SO_TXTIME socket option on the listening UDP socket for pacing
     // outgoing packets.
@@ -297,39 +387,68 @@ pub fn multicore_start_server(args: ServerArgs, conn_args: CommonArgs){
 
     let local_addr = args.listen.parse().unwrap();
 
-    let mut threads_poll = Poll::new().unwrap();
-    let mut threads_done_event = Events::with_capacity(1024);
-    let threads_done_token = Token(0);
-    let waker = Arc::new(Waker::new(threads_poll.registry(), threads_done_token).unwrap());
-
     drop(socket); // Garbage collect the initial socket
 
     loop {
-        let (conn, init_path) = wait_for_new_connection(&mut config, &args, &mut keylog, local_addr);
-        info!("Received new connection");
-        let client = MulticoreClient{
-            conn: Arc::new(RwLock::new(conn)), 
-            on_done: waker.clone(), 
-            next_stream_id: Arc::new(RwLock::new(3))
+        let (conn, init_path) =
+            wait_for_new_connection(&mut config, &args, &mut keylog, local_addr);
+
+        let client = MulticoreClient {
+            conn: Arc::new(RwLock::new(conn)),
+            next_stream_id: Arc::new(RwLock::new(3)),
         };
         let client = Arc::new(client);
         let copied_args = args.clone();
-        thread::spawn(move || {
+        let (tx, rx) = channel();
+        let nb_initiated_paths = 2; // Hard coded
+        let clone_client_arc = client.clone();
+
+        let local_addr = init_path.local_addr();
+        let peer_addr = init_path.peer_addr();
+
+        let mut joins = Vec::new();
+        joins.push(thread::spawn(move || {
             server_thread(
-                client, 
-                init_path, 
-                copied_args
+                clone_client_arc,
+                init_path,
+                copied_args,
+                nb_initiated_paths,
+                None,
+                Some(rx),
             )
-        });
-        threads_poll.poll(&mut threads_done_event, None).unwrap();
+        }));
 
+        let new_local_addr = increment_port(local_addr);
+        let new_peer_addr = increment_port(peer_addr);
+        let additional_path =
+            MulticorePath::default(&config, false, new_local_addr, new_peer_addr);
+        let copied_args = args.clone();
+
+        joins.push(thread::spawn(move || {
+            server_thread(
+                client,
+                additional_path,
+                copied_args,
+                nb_initiated_paths,
+                Some(tx),
+                None,
+            )
+        }));
+
+        for join_handle in joins {
+            match join_handle.join() {
+                Ok(..) => {},
+                Err(e) => {
+                    error!("join return: error {:?}", e);
+                },
+            }
+        }
     }
-
 }
 
 fn wait_for_new_connection(
-    config: &mut Config, args: &ServerArgs,
-    keylog: &mut Option<File>, local_addr: std::net::SocketAddr
+    config: &mut Config, args: &ServerArgs, keylog: &mut Option<File>,
+    local_addr: std::net::SocketAddr,
 ) -> (MulticoreConnection, MulticorePath) {
     let rng = SystemRandom::new();
 
@@ -341,8 +460,11 @@ fn wait_for_new_connection(
     let mut events = mio::Events::with_capacity(1024);
     let mut socket = mio::net::UdpSocket::bind(local_addr).unwrap();
 
-    let conn_id_seed = ring::hmac::Key::generate(ring::hmac::HMAC_SHA256, &rng).unwrap();
-    poll.registry().register(&mut socket,  Token(0), Interest::READABLE).unwrap();    
+    let conn_id_seed =
+        ring::hmac::Key::generate(ring::hmac::HMAC_SHA256, &rng).unwrap();
+    poll.registry()
+        .register(&mut socket, Token(0), Interest::READABLE)
+        .unwrap();
     loop {
         info!("[Listener] listening on {:}", socket.local_addr().unwrap());
 
@@ -510,19 +632,20 @@ fn wait_for_new_connection(
                 }
             }
 
-            info!("early ? {} established {}", conn.is_in_early_data(), conn.is_established());
+            info!(
+                "early ? {} established {}",
+                conn.is_in_early_data(),
+                conn.is_established()
+            );
             // TODO multicore qlog
-            return (conn, init_path)
+            return (conn, init_path);
         }
     }
 }
 
 fn multicore_create_socket(
-    local_addr: &std::net::SocketAddr, 
-    peer_addr: &std::net::SocketAddr,
-    poll: &mut mio::Poll, 
-    disable_pacing: bool, 
-    disable_gso: bool
+    local_addr: &std::net::SocketAddr, peer_addr: &std::net::SocketAddr,
+    poll: &mut mio::Poll, disable_pacing: bool, disable_gso: bool,
 ) -> (mio::net::UdpSocket, bool, bool) {
     let mut socket = mio::net::UdpSocket::bind(*local_addr).unwrap();
     let mut pacing = false;
@@ -532,14 +655,15 @@ fn multicore_create_socket(
             Ok(_) => {
                 pacing = true;
                 debug!("successfully set SO_TXTIME socket option");
-            }, 
+            },
             Err(e) => debug!("setsockopt failed {:?}", e),
         }
     }
 
-    info!("[Server Thread] Thread ID : {:?} Started with path {:?} <-> {:?}", 
-        thread::current().id(), 
-        local_addr, 
+    info!(
+        "[Server Thread] Thread ID : {:?} Started with path {:?} <-> {:?}",
+        thread::current().id(),
+        local_addr,
         peer_addr
     );
 
@@ -638,43 +762,31 @@ fn set_txtime_sockopt(sock: &mio::net::UdpSocket) -> io::Result<()> {
     Ok(())
 }
 
-fn handle_path_events(path: &mut MulticorePath, conn_guard: &Arc<RwLock<MulticoreConnection>>) {
+fn handle_path_events(
+    path: &mut MulticorePath, conn_guard: &Arc<RwLock<MulticoreConnection>>,
+) {
     while let Some(qe) = path.path_event_next() {
         match qe {
             quiche::PathEvent::New(local_addr, peer_addr) => {
-                info!(
-                    "Seen new path ({}, {})",
-                    local_addr,
-                    peer_addr
-                );
+                info!("Seen new path ({}, {})", local_addr, peer_addr);
 
                 // Directly probe the new path.
-                path
-                    .probe_path(conn_guard)
+                path.probe_path(conn_guard)
                     .map_err(|e| error!("cannot probe: {}", e))
                     .ok();
             },
 
             quiche::PathEvent::Validated(local_addr, peer_addr) => {
-                info!(
-                    "Path ({}, {}) is now validated",
-                    local_addr,
-                    peer_addr
-                );
+                info!("Path ({}, {}) is now validated", local_addr, peer_addr);
                 if path.multipath {
-                    path
-                        .set_active(true)
+                    path.set_active(true)
                         .map_err(|e| error!("cannot set path active: {}", e))
                         .ok();
                 }
             },
 
             quiche::PathEvent::FailedValidation(local_addr, peer_addr) => {
-                info!(
-                    "Path ({}, {}) failed validation",
-                    local_addr,
-                    peer_addr
-                );
+                info!("Path ({}, {}) failed validation", local_addr, peer_addr);
             },
 
             quiche::PathEvent::Closed(local_addr, peer_addr, err, reason) => {
@@ -690,18 +802,12 @@ fn handle_path_events(path: &mut MulticorePath, conn_guard: &Arc<RwLock<Multicor
             quiche::PathEvent::ReusedSourceConnectionId(cid_seq, old, new) => {
                 info!(
                     "Peer reused cid seq {} (initially {:?}) on {:?}",
-                    cid_seq,
-                    old,
-                    new
+                    cid_seq, old, new
                 );
             },
 
             quiche::PathEvent::PeerMigrated(local_addr, peer_addr) => {
-                info!(
-                    "Connection migrated to ({}, {})",
-                    local_addr,
-                    peer_addr
-                );
+                info!("Connection migrated to ({}, {})", local_addr, peer_addr);
             },
 
             quiche::PathEvent::PeerPathStatus(addr, path_status) => {
@@ -713,6 +819,11 @@ fn handle_path_events(path: &mut MulticorePath, conn_guard: &Arc<RwLock<Multicor
     }
 }
 
+fn increment_port(socket_addr: std::net::SocketAddr) -> std::net::SocketAddr {
+    let (ip, port) = (socket_addr.ip(), socket_addr.port());
+    let new_port = port + 1;
+    std::net::SocketAddr::new(ip, new_port)
+}
 
 #[cfg(not(target_os = "linux"))]
 fn set_txtime_sockopt(_: &mio::net::UdpSocket) -> io::Result<()> {

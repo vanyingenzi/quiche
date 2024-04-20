@@ -25,10 +25,10 @@
 // SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 use crate::args::*;
-
-use std::net::ToSocketAddrs;
 use crate::common::*;
 
+use std::net::ToSocketAddrs;
+use std::sync::mpsc::TryRecvError;
 use std::sync::Arc;
 use std::sync::RwLock;
 use std::thread;
@@ -39,20 +39,24 @@ use mio::Events;
 use mio::Poll;
 use quiche::{MulticoreConnection, MulticorePath};
 use ring::rand::*;
+use std::sync::mpsc::{channel, Receiver, Sender};
 
 const MAX_DATAGRAM_SIZE: usize = 1350;
 const MAX_BUF_SIZE: usize = 65507;
 
 fn multicore_initiate_connection(
     conn_guard: &Arc<RwLock<MulticoreConnection>>, path: &mut MulticorePath,
-    out: &mut [u8], socket: &mut mio::net::UdpSocket, 
+    out: &mut [u8], socket: &mut mio::net::UdpSocket,
 ) -> Result<(), ClientError> {
     info!(
         "connecting to {:} from {:}",
-        path.peer_addr(), path.local_addr(),
+        path.peer_addr(),
+        path.local_addr(),
     );
 
-    let (write, send_info) = path.send_on_path(conn_guard, out).expect("initial send failed");
+    let (write, send_info) = path
+        .send_on_path(conn_guard, out)
+        .expect("initial send failed");
     while let Err(e) = socket.send_to(&out[..write], send_info.to) {
         if e.kind() == std::io::ErrorKind::WouldBlock {
             trace!(
@@ -63,7 +67,7 @@ fn multicore_initiate_connection(
             continue;
         }
         return Err(ClientError::Other(format!("send() failed: {e:?}")));
-    } 
+    }
 
     trace!("written {}", write);
     Ok(())
@@ -71,31 +75,28 @@ fn multicore_initiate_connection(
 
 #[inline]
 fn write_packets_on_socket(
-    conn_guard: &Arc<RwLock<MulticoreConnection>>, path: &mut MulticorePath, 
-    buf: &mut [u8], socket: &UdpSocket, 
+    conn_guard: &Arc<RwLock<MulticoreConnection>>, path: &mut MulticorePath,
+    buf: &mut [u8], socket: &UdpSocket,
 ) -> Result<(), ClientError> {
     let local_addr = path.local_addr();
     let peer_addr = path.peer_addr();
     loop {
         let (write, send_info) = match path.send_on_path(conn_guard, buf) {
-                Ok(v) => v,
+            Ok(v) => v,
 
-                Err(quiche::Error::Done) => {
-                    //trace!("{} -> {}: done writing", local_addr, peer_addr);
-                    break;
-                },
+            Err(quiche::Error::Done) => {
+                //trace!("{} -> {}: done writing", local_addr, peer_addr);
+                break;
+            },
 
-                Err(e) => {
-                    error!(
-                        "{} -> {}: send failed: {:?}",
-                        local_addr, peer_addr, e
-                    );
-                    let mut conn = conn_guard.write().unwrap();
+            Err(e) => {
+                error!("{} -> {}: send failed: {:?}", local_addr, peer_addr, e);
+                let mut conn = conn_guard.write().unwrap();
+                conn.close(false, 0x1, b"fail").ok();
+                break;
+            },
+        };
 
-                    conn.close(false, 0x1, b"fail").ok();
-                    break;
-                },
-            };
         if let Err(e) = socket.send_to(&buf[..write], send_info.to) {
             if e.kind() == std::io::ErrorKind::WouldBlock {
                 trace!("{} -> {}: send() would block", local_addr, send_info.to);
@@ -115,8 +116,8 @@ fn write_packets_on_socket(
 
 #[inline]
 pub fn read_packets_on_socket(
-    conn_guard: &Arc<RwLock<MulticoreConnection>>, path: &mut MulticorePath, 
-    buf: &mut [u8], socket: &UdpSocket, events: &Events, 
+    conn_guard: &Arc<RwLock<MulticoreConnection>>, path: &mut MulticorePath,
+    buf: &mut [u8], socket: &UdpSocket, events: &Events,
 ) -> Result<(), ClientError> {
     let local_addr = path.local_addr();
     for event in events {
@@ -132,7 +133,7 @@ pub fn read_packets_on_socket(
                             trace!("{}: recv() would block", local_addr);
                             break 'read;
                         }
-                        
+
                         return Err(ClientError::Other(format!(
                             "{local_addr}: recv() failed: {e:?}"
                         )));
@@ -145,9 +146,10 @@ pub fn read_packets_on_socket(
                     from,
                 };
 
-                let read = match path.recv(conn_guard, &mut buf[..len], recv_info) {
+                let read = match path.recv(conn_guard, &mut buf[..len], recv_info)
+                {
                     Ok(v) => v,
-            
+
                     Err(e) => {
                         error!("{}: recv failed: {:?}", local_addr, e);
                         0
@@ -157,16 +159,17 @@ pub fn read_packets_on_socket(
             }
         }
     }
-
     Ok(())
 }
 
-
 fn client_thread(
-    conn_guard: Arc<RwLock<MulticoreConnection>>, 
-    mut path: MulticorePath, 
+    conn_guard: Arc<RwLock<MulticoreConnection>>,
+    mut path: MulticorePath,
     initiate_connection: bool,
-    multipath_request: bool // By the conn args 
+    multipath_request: bool, // By the conn args
+    nb_initiated_paths: usize,
+    mut tx_finish_channel: Option<Sender<MulticorePathDoneInfo>>,
+    mut rx_finish_channel: Option<Receiver<MulticorePathDoneInfo>>,
 ) -> Result<(), ClientError> {
     let mut out = [0; MAX_DATAGRAM_SIZE];
     let mut buf = [0; MAX_BUF_SIZE];
@@ -174,13 +177,20 @@ fn client_thread(
     let mut events = Events::with_capacity(1024);
     let local_addr = path.local_addr();
     let peer_addr = path.peer_addr();
-    let mut socket = multicore_create_socket((&local_addr, &peer_addr), &mut poll);
+    let mut socket =
+        multicore_create_socket((&local_addr, &peer_addr), &mut poll);
     let rng = SystemRandom::new();
 
     if initiate_connection {
-        multicore_initiate_connection(&conn_guard, &mut path, &mut out, &mut socket).unwrap();
+        multicore_initiate_connection(
+            &conn_guard,
+            &mut path,
+            &mut out,
+            &mut socket,
+        )
+        .unwrap();
     }
-    
+
     debug!(
         "[Path Thread]: Thread {:?}, started with path {} <-> {}",
         thread::current().id(),
@@ -190,26 +200,81 @@ fn client_thread(
 
     let mut scid_sent = false;
     let mut probed_my_path = initiate_connection;
+    let app_data_start = std::time::Instant::now();
+    let mut nb_active_paths = nb_initiated_paths;
+    let mut can_close_conn = false;
+    let mut requested_conn_close = false;
 
-    loop {
-        // TODO multicore
-        poll.poll(&mut events, Some(Duration::from_millis(10))).unwrap();
-        
+    'main: loop {
+        // TODO multicore timeout
+
+        poll.poll(&mut events, Some(Duration::from_millis(10)))
+            .unwrap();
+
         if !events.is_empty() {
-            match read_packets_on_socket(&conn_guard, &mut path, &mut buf, &socket, &events) {
+            match read_packets_on_socket(
+                &conn_guard,
+                &mut path,
+                &mut buf,
+                &socket,
+                &events,
+            ) {
                 Ok(()) => {},
                 Err(e) => {
                     error!(
-                        "[Path Thread]: Thread {:?}, {} <-> {}", 
+                        "[Path Thread]: Thread {:?}, {} <-> {}",
                         thread::current().id(),
                         local_addr,
                         peer_addr
                     );
-                    return Err(e);
-                }
+                    if signal_path_done(
+                        &mut path,
+                        MulticoreStatus::Error,
+                        tx_finish_channel.as_mut(),
+                    ) {
+                        return Err(e);
+                    }
+                },
             }
         } else {
+            if rx_finish_channel.is_some() {
+                handle_done_paths(
+                    rx_finish_channel.as_mut(),
+                    &mut nb_active_paths,
+                )?;
+            }
             path.on_timeout(&conn_guard);
+        }
+
+        for s in path.readable() {
+            while let Ok((read, fin)) = path.stream_recv(&conn_guard, s, &mut buf)
+            {
+                trace!("received {} bytes", read);
+                let stream_buf = &buf[..read];
+                trace!(
+                    "stream {} has {} bytes (fin? {})",
+                    s,
+                    stream_buf.len(),
+                    fin
+                );
+
+                if fin {
+                    info!(
+                        "path {:?} <-> {:?} received in {:?}",
+                        local_addr,
+                        peer_addr,
+                        app_data_start.elapsed()
+                    );
+                    can_close_conn = true;
+                    if signal_path_done(
+                        &mut path,
+                        MulticoreStatus::Success,
+                        tx_finish_channel.as_mut(),
+                    ) {
+                        break 'main;
+                    }
+                }
+            }
         }
 
         handle_path_events(&mut path);
@@ -225,32 +290,50 @@ fn client_thread(
             }
         }
 
-        if multipath_request &&
-           !probed_my_path
-        {   // Done once per path
+        if multipath_request && !probed_my_path {
             let available_dcids;
             {
                 let conn = conn_guard.read().unwrap();
                 available_dcids = conn.available_dcids() > 0;
             }
-            if  available_dcids &&
-                path.probe_path(&conn_guard).is_ok() 
-            {
+            if available_dcids && path.probe_path(&conn_guard).is_ok() {
                 probed_my_path = true;
             }
         }
-        
+
         if probed_my_path {
             write_packets_on_socket(&conn_guard, &mut path, &mut out, &socket)?;
         }
+
+        if nb_active_paths == 1 && can_close_conn && requested_conn_close {
+            let conn = conn_guard.read().unwrap();
+            if conn.is_closed() {
+                info!("connection closed, {:?}", conn.stats(),);
+
+                if !conn.is_established() {
+                    error!(
+                        "connection timed out after {:?}",
+                        app_data_start.elapsed(),
+                    );
+
+                    return Err(ClientError::HandshakeFail);
+                }
+                break 'main;
+            }
+        } else if nb_active_paths == 1 && can_close_conn && !requested_conn_close
+        {
+            let mut conn = conn_guard.write().unwrap();
+            conn.close(true, 0, b"").unwrap();
+            requested_conn_close = true;
+        }
     }
+    Ok(())
 }
 
 pub fn multicore_connect(
     args: ClientArgs, conn_args: CommonArgs,
     _output_sink: impl FnMut(String) + 'static,
 ) -> Result<(), ClientError> {
-
     // We'll only connect to the first server provided in URL list.
     let connect_url = &args.urls[0];
 
@@ -261,7 +344,8 @@ pub fn multicore_connect(
         connect_url.to_socket_addrs().unwrap().next().unwrap()
     };
 
-    let (sockets_addrs, local_addr) = multicore_prepare_addresses(&peer_addr, &args);
+    let (sockets_addrs, local_addr) =
+        multicore_prepare_addresses(&peer_addr, &args);
 
     let mut addrs = Vec::with_capacity(sockets_addrs.len());
     addrs.push(local_addr);
@@ -270,7 +354,6 @@ pub fn multicore_connect(
             addrs.push(*src);
         }
     }
-
 
     // Warn the user if there are more usable addresses than the advertised
     // `active_connection_id_limit`.
@@ -366,7 +449,8 @@ pub fn multicore_connect(
         local_addr,
         peer_addr,
         &mut config,
-    ).unwrap();
+    )
+    .unwrap();
 
     if let Some(keylog) = &mut keylog {
         if let Ok(keylog) = keylog.try_clone() {
@@ -387,48 +471,47 @@ pub fn multicore_connect(
     let mut threads_join = Vec::new();
     let cloned_conn_guard = conn_guard.clone();
     let multipath_requested = conn_args.multipath;
+    let (tx, rx) = channel();
+    let active_threads = sockets_addrs.len();
+    threads_join.push(thread::spawn(move || {
+        client_thread(
+            cloned_conn_guard,
+            init_path,
+            true,
+            multipath_requested,
+            active_threads,
+            None,
+            Some(rx),
+        )
+    }));
 
-    threads_join.push(
-        thread::spawn(move || {
-            client_thread(
-                cloned_conn_guard,
-                init_path,
-                true,
-                multipath_requested
-            )
-        })
-    );
-    
     for (local, peer) in sockets_addrs.clone() {
         if local == local_addr {
             continue;
         }
-        let path = MulticorePath::default(
-            &config,
-            false,
-            local, 
-            peer
-        );
+        let path = MulticorePath::default(&config, false, local, peer);
         let cloned_conn_guard = conn_guard.clone();
         let initiate_conn = local == local_addr;
-        threads_join.push(
-            thread::spawn(move || {
-                client_thread(
-                    cloned_conn_guard,
-                    path,
-                    initiate_conn,
-                    multipath_requested
-                )
-            })
-        );
+        let tx_clone = tx.clone();
+        threads_join.push(thread::spawn(move || {
+            client_thread(
+                cloned_conn_guard,
+                path,
+                initiate_conn,
+                multipath_requested,
+                active_threads,
+                Some(tx_clone),
+                None,
+            )
+        }));
     }
 
     for join_handle in threads_join {
         match join_handle.join() {
-            Ok(..) => {}, 
+            Ok(..) => {},
             Err(e) => {
                 error!("Join return: error {:?}", e);
-            }
+            },
         }
     }
 
@@ -462,11 +545,15 @@ fn multicore_prepare_addresses(
     if first_local_addr.is_none() {
         let sock_addr = match peer_addr {
             std::net::SocketAddr::V4(_) => std::net::SocketAddr::new(
-                std::net::IpAddr::V4(std::net::Ipv4Addr::from_str("0.0.0.0").ok().unwrap()),
+                std::net::IpAddr::V4(
+                    std::net::Ipv4Addr::from_str("0.0.0.0").ok().unwrap(),
+                ),
                 0,
             ),
             std::net::SocketAddr::V6(_) => std::net::SocketAddr::new(
-                std::net::IpAddr::V6(std::net::Ipv6Addr::from_str("[::]").ok().unwrap()),
+                std::net::IpAddr::V6(
+                    std::net::Ipv6Addr::from_str("[::]").ok().unwrap(),
+                ),
                 0,
             ),
         };
@@ -476,16 +563,13 @@ fn multicore_prepare_addresses(
     (tuples, first_local_addr.unwrap())
 }
 
-fn handle_path_events(path: &mut MulticorePath){
+fn handle_path_events(path: &mut MulticorePath) {
     while let Some(qe) = path.path_event_next() {
         match qe {
             quiche::PathEvent::New(..) => unreachable!(),
 
             quiche::PathEvent::Validated(local_addr, peer_addr) => {
-                info!(
-                    "Path ({}, {}) is now validated",
-                    local_addr, peer_addr
-                );
+                info!("Path ({}, {}) is now validated", local_addr, peer_addr);
                 if path.multipath {
                     path.set_active(true).ok();
                 }
@@ -493,10 +577,7 @@ fn handle_path_events(path: &mut MulticorePath){
             },
 
             quiche::PathEvent::FailedValidation(local_addr, peer_addr) => {
-                info!(
-                    "Path ({}, {}) failed validation",
-                    local_addr, peer_addr
-                );
+                info!("Path ({}, {}) failed validation", local_addr, peer_addr);
             },
 
             quiche::PathEvent::Closed(local_addr, peer_addr, e, reason) => {
@@ -506,11 +587,7 @@ fn handle_path_events(path: &mut MulticorePath){
                 );
             },
 
-            quiche::PathEvent::ReusedSourceConnectionId(
-                cid_seq,
-                old,
-                new,
-            ) => {
+            quiche::PathEvent::ReusedSourceConnectionId(cid_seq, old, new) => {
                 info!(
                     "Peer reused cid seq {} (initially {:?}) on {:?}",
                     cid_seq, old, new

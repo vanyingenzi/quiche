@@ -304,7 +304,6 @@ impl MulticoreStreamMap {
     }
 
     /// Creates an iterator over streams that can be written to.
-    #[allow(dead_code)]
     pub fn writable(&self) -> StreamIter {
         StreamIter {
             streams: self.writable.iter().map(|s| s.id).collect(),
