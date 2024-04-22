@@ -8833,7 +8833,7 @@ impl MulticorePath {
         &self,        
         conn_guard: &Arc<RwLock<MulticoreConnection>>,
     ) -> usize {
-        if false {
+        if self.completed_handshake {
             info!("Read from reduced connection");
             self.reduced_connection.as_ref().unwrap().ids.available_dcids()
         } else {
@@ -8862,8 +8862,7 @@ impl MulticorePath {
         reset_token: u128, 
         retire_if_needed: bool,
     ) -> Result<u64> {
-        if false {
-            info!("Added to reduced connection");
+        if self.completed_handshake {
             self.reduced_connection.as_mut().unwrap().ids.new_scid(
                 scid.to_vec().into(),
                 Some(reset_token),
@@ -8872,7 +8871,6 @@ impl MulticorePath {
                 retire_if_needed,
             )
         } else {
-            info!("Added to connection");
             conn_guard.write().unwrap().ids.new_scid(
                 scid.to_vec().into(),
                 Some(reset_token),
@@ -11167,6 +11165,10 @@ impl MulticorePath {
             AddrTupleFmt(path.local_addr(), path.peer_addr())
         );
 
+        for frame in &mut frames {
+            trace!("{} tx frm {:?}", reduced_conn.trace_id, frame);
+        }
+
         let aead = match crypto_space.crypto_seal {
             Some(ref v) => v,
             None => return Err(Error::InvalidState),
@@ -11316,7 +11318,7 @@ impl MulticorePath {
         }
 
         // Generate coalesced packets.
-        if false {
+        if self.completed_handshake {
             info!("sending using reduced send single");
             while left > 0 {
                 let (ty, written) = match self.reduced_send_single(
@@ -11870,7 +11872,7 @@ impl MulticorePath {
                     return Err(Error::MulticoreNotDone);
                 }
 
-                if false {
+                if self.completed_handshake {
                     let reduced_conn = self.reduced_connection.as_mut().unwrap();
                     if reduced_conn.ids.zero_length_dcid() {
                         return Err(Error::InvalidState);
@@ -13290,7 +13292,7 @@ impl MulticorePath {
 
         let mut done = 0;
         let mut left = len;
-        if false {
+        if self.completed_handshake {
             while left > 0 {
                 let read = match self.reduced_recv_single(
                     conn_guard,
@@ -13429,7 +13431,7 @@ impl MulticorePath {
                     self.reduced_connection.as_mut().unwrap().peer_error = Some(conn_err.clone());
                 }, 
                 MulticorePathPendingEvent::NewConnectionId(seq_num, retire_prior_to, conn_id, reset_token) => {
-                    if false {
+                    if self.completed_handshake {
                         let reduced_conn = self.reduced_connection.as_mut().unwrap();
                         if reduced_conn.ids.zero_length_dcid() {
                             return Err(Error::InvalidState);
@@ -24571,14 +24573,111 @@ pub mod multicore_testing{
         Ok(())
     }
 
+    pub fn encode_pkt_on_path_after_completed_handshake(
+        _conn_guard: &Arc<RwLock<MulticoreConnection>>,
+        paths: &mut Slab<MulticorePath>, 
+        pkt_type: packet::Type, frames: &[frame::Frame],
+        buf: &mut [u8],
+    ) -> Result<usize> {
+        let send_path = paths.get_mut(0).unwrap();
+        let mut b = octets::OctetsMut::with_slice(buf);
+
+        let epoch = pkt_type.to_epoch()?;
+        let reduced_conn = send_path.reduced_connection.as_mut().unwrap();
+        let multipath_multiple_spaces = reduced_conn.multipath;
+        let pn = reduced_conn.pkt_num_spaces.spaces.get(epoch, 0)?.next_pkt_num;
+        let pn_len = 4;
+
+        let p = send_path.inner_path.as_mut().unwrap();
+
+        let active_dcid_seq = p
+            .active_dcid_seq
+            .as_ref()
+            .ok_or(Error::InvalidState)?;
+        let active_scid_seq = p
+            .active_scid_seq
+            .as_ref()
+            .ok_or(Error::InvalidState)?;
+
+        let hdr = Header {
+            ty: pkt_type,
+            version: reduced_conn.version,
+            dcid: ConnectionId::from_ref(
+                reduced_conn.ids.get_dcid(*active_dcid_seq)?.cid.as_ref(),
+            ),
+            scid: ConnectionId::from_ref(
+                reduced_conn.ids.get_scid(*active_scid_seq)?.cid.as_ref(),
+            ),
+            pkt_num: 0,
+            pkt_num_len: pn_len,
+            token: reduced_conn.token.clone(),
+            versions: None,
+            key_phase: reduced_conn.key_phase,
+        };
+
+        hdr.to_bytes(&mut b)?;
+
+        let payload_len = frames.iter().fold(0, |acc, x| acc + x.wire_len());
+
+        if pkt_type != packet::Type::Short {
+            let len = pn_len +
+                payload_len +
+                reduced_conn.pkt_num_spaces
+                    .crypto
+                    .get(epoch)
+                    .crypto_overhead()
+                    .unwrap();
+            b.put_varint(len as u64)?;
+        }
+
+        // Always encode packet number in 4 bytes, to allow encoding packets
+        // with empty payloads.
+        b.put_u32(pn as u32)?;
+
+        let payload_offset = b.off();
+
+        for frame in frames {
+            frame.to_bytes(&mut b)?;
+        }
+
+        let aead = match reduced_conn.pkt_num_spaces.crypto.get(epoch).crypto_seal {
+            Some(ref v) => v,
+            None => return Err(Error::InvalidState),
+        };
+
+        // We don't support multipath in this method.
+        assert!(!multipath_multiple_spaces);
+        let path_seq = packet::INITIAL_PACKET_NUMBER_SPACE_ID as u32;
+
+        let written = packet::encrypt_pkt(
+            &mut b,
+            path_seq,
+            pn,
+            pn_len,
+            payload_len,
+            payload_offset,
+            None,
+            aead,
+        )?;
+
+        reduced_conn.pkt_num_spaces.spaces.get_mut(epoch, 0)?.next_pkt_num += 1;
+
+        Ok(written)
+    }
+
     pub fn encode_pkt_on_path(
         conn_guard: &Arc<RwLock<MulticoreConnection>>,
         paths: &mut Slab<MulticorePath>, 
         pkt_type: packet::Type, frames: &[frame::Frame],
         buf: &mut [u8],
     ) -> Result<usize> {
-        let mut conn = conn_guard.write().unwrap();
+        
         let send_path = paths.get(0).unwrap();
+        if send_path.completed_handshake {
+            return encode_pkt_on_path_after_completed_handshake(conn_guard, paths, pkt_type, frames, buf);
+        }
+        
+        let mut conn = conn_guard.write().unwrap();
         let mut b = octets::OctetsMut::with_slice(buf);
 
         let epoch = pkt_type.to_epoch()?;
