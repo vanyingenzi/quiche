@@ -370,7 +370,7 @@ impl Args for ClientArgs {
         };
 
         // URLs (can be multiple).
-        let urls: Vec<url::Url> = args
+        let urls = args
             .get_vec("URL")
             .into_iter()
             .map(|x| url::Url::parse(x).unwrap())
@@ -560,6 +560,7 @@ Options:
   --multipath                 Enable multipath support.
   --multicore                 Enable multicore support. [Under development]
   --cpu-affinity              CPU affinity. [Under development]
+  --multicore-transfer BYTES  The bytes to send. [Under development]
   -h --help                   Show this screen.
 ";
 
@@ -574,6 +575,7 @@ pub struct ServerArgs {
     pub key: String,
     pub disable_gso: bool,
     pub disable_pacing: bool,
+    pub multicore_transfer: usize,
 }
 
 impl Args for ServerArgs {
@@ -588,6 +590,12 @@ impl Args for ServerArgs {
         let key = args.get_str("--key").to_string();
         let disable_gso = args.get_bool("--disable-gso");
         let disable_pacing = args.get_bool("--disable-pacing");
+        let multicore_transfer;
+        if args.get_bool("--multicore"){
+            multicore_transfer = args.get_str("--multicore-transfer").parse::<usize>().unwrap();
+        } else {
+            multicore_transfer = 0;
+        }
 
         ServerArgs {
             listen,
@@ -598,6 +606,7 @@ impl Args for ServerArgs {
             key,
             disable_gso,
             disable_pacing,
+            multicore_transfer
         }
     }
 }

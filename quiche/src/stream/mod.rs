@@ -363,6 +363,11 @@ impl MulticoreStreamMap {
         !self.stopped.is_empty()
     }
 
+    /// All streams are fin
+    pub fn all_streams_fin(&self) -> bool {
+        self.streams.iter().any(|(_, s)| !s.send.is_fin() || !s.recv.is_fin())
+    }
+
     /// Returns the number of active streams in the map.
     #[cfg(test)]
     #[allow(dead_code)]

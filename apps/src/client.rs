@@ -31,13 +31,9 @@ use std::collections::HashMap;
 use std::net::ToSocketAddrs;
 
 use std::io::prelude::*;
-
 use std::rc::Rc;
-
 use std::cell::RefCell;
-
 use ring::rand::*;
-
 use slab::Slab;
 
 const MAX_DATAGRAM_SIZE: usize = 1350;
@@ -673,6 +669,6 @@ fn lowest_latency_scheduler(
     use itertools::Itertools;
     conn.path_stats()
         .filter(|p| !matches!(p.state, quiche::PathState::Closed(_, _)))
-        .sorted_by_key(|p| p.rtt)
+        .sorted_by_key(|p| p.cwnd_available)
         .map(|p| (p.local_addr, p.peer_addr))
 }

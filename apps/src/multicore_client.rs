@@ -28,7 +28,6 @@ use crate::args::*;
 use crate::common::*;
 
 use std::net::ToSocketAddrs;
-use std::sync::mpsc::TryRecvError;
 use std::sync::Arc;
 use std::sync::RwLock;
 use std::thread;
@@ -191,7 +190,7 @@ fn client_thread(
         .unwrap();
     }
 
-    debug!(
+    info!(
         "[Path Thread]: Thread {:?}, started with path {} <-> {}",
         thread::current().id(),
         local_addr,
@@ -277,13 +276,15 @@ fn client_thread(
             }
         }
 
+        path.handle_pending_multicore_events().unwrap();
         handle_path_events(&mut path);
 
         if initiate_connection && !scid_sent {
-            let mut conn = conn_guard.write().unwrap();
-            while conn.source_cids_left() > 0 {
+            // TODO multicore retired scid
+
+            while path.source_cids_left(&conn_guard) > 0 {
                 let (scid, reset_token) = generate_cid_and_reset_token(&rng);
-                if conn.new_source_cid(&scid, reset_token, false).is_err() {
+                if path.new_source_cid(&conn_guard, &scid, reset_token, false).is_err() {
                     break;
                 }
                 scid_sent = true;
@@ -291,13 +292,10 @@ fn client_thread(
         }
 
         if multipath_request && !probed_my_path {
-            let available_dcids;
-            {
-                let conn = conn_guard.read().unwrap();
-                available_dcids = conn.available_dcids() > 0;
-            }
+            let available_dcids = path.available_dcids(&conn_guard) > 0;
             if available_dcids && path.probe_path(&conn_guard).is_ok() {
                 probed_my_path = true;
+                info!("probed my path: {} <-> {}", local_addr, peer_addr);
             }
         }
 
@@ -525,17 +523,24 @@ fn multicore_prepare_addresses(
     std::net::SocketAddr,
 ) {
     use std::str::FromStr;
-    let mut tuples = vec![];
+    let mut local_tuples = vec![];
     let mut first_local_addr: Option<std::net::SocketAddr> = None;
 
     for src_addr in args.addrs.iter().filter(|sa| {
         (sa.is_ipv4() && peer_addr.is_ipv4())
             || (sa.is_ipv6() && peer_addr.is_ipv6())
     }) {
-        tuples.push((src_addr.clone(), peer_addr.clone()));
+        local_tuples.push(src_addr.clone());
         if first_local_addr.is_none() {
             first_local_addr = Some(*src_addr);
         }
+    }
+
+    let mut tuples = vec![];
+    let mut peer_addr = peer_addr.clone();
+    for src in local_tuples {
+        tuples.push((src, peer_addr));
+        peer_addr = increment_port(peer_addr);
     }
 
     // If there is no such address, rely on the default INADDR_IN or IN6ADDR_ANY
@@ -578,6 +583,7 @@ fn handle_path_events(path: &mut MulticorePath) {
 
             quiche::PathEvent::FailedValidation(local_addr, peer_addr) => {
                 info!("Path ({}, {}) failed validation", local_addr, peer_addr);
+                // TODO multicore close connection then
             },
 
             quiche::PathEvent::Closed(local_addr, peer_addr, e, reason) => {

@@ -7,12 +7,12 @@ mkdir -p /tmp/www; fallocate -l 1G /tmp/www/testfile
 
 server
 ```bash
-RUST_LOG=info ../target/release/quiche-server --root /tmp/www --multipath --multicore
+RUST_LOG=info ../target/release/quiche-server --root /tmp/www --multipath --multicore --multicore-transfer 1073741824
 ```
 
 client 
 ```bash
-RUST_LOG=info ../target/release/quiche-client https:127.0.0.1:4433/testfile --no-verify -A 127.0.0.1:6788 -A 127.0.0.1:6789 --multipath --multicore --wire-version 1 >/dev/null
+RUST_LOG=info ../target/release/quiche-client https:127.0.0.1:4433 --no-verify -A 127.0.0.1:6788 -A 127.0.0.1:6789 --multipath --multicore --wire-version 1 >/dev/null
 ```
 
 ```bash
@@ -20,5 +20,5 @@ sudo perf record -e cycles -F 999 -g --call-graph lbr -- ../target/release/quich
 ```
 
 ```bash
-cargo test --features=multicore
+cargo test multicore
 ```

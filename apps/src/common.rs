@@ -29,6 +29,7 @@
 //! This module provides some utility functions that are common to quiche
 //! applications.
 
+use std::convert::TryInto;
 use std::io::prelude::*;
 
 use std::collections::HashMap;
@@ -45,7 +46,6 @@ use std::sync::mpsc::TryRecvError;
 use std::sync::Arc;
 use std::sync::RwLock;
 
-use mio::Waker;
 use quiche::MulticoreConnection;
 use quiche::MulticorePath;
 use ring::rand::SecureRandom;
@@ -172,6 +172,12 @@ pub fn signal_path_done(
     } else {
         false
     }
+}
+
+pub fn increment_port(socket_addr: std::net::SocketAddr) -> std::net::SocketAddr {
+    let (ip, port) = (socket_addr.ip(), socket_addr.port());
+    let new_port = port + 1;
+    std::net::SocketAddr::new(ip, new_port)
 }
 
 /// Makes a buffered writer for a resource with a target URL.
@@ -1160,8 +1166,10 @@ impl Http3Conn {
                     }
                 }
 
-                match std::fs::read(file_path.as_path()) {
-                    Ok(data) => (200, data),
+                match std::fs::metadata(file_path.as_path()) {
+                    Ok(metadata) => {
+                        (200, std::iter::repeat(255).take(metadata.len().try_into().unwrap()).collect())
+                    },
 
                     Err(_) => (404, b"Not Found!".to_vec()),
                 }

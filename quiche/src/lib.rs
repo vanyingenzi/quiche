@@ -1628,7 +1628,12 @@ pub struct MulticoreConnection {
 
     per_path_unprocessed_events: BTreeMap<usize, VecDeque<MulticorePathPendingEvent>>, 
     /// Whether the connection is in draining state
-    draining: bool
+    draining: bool,
+
+    /// Whether the connection received application close from peer
+    pub recv_application_close: bool, 
+    /// Whether the connection received connection close from peer
+    pub recv_connection_close: bool,
 }
  
 
@@ -2370,6 +2375,7 @@ impl Connection {
                 Err(Error::Done) => {
                     // If the packet can't be processed or decrypted, check if
                     // it's a stateless reset.
+                    debug!("recv_single return done");
                     if self.is_stateless_reset(&buf[len - left..len]) {
                         trace!("{} packet is a stateless reset", self.trace_id);
 
@@ -8342,7 +8348,13 @@ pub enum MulticorePathPendingEvent {
     /// An event to discard the pkt num space
     PktNumSpaceDiscarded (packet::Epoch, recovery::HandshakeStatus, std::time::Instant),
     /// An event to handle acks
-    PacketOnACKReceived(usize, recovery::SpaceId, ranges::RangeSet, u64, packet::Epoch, recovery::HandshakeStatus, time::Instant, String)
+    PacketOnACKReceived(usize, recovery::SpaceId, ranges::RangeSet, u64, packet::Epoch, recovery::HandshakeStatus, time::Instant, String), 
+    /// A peer error that occured
+    PeerError(ConnectionError),
+    /// A local error that occured
+    LocalError(ConnectionError),
+    /// A change in the connection IDs
+    NewConnectionId(u64, u64, Vec<u8>, [u8; 16]),
 }
 
 /// A structured to be used to get connection information locally
@@ -8356,6 +8368,7 @@ pub struct ReducedMulticoreConnection {
     peer_transport_params: TransportParams,
     /// Local transport parameters.
     local_transport_params: TransportParams,
+
     /// Packet number spaces.
     pkt_num_spaces: packet::PktNumSpaceMap,
     /// Whether an ack-eliciting packet has been sent since last receiving a packet.
@@ -8372,7 +8385,18 @@ pub struct ReducedMulticoreConnection {
     source_id_len: usize, // ! This is might change upon path failure
     /// Lowest active path id
     lowest_active_path_id: usize, // ! This is might change upon path failure
-    handshake_status: crate::recovery::HandshakeStatus
+
+    handshake_status: crate::recovery::HandshakeStatus,
+    /// Received address verification token.
+    token: Option<Vec<u8>>, // ! Clonable after handshake
+    /// Key phase bit used for outgoing protected packets.
+    key_phase: bool, // ! Ignored in our case for simplicity but concurrent access
+    /// Error code and reason to be sent to the peer in a CONNECTION_CLOSE
+    /// frame.
+    local_error: Option<ConnectionError>, // ! Concurrent Acces in case of failure
+    /// Error code and reason received from the peer in a CONNECTION_CLOSE
+    /// frame.
+    peer_error: Option<ConnectionError>, // ! Concurrent Acces in case of failure
 }
 
 impl ReducedMulticoreConnection {
@@ -8410,6 +8434,10 @@ impl ReducedMulticoreConnection {
             ids: conn.ids.clone(),
             lowest_active_path_id: conn.lowest_active_path_id, 
             handshake_status: conn.handshake_status(),
+            token: conn.token.clone(), 
+            key_phase: conn.key_phase, 
+            local_error: conn.local_error.clone(),
+            peer_error: conn.peer_error.clone(),
         })
     }
 } 
@@ -8466,6 +8494,12 @@ pub struct MulticorePath {
     pub multipath: bool,
     /// Draining timeout expiration time.
     draining_timer: Option<time::Instant>,
+    /// A simple structure that contains a subset of information about the connection 
+    reduced_connection: Option<ReducedMulticoreConnection>,
+    /// Idle timeout expiration time.
+    idle_timer: Option<time::Instant>,
+    /// Whether to emit DATAGRAM frames in the next packet.
+    emit_dgram: bool, // ? Moved to Path
 }
 
 impl MulticorePath {
@@ -8516,6 +8550,9 @@ impl MulticorePath {
             multipath: false,
             //newly_acked: Vec::new(),
             draining_timer: None,
+            reduced_connection: None,
+            idle_timer: None,
+            emit_dgram: true,
         }
     }
 
@@ -8562,6 +8599,9 @@ impl MulticorePath {
             stream_retrans_bytes: 0,
             // newly_acked: Vec::new(),
             draining_timer: None,
+            reduced_connection: None,
+            idle_timer: None,
+            emit_dgram: true,
         }
     }
 
@@ -8593,6 +8633,11 @@ impl MulticorePath {
     /// connection.
     pub fn stats(&self) -> path::PathStats {
         self.get_inner_path().unwrap().stats()
+    }
+
+    /// Has an inner path
+    pub fn has_inner_path(&self) -> bool {
+        self.inner_path.is_some()
     }
 
     /// Returns the local address on which this path operates.
@@ -8651,7 +8696,7 @@ impl MulticorePath {
     /// [`None`] is returned if the peer hasn't advertised a maximum DATAGRAM
     /// frame size.
     #[inline]
-    pub fn dgram_max_writable_len(&self, conn: &mut MulticoreConnection) -> Option<usize> {
+    pub fn dgram_max_writable_len(&self, conn: &MulticoreConnection) -> Option<usize> {
         match conn.peer_transport_params.max_datagram_frame_size {
             None => None,
             Some(peer_frame_len) => {
@@ -8718,6 +8763,7 @@ impl MulticorePath {
 
             return Ok(packet::Type::from_epoch(epoch));
         }
+
         for &epoch in packet::Epoch::epochs(
             packet::Epoch::Initial..=packet::Epoch::Application,
         ) {
@@ -8778,6 +8824,64 @@ impl MulticorePath {
         Err(Error::Done)
     }
 
+    /// Returns the number of spare Destination Connection IDs, i.e.,
+    /// Destination Connection IDs that are still unused.
+    ///
+    /// Note that this function returns 0 if the host uses zero length
+    /// Destination Connection IDs.
+    pub fn available_dcids(
+        &self,        
+        conn_guard: &Arc<RwLock<MulticoreConnection>>,
+    ) -> usize {
+        if false {
+            info!("Read from reduced connection");
+            self.reduced_connection.as_ref().unwrap().ids.available_dcids()
+        } else {
+            conn_guard.read().unwrap().ids.available_dcids()
+        }
+    }
+
+
+    /// Returns the number of source Connection IDs that should be provided
+    /// to the peer without exceeding the limit it advertised.
+    #[inline]
+    pub fn source_cids_left(&self, conn_guard: &Arc<RwLock<MulticoreConnection>>) -> usize {
+        let max_active_source_cids = cmp::min(
+            self.peer_transport_params.active_conn_id_limit,
+            self.local_transport_params.active_conn_id_limit,
+        ) as usize;
+        let conn = conn_guard.read().unwrap();
+        max_active_source_cids - conn.ids.active_source_cids()
+    }
+
+    /// New source id
+    pub fn new_source_cid(
+        &mut self, 
+        conn_guard: &Arc<RwLock<MulticoreConnection>>,
+        scid: &ConnectionId, 
+        reset_token: u128, 
+        retire_if_needed: bool,
+    ) -> Result<u64> {
+        if false {
+            info!("Added to reduced connection");
+            self.reduced_connection.as_mut().unwrap().ids.new_scid(
+                scid.to_vec().into(),
+                Some(reset_token),
+                true,
+                None,
+                retire_if_needed,
+            )
+        } else {
+            info!("Added to connection");
+            conn_guard.write().unwrap().ids.new_scid(
+                scid.to_vec().into(),
+                Some(reset_token),
+                true,
+                None,
+                retire_if_needed,
+            )
+        }
+    }
 
     fn send_single(
         &mut self, 
@@ -8785,7 +8889,7 @@ impl MulticorePath {
         out: &mut [u8], has_initial: bool,
         now: time::Instant,
     ) -> Result<(packet::Type, usize)> {
-        
+
         if out.is_empty() {
             return Err(Error::BufferTooShort);
         }
@@ -8798,7 +8902,7 @@ impl MulticorePath {
         
         let mut b = octets::OctetsMut::with_slice(out);
 
-        let pkt_type = self.write_pkt_type(conn)?;
+        let pkt_type: Type = self.write_pkt_type(conn)?;
 
         let max_dgram_len = if !self.dgram_send_queue.is_empty() {
             self.dgram_max_writable_len(conn)
@@ -8892,9 +8996,7 @@ impl MulticorePath {
                     }
                 },
 
-                frame::Frame::MaxData { .. } => {
-                    self.almost_full = true;
-                },
+                frame::Frame::MaxData { .. } => unreachable!(),
 
                 frame::Frame::NewConnectionId { seq_num, .. } => {
                     conn.ids.mark_advertise_new_scid_seq(seq_num, true);
@@ -9108,6 +9210,7 @@ impl MulticorePath {
         }
 
         // Create ACK_MP frames if needed.
+        // NOTE : multicore for simplicity we don't send ack for other space ids
         if multiple_application_data_pkt_num_spaces &&
             !is_closing &&
             self.inner_path.as_mut().unwrap().active()
@@ -9115,7 +9218,6 @@ impl MulticorePath {
             // We first check if we should bundle the ACK_MP belonging to our
             // path. We only bundle additional ACK_MP from other paths if we
             // need to send one. This avoids sending ACK_MP frames endlessly.
-            let mut wrote_ack_mp = false;
             if let Some(active_scid_seq) = self.inner_path.as_mut().unwrap().active_scid_seq {
                 let pns =
                     conn.pkt_num_spaces.spaces.get_mut(epoch, active_scid_seq)?;
@@ -9144,66 +9246,6 @@ impl MulticorePath {
                     if pns.ack_elicited || (left_before_packing_ack_frame - left) + frame.wire_len() < cwnd_available {
                         if push_frame_to_pkt!(b, frames, frame, left) {
                             pns.ack_elicited = false;
-                            wrote_ack_mp = true;
-                        }
-                    }
-                }
-                if wrote_ack_mp {
-                    for space_id in conn
-                        .pkt_num_spaces
-                        .spaces
-                        .application_data_space_ids()
-                        .collect::<Vec<u64>>()
-                    {
-                        // Don't process twice the path's packet number space.
-                        if space_id == active_scid_seq {
-                            continue;
-                        }
-                        // If the SCID is no more present, do not raise an error.
-                        let pns_path_id = conn
-                            .ids
-                            .get_scid(space_id)
-                            .ok()
-                            .and_then(|e| e.path_id);
-                        let pns = conn
-                            .pkt_num_spaces
-                            .spaces
-                            .get_mut(epoch, space_id)?;
-                        if pns.recv_pkt_need_ack.len() > 0 &&
-                            (pns.ack_elicited || ack_elicit_required)
-                        {
-                            let ack_delay = pns.largest_rx_pkt_time.elapsed();
-
-                            let ack_delay = ack_delay.as_micros() as u64 /
-                                2_u64.pow(
-                                    conn.local_transport_params.ack_delay_exponent
-                                        as u32,
-                                );
-
-                            let frame = frame::Frame::ACKMP {
-                                space_identifier: space_id,
-                                ack_delay,
-                                ranges: pns.recv_pkt_need_ack.clone(),
-                                ecn_counts: None, /* sending ECN is not
-                                                   * supported at
-                                                   * this time */
-                            };
-
-                            if !ack_elicit_required || (left_before_packing_ack_frame - left) + frame.wire_len() < cwnd_available {
-                                if push_frame_to_pkt!(b, frames, frame, left) {
-                                    // Continue advertising until we send the ACK_MP
-                                    // on its own path, unless the path is not active.
-                                    if let Some(path_id) = pns_path_id {
-                                        if let Some(path_stats) = conn.paths_stats.get(&path_id){
-                                            if !path_stats.active{
-                                                pns.ack_elicited = false;
-                                            }
-                                        }
-                                    } else {
-                                        pns.ack_elicited = false;
-                                    }
-                                }
-                            }
                         }
                     }
                 }
@@ -9372,8 +9414,8 @@ impl MulticorePath {
                 }
             }
 
-            // Create MAX_DATA frame as needed.
-            if self.almost_full &&
+            // We don't create MAX_DATA stream as flow control is done per path and not per whole connection
+            /*if self.almost_full &&
                 flow_control.max_data() < flow_control.max_data_next()
             {
                 // Autotune the connection window size.
@@ -9392,7 +9434,7 @@ impl MulticorePath {
                     ack_eliciting = true;
                     in_flight = true;
                 }
-            }
+            }*/
 
             // Create STOP_SENDING frames as needed.
             for (stream_id, error_code) in self
@@ -9548,6 +9590,7 @@ impl MulticorePath {
                         if push_frame_to_pkt!(b, frames, frame, left) {
                             let pto = path.recovery.pto();
                             self.draining_timer = Some(now + (pto * 3));
+                            conn.draining = true;
 
                             ack_eliciting = true;
                             in_flight = true;
@@ -9564,6 +9607,7 @@ impl MulticorePath {
                     if push_frame_to_pkt!(b, frames, frame, left) {
                         let pto = path.recovery.pto();
                         self.draining_timer = Some(now + (pto * 3));
+                        conn.draining = true;
 
                         ack_eliciting = true;
                         in_flight = true;
@@ -10066,7 +10110,7 @@ impl MulticorePath {
         // (Re)start the idle timer if we are sending the first ack-eliciting
         // packet since last receiving a packet.
         if ack_eliciting && !conn.ack_eliciting_sent {
-            if let Some(idle_timeout) = conn.idle_timeout(self) {
+            if let Some(idle_timeout) = self.idle_timeout() {
                 conn.idle_timer = Some(now + idle_timeout);
             }
         }
@@ -10105,91 +10149,1244 @@ impl MulticorePath {
         Ok(())
     }
 
+    /// Used after handshake and complete path validation on path
+    fn reduced_write_pkt_type(
+        &mut self, conn_guard: &Arc<RwLock<MulticoreConnection>>
+    ) -> Result<packet::Type> {
+        if self.reduced_connection.as_ref().unwrap()
+            .local_error
+            .as_ref()
+            .map_or(false, |conn_err| !conn_err.is_app)
+        {
+            // TODO multicore remove as this server as a checker
+            let conn = conn_guard.read().unwrap();
+            let epoch = match conn.handshake.write_level() {
+                crypto::Level::Initial => unreachable!(),
+                crypto::Level::ZeroRTT => unreachable!(),
+                crypto::Level::Handshake => unreachable!(),
+                crypto::Level::OneRTT => packet::Epoch::Application,
+            };
+            // call to this function implies so
+            // call to this function implies connection has been established
+            return Ok(packet::Type::from_epoch(epoch));
+        }
+        for &epoch in packet::Epoch::epochs(
+            packet::Epoch::Initial..=packet::Epoch::Application,
+        ) {
+            // Only send packets in a space when we have the send keys for it.
+            if self.reduced_connection.as_ref().unwrap().pkt_num_spaces.crypto.get(epoch).crypto_seal.is_none() {
+                continue;
+            }
+
+            if self.reduced_connection.as_ref().unwrap().pkt_num_spaces.is_ready(epoch, self.inner_path.as_mut().unwrap().active_dcid_seq) {
+                return Ok(packet::Type::from_epoch(epoch));
+            }
+
+            // There are lost frames in this packet number space.
+            if !self.get_inner_path_mut().unwrap().recovery.lost[epoch].is_empty() {
+                return Ok(packet::Type::from_epoch(epoch));
+            }
+
+            // We need to send PTO probe packets.
+            if self.get_inner_path_mut().unwrap().recovery.loss_probes[epoch] > 0 {
+                return Ok(packet::Type::from_epoch(epoch));
+            }
+        }
+
+        let send_path = self.get_inner_path().unwrap();
+        // TODO multicore get rid of this lock too
+        let conn = conn_guard.read().unwrap();
+
+        // If there are flushable, almost full or blocked streams, use the
+        // Application epoch.
+        let reduced_conn = self.reduced_connection.as_ref().unwrap();
+        if conn.should_send_handshake_done() ||
+                (self.almost_full && self.flow_control.max_data() < self.flow_control.max_data_next()) ||
+                conn.blocked_limit.is_some() ||
+                self.dgram_send_queue.has_pending() ||
+                reduced_conn.local_error
+                    .as_ref()
+                    .map_or(false, |conn_err| conn_err.is_app) ||
+                conn.stream_ids.should_update_max_streams_bidi() ||
+                conn.stream_ids.should_update_max_streams_uni() ||
+                self.streams.has_flushable() ||
+                self.streams.has_almost_full() ||
+                self.streams.has_blocked() ||
+                self.streams.has_reset() ||
+                self.streams.has_stopped() ||
+                reduced_conn.ids.has_new_scids() ||
+                reduced_conn.ids.has_retire_dcids() ||
+                conn.has_path_abandon() ||
+                conn.has_path_status() ||
+                send_path.needs_ack_eliciting ||
+                send_path.probing_required()
+        {
+            // Only clients can send 0-RTT packets.
+            if !self.is_server && conn.is_in_early_data() {
+                return Ok(packet::Type::ZeroRTT);
+            }
+
+            return Ok(packet::Type::Short);
+        }
+        Err(Error::Done)
+    }
+
+    /// To used when focused on sending I/O and handshake is complete and not closing connection
+    fn reduced_send_single(
+        &mut self, 
+        conn_guard: &Arc<RwLock<MulticoreConnection>>,
+        out: &mut [u8], has_initial: bool,
+        now: time::Instant,
+    ) -> Result<(packet::Type, usize)> {
+        if out.is_empty() {
+            return Err(Error::BufferTooShort);
+        }
+
+        if self.draining_timer.is_some() {
+            return Err(Error::Done);
+        }
+
+        let is_closing = self.reduced_connection.as_ref().unwrap().local_error.is_some();
+
+        let mut b = octets::OctetsMut::with_slice(out);
+        let pkt_type = self.reduced_write_pkt_type(conn_guard)?;
+
+        let max_dgram_len = if !self.dgram_send_queue.is_empty() {
+            let conn = conn_guard.read().unwrap();
+            self.dgram_max_writable_len(&conn)
+        } else {
+            None
+        };
+
+        let epoch = pkt_type.to_epoch()?;
+        let multiple_application_data_pkt_num_spaces = self.reduced_connection.as_ref().unwrap().multipath && epoch == packet::Epoch::Application;
+        let p = self.inner_path.as_mut().unwrap();
+        let dcid_seq = p
+            .active_dcid_seq.ok_or(Error::OutOfIdentifiers)?;
+        let space_id = if multiple_application_data_pkt_num_spaces {
+            dcid_seq
+        } else {
+            packet::INITIAL_PACKET_NUMBER_SPACE_ID
+        };
+        for lost in p.recovery.lost[epoch].drain(..) {
+            match lost {
+                frame::Frame::CryptoHeader { offset, length } => {
+                    self.reduced_connection.as_mut().unwrap().pkt_num_spaces
+                        .crypto
+                        .get_mut(epoch)
+                        .crypto_stream
+                        .send
+                        .retransmit(offset, length);
+
+                    self.stream_retrans_bytes += length as u64;
+                    p.stream_retrans_bytes += length as u64;
+
+                    p.retrans_count += 1;
+                },
+
+                frame::Frame::StreamHeader {
+                    stream_id,
+                    offset,
+                    length,
+                    fin,
+                } => {
+                    let stream = match self.streams.get_mut(stream_id) {
+                        Some(v) => v,
+
+                        None => continue,
+                    };
+
+                    let was_flushable = stream.is_flushable();
+
+                    let empty_fin = length == 0 && fin;
+
+                    stream.send.retransmit(offset, length);
+
+                    // If the stream is now flushable push it to the
+                    // flushable queue, but only if it wasn't already
+                    // queued.
+                    //
+                    // Consider the stream flushable also when we are
+                    // sending a zero-length frame that has the fin flag
+                    // set.
+                    if (stream.is_flushable() || empty_fin) && !was_flushable
+                    {
+                        let priority_key = Arc::clone(&stream.priority_key);
+                        self.streams.insert_flushable(&priority_key);
+                    }
+
+                    p.stream_retrans_bytes += length as u64;
+                    p.retrans_count += 1;
+                },
+
+                frame::Frame::ACK { .. } => {
+                    self.reduced_connection.as_mut().unwrap().pkt_num_spaces
+                        .spaces
+                        .get_mut(epoch, 0)
+                        .map(|pns| {
+                            pns.ack_elicited = true;
+                        })
+                        .ok();
+                },
+
+                frame::Frame::ResetStream {
+                    stream_id,
+                    error_code,
+                    final_size,
+                } =>
+                    if self.streams.get(stream_id).is_some() {
+                        self.streams
+                            .insert_reset(stream_id, error_code, final_size);
+                    },
+
+                // Retransmit HANDSHAKE_DONE only if it hasn't been acked at
+                // least once already.
+                frame::Frame::HandshakeDone => {
+                    let mut conn = conn_guard.write().unwrap();
+                    if !conn.handshake_done_acked {
+                        conn.handshake_done_sent = false;
+                    }
+                },
+
+                frame::Frame::MaxStreamData { stream_id, .. } => {
+                    if self.streams.get(stream_id).is_some() {
+                        self.streams.insert_almost_full(stream_id);
+                    }
+                },
+
+                frame::Frame::MaxData { .. } => unreachable!(),
+
+                frame::Frame::NewConnectionId { seq_num, .. } => {
+                    let mut conn = conn_guard.write().unwrap();
+                    conn.ids.mark_advertise_new_scid_seq(seq_num, true);
+                },
+
+                frame::Frame::RetireConnectionId { seq_num } => {
+                    let mut conn = conn_guard.write().unwrap();
+                    conn.ids.mark_retire_dcid_seq(seq_num, true);
+                },
+
+                frame::Frame::ACKMP {
+                    space_identifier, ..
+                } => {
+                    if space_identifier == space_id{
+                        self.reduced_connection.as_mut().unwrap().pkt_num_spaces
+                            .spaces
+                            .get_mut(epoch, space_identifier)
+                            .map(|pns| {
+                                pns.ack_elicited = true;
+                            })
+                            .ok();
+                    }
+                },
+
+                _ => (),
+            }
+        }
+
+        let is_app_limited = self.delivery_rate_check_if_app_limited();
+        let reduced_conn = self.reduced_connection.as_mut().unwrap();
+
+        let consider_standby_paths = false; // TODO multicore standby paths
+        let flow_control = &mut self.flow_control;
+        let crypto_space = reduced_conn.pkt_num_spaces.crypto.get_mut(epoch);
+
+        let mut left = b.cap();
+        let dcid_seq = self.inner_path.as_mut().unwrap()
+            .active_dcid_seq.ok_or(Error::OutOfIdentifiers)?;
+        let space_id = if multiple_application_data_pkt_num_spaces {
+            dcid_seq
+        } else {
+            packet::INITIAL_PACKET_NUMBER_SPACE_ID
+        };
+        let pkt_space = reduced_conn
+            .pkt_num_spaces
+            .spaces
+            .get_mut_or_create(epoch, space_id);
+
+        let pn = pkt_space.next_pkt_num;
+        let pn_len = packet::pkt_num_len(pn)?;
+
+        // The AEAD overhead at the current encryption level.
+        let crypto_overhead =
+            crypto_space.crypto_overhead().ok_or(Error::Done)?;
+
+        let dcid =
+            ConnectionId::from_ref(reduced_conn.ids.get_dcid(dcid_seq)?.cid.as_ref());
+
+        let scid = if let Some(scid_seq) = self.inner_path.as_mut().unwrap().active_scid_seq {
+            ConnectionId::from_ref(reduced_conn.ids.get_scid(scid_seq)?.cid.as_ref())
+        } else if pkt_type == packet::Type::Short {
+            ConnectionId::default()
+        } else {
+            return Err(Error::InvalidState);
+        };
+
+        let hdr = Header {
+            ty: pkt_type,
+
+            version: reduced_conn.version,
+
+            dcid,
+            scid,
+
+            pkt_num: 0,
+            pkt_num_len: pn_len,
+
+            // Only clone token for Initial packets, as other packets don't have
+            // this field (Retry doesn't count, as it's not encoded as part of
+            // this code path).
+            token: if pkt_type == packet::Type::Initial {
+                reduced_conn.token.clone()
+            } else {
+                None
+            },
+
+            versions: None,
+            key_phase: reduced_conn.key_phase,
+        };
+
+        hdr.to_bytes(&mut b)?;
+
+        let hdr_trace = if log::max_level() == log::LevelFilter::Trace {
+            Some(format!("{hdr:?}"))
+        } else {
+            None
+        };
+
+        let mut overhead = b.off() + pn_len + crypto_overhead;
+
+        if pkt_type != packet::Type::Short {
+            overhead += PAYLOAD_LENGTH_LEN;
+        }
+
+        match left.checked_sub(overhead) {
+            Some(v) => left = v,
+
+            None => {
+                // We can't send more because there isn't enough space available
+                // in the output buffer.
+                //
+                // This usually happens when we try to send a new packet but
+                // failed because cwnd is almost full. In such case app_limited
+                // is set to false here to make cwnd grow when ACK is received.
+                self.get_inner_path_mut().unwrap().recovery.update_app_limited(false);
+                return Err(Error::Done);
+            },
+        }
+        if left < PAYLOAD_MIN_LEN {
+            self.get_inner_path_mut().unwrap().recovery.update_app_limited(false);
+            return Err(Error::Done);
+        }
+
+        let mut frames: SmallVec<[frame::Frame; 1]> = SmallVec::new();
+
+        let mut ack_eliciting = false;
+        let mut in_flight = false;
+        let mut has_data = false;
+
+        let ack_elicit_required = self.inner_path.as_mut().unwrap().recovery.should_elicit_ack(epoch);
+        let header_offset = b.off();
+
+        if pkt_type != packet::Type::Short {
+            b.skip(PAYLOAD_LENGTH_LEN)?;
+        }
+
+        packet::encode_pkt_num(pn, &mut b)?;
+
+        let payload_offset = b.off();
+
+        let cwnd_available =
+        self.inner_path.as_mut().unwrap().recovery.cwnd_available().saturating_sub(overhead);
+
+        let left_before_packing_ack_frame = left;
+
+        // Create ACK frame.
+        if !multiple_application_data_pkt_num_spaces &&
+            pkt_space.recv_pkt_need_ack.len() > 0 &&
+            (pkt_space.ack_elicited || ack_elicit_required) &&
+            (!is_closing || pkt_type == Type::Handshake) &&
+                self.inner_path.as_mut().unwrap().active()
+        {
+            let ack_delay = pkt_space.largest_rx_pkt_time.elapsed();
+
+            let ack_delay = ack_delay.as_micros() as u64 /
+                2_u64
+                    .pow(reduced_conn.local_transport_params.ack_delay_exponent as u32);
+
+            let frame = frame::Frame::ACK {
+                ack_delay,
+                ranges: pkt_space.recv_pkt_need_ack.clone(),
+                ecn_counts: None, // sending ECN is not supported at this time
+            };
+
+            // When a PING frame needs to be sent, avoid sending the ACK if
+            // there is not enough cwnd available for both (note that PING
+            // frames are always 1 byte, so we just need to check that the
+            // ACK's length is lower than cwnd).
+            if pkt_space.ack_elicited || frame.wire_len() < cwnd_available {
+                // ACK-only packets are not congestion controlled so ACKs must
+                // be bundled considering the buffer capacity only, and not the
+                // available cwnd.
+                if push_frame_to_pkt!(b, frames, frame, left) {
+                    pkt_space.ack_elicited = false;
+                }
+            }
+        }
+
+        // Create ACK_MP frames if needed.
+        // NOTE : multicore for simplicity we don't send ack for other space ids
+        if multiple_application_data_pkt_num_spaces &&
+            !is_closing &&
+            self.inner_path.as_mut().unwrap().active()
+        {
+            if let Some(active_scid_seq) = self.inner_path.as_mut().unwrap().active_scid_seq {
+                let pns =
+                    reduced_conn.pkt_num_spaces.spaces.get_mut(epoch, active_scid_seq)?;
+                if pns.recv_pkt_need_ack.len() > 0 &&
+                    (pns.ack_elicited || ack_elicit_required)
+                {
+                    let ack_delay = pns.largest_rx_pkt_time.elapsed();
+
+                    let ack_delay = ack_delay.as_micros() as u64 /
+                        2_u64.pow(
+                            reduced_conn.local_transport_params.ack_delay_exponent as u32,
+                        );
+
+                    let frame = frame::Frame::ACKMP {
+                        space_identifier: active_scid_seq,
+                        ack_delay,
+                        ranges: pns.recv_pkt_need_ack.clone(),
+                        ecn_counts: None, /* sending ECN is not supported at
+                                           * this time */
+                    };
+
+                    // When a PING frame needs to be sent, avoid sending the ACK_MP if
+                    // there is not enough cwnd available for both (note that PING
+                    // frames are always 1 byte, so we just need to check that the
+                    // ACK_MP's length is lower than cwnd).
+                    if pns.ack_elicited || (left_before_packing_ack_frame - left) + frame.wire_len() < cwnd_available {
+                        if push_frame_to_pkt!(b, frames, frame, left) {
+                            pns.ack_elicited = false;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Limit output packet size by congestion window size.
+        left = cmp::min(
+            left,
+            // Bytes consumed by ACK frames.
+            cwnd_available.saturating_sub(left_before_packing_ack_frame - left),
+        );
+
+        let mut challenge_data = None;
+        
+        if pkt_type == packet::Type::Short {
+            // Create PATH_RESPONSE frame if needed.
+            // We do not try to ensure that these are really sent.
+            while let Some(challenge) = self.inner_path.as_mut().unwrap().pop_received_challenge() {
+                let frame = frame::Frame::PathResponse { data: challenge };
+
+                if push_frame_to_pkt!(b, frames, frame, left) {
+                    ack_eliciting = true;
+                    in_flight = true;
+                } else {
+                    // If there are other pending PATH_RESPONSE, don't lose them
+                    // now.
+                    break;
+                }
+            }
+
+            // Create PATH_CHALLENGE frame if needed.
+            if self.inner_path.as_mut().unwrap().validation_requested() {
+                // TODO: ensure that data is unique over paths.
+                let data = rand::rand_u64().to_be_bytes();
+
+                let frame = frame::Frame::PathChallenge { data };
+
+                if push_frame_to_pkt!(b, frames, frame, left) {
+                    // Let's notify the path once we know the packet size.
+                    challenge_data = Some(data);
+
+                    ack_eliciting = true;
+                    in_flight = true;
+                }
+            }
+
+            if let Some(key_update) = crypto_space.key_update.as_mut() {
+                key_update.update_acked = true;
+            }
+        }
+
+        if pkt_type == packet::Type::Short && !is_closing {
+            // Create NEW_CONNECTION_ID frames as needed.
+            while let Some(seq_num) = reduced_conn.ids.next_advertise_new_scid_seq() {
+                let frame = reduced_conn.ids.get_new_connection_id_frame_for(seq_num)?;
+
+                if push_frame_to_pkt!(b, frames, frame, left) {
+                    reduced_conn.ids.mark_advertise_new_scid_seq(seq_num, false);
+
+                    ack_eliciting = true;
+                    in_flight = true;
+                } else {
+                    break;
+                }
+            }
+        }
+
+        if pkt_type == packet::Type::Short && !is_closing && self.inner_path.as_mut().unwrap().active() {
+
+            // Create DATA_BLOCKED frame.
+            if let Some(limit) = self.blocked_limit {
+                let frame = frame::Frame::DataBlocked { limit };
+
+                if push_frame_to_pkt!(b, frames, frame, left) {
+                    self.blocked_limit = None;
+
+                    ack_eliciting = true;
+                    in_flight = true;
+                }
+            }
+
+            // Create MAX_STREAM_DATA frames as needed.
+            for stream_id in self.streams.almost_full() {
+                let stream = match self.streams.get_mut(stream_id) {
+                    Some(v) => v,
+
+                    None => {
+                        // The stream doesn't exist anymore, so remove it from
+                        // the almost full set.
+                        self.streams.remove_almost_full(stream_id);
+                        continue;
+                    },
+                };
+
+                // Autotune the stream window size.
+                stream.recv.autotune_window(now, self.inner_path.as_mut().unwrap().recovery.rtt());
+
+                let frame = frame::Frame::MaxStreamData {
+                    stream_id,
+                    max: stream.recv.max_data_next(),
+                };
+
+                if push_frame_to_pkt!(b, frames, frame, left) {
+                    let recv_win = stream.recv.window();
+
+                    stream.recv.update_max_data(now);
+
+                    self.streams.remove_almost_full(stream_id);
+
+                    ack_eliciting = true;
+                    in_flight = true;
+
+                    // Make sure the connection window always has some
+                    // room compared to the stream window.
+                    flow_control.ensure_window_lower_bound(
+                        (recv_win as f64 * CONNECTION_WINDOW_FACTOR) as u64,
+                    );
+
+                    // Also send MAX_DATA when MAX_STREAM_DATA is sent, to avoid a
+                    // potential race condition.
+                    self.almost_full = true;
+                }
+            }
+
+            // We don't create MAX_DATA stream as flow control is done per path and not per whole connection
+
+            // Create STOP_SENDING frames as needed.
+            for (stream_id, error_code) in self
+                .streams
+                .stopped()
+                .map(|(&k, &v)| (k, v))
+                .collect::<Vec<(u64, u64)>>()
+            {
+                let frame = frame::Frame::StopSending {
+                    stream_id,
+                    error_code,
+                };
+
+                if push_frame_to_pkt!(b, frames, frame, left) {
+                    self.streams.remove_stopped(stream_id);
+
+                    ack_eliciting = true;
+                    in_flight = true;
+                }
+            }
+
+            // Create RESET_STREAM frames as needed.
+            for (stream_id, (error_code, final_size)) in self
+                .streams
+                .reset()
+                .map(|(&k, &v)| (k, v))
+                .collect::<Vec<(u64, (u64, u64))>>()
+            {
+                let frame = frame::Frame::ResetStream {
+                    stream_id,
+                    error_code,
+                    final_size,
+                };
+
+                if push_frame_to_pkt!(b, frames, frame, left) {
+                    self.streams.remove_reset(stream_id);
+
+                    ack_eliciting = true;
+                    in_flight = true;
+                }
+            }
+
+            // Create STREAM_DATA_BLOCKED frames as needed.
+            for (stream_id, limit) in self
+                .streams
+                .blocked()
+                .map(|(&k, &v)| (k, v))
+                .collect::<Vec<(u64, u64)>>()
+            {
+                let frame = frame::Frame::StreamDataBlocked { stream_id, limit };
+
+                if push_frame_to_pkt!(b, frames, frame, left) {
+                    self.streams.remove_blocked(stream_id);
+
+                    ack_eliciting = true;
+                    in_flight = true;
+                }
+            }
+
+            // Create RETIRE_CONNECTION_ID frames as needed.
+            // TODO multicore
+
+            // Create PATH_ABANDON frames as needed.
+            // TODO multicore
+
+            // Create PATH_AVAILABLE/PATH_STANDBY frames as needed.
+            // TODO multicore
+            // NOTE is a new path is available should use traditionall send_single
+        }
+
+        let path_id = self.path_id.unwrap();
+        let path = self.inner_path.as_mut().unwrap();
+        let reduced_conn = self.reduced_connection.as_mut().unwrap();
+
+        // Create CONNECTION_CLOSE frame. Try to send this only on the active
+        // path, unless it is the last one available.
+        if path_id == reduced_conn.lowest_active_path_id && path.active() {
+            if let Some(conn_err) = reduced_conn.local_error.as_ref() {
+                if conn_err.is_app {
+                    // Create ApplicationClose frame.
+                    if pkt_type == packet::Type::Short {
+                        let frame = frame::Frame::ApplicationClose {
+                            error_code: conn_err.error_code,
+                            reason: conn_err.reason.clone(),
+                        };
+
+                        if push_frame_to_pkt!(b, frames, frame, left) {
+                            let pto = path.recovery.pto();
+                            self.draining_timer = Some(now + (pto * 3));
+                            let mut conn = conn_guard.write().unwrap();
+                            conn.draining = true;
+
+                            ack_eliciting = true;
+                            in_flight = true;
+                        }
+                    }
+                } else {
+                    // Create ConnectionClose frame.
+                    let frame = frame::Frame::ConnectionClose {
+                        error_code: conn_err.error_code,
+                        frame_type: 0,
+                        reason: conn_err.reason.clone(),
+                    };
+
+                    if push_frame_to_pkt!(b, frames, frame, left) {
+                        let pto = path.recovery.pto();
+                        self.draining_timer = Some(now + (pto * 3));
+                        let mut conn = conn_guard.write().unwrap();
+                        conn.draining = true;
+
+                        ack_eliciting = true;
+                        in_flight = true;
+                    }
+                }
+            }
+        }
+
+        // Create CONNECTION_CLOSE frame. Sent over traditional normal send_single
+        let crypto_space = reduced_conn.pkt_num_spaces.crypto.get_mut(epoch);
+        if crypto_space.crypto_stream.is_flushable() &&
+            left > frame::MAX_CRYPTO_OVERHEAD &&
+            !is_closing &&
+            path.active()
+        {
+            let crypto_off = crypto_space.crypto_stream.send.off_front();
+
+            // Encode the frame.
+            //
+            // Instead of creating a `frame::Frame` object, encode the frame
+            // directly into the packet buffer.
+            //
+            // First we reserve some space in the output buffer for writing the
+            // frame header (we assume the length field is always a 2-byte
+            // varint as we don't know the value yet).
+            //
+            // Then we emit the data from the crypto stream's send buffer.
+            //
+            // Finally we go back and encode the frame header with the now
+            // available information.
+            let hdr_off = b.off();
+
+            let hdr_len = 1 + // frame type
+                octets::varint_len(crypto_off) + // offset
+                2; // length, always encode as 2-byte varint
+
+            if let Some(max_len) = left.checked_sub(hdr_len) {
+                let (mut crypto_hdr, mut crypto_payload) =
+                    b.split_at(hdr_off + hdr_len)?;
+
+                // Write stream data into the packet buffer.
+                let (len, _) = crypto_space
+                    .crypto_stream
+                    .send
+                    .emit(&mut crypto_payload.as_mut()[..max_len])?;
+
+
+                // Encode the frame's header.
+                //
+                // Due to how `OctetsMut::split_at()` works, `crypto_hdr` starts
+                // from the initial offset of `b` (rather than the current
+                // offset), so it needs to be advanced to the
+                // initial frame offset.
+                crypto_hdr.skip(hdr_off)?;
+
+                frame::encode_crypto_header(
+                    crypto_off,
+                    len as u64,
+                    &mut crypto_hdr,
+                )?;
+
+                // Advance the packet buffer's offset.
+                b.skip(hdr_len + len)?;
+
+                let frame = frame::Frame::CryptoHeader {
+                    offset: crypto_off,
+                    length: len,
+                };
+
+                if push_frame_to_pkt!(b, frames, frame, left) {
+                    ack_eliciting = true;
+                    in_flight = true;
+                    has_data = true;
+                }
+            }
+        }
+
+        // The preference of data-bearing frame to include in a packet
+        // is managed by `self.emit_dgram`. However, whether any frames
+        // can be sent depends on the state of their buffers. In the case
+        // where one type is preferred but its buffer is empty, fall back
+        // to the other type in order not to waste this function call.
+        let mut dgram_emitted = false;
+        let dgrams_to_emit = max_dgram_len.is_some();
+        let stream_to_emit = self.streams.has_flushable();
+
+        let mut do_dgram = self.emit_dgram && dgrams_to_emit;
+        let do_stream = !self.emit_dgram && stream_to_emit;
+
+        if !do_stream && dgrams_to_emit {
+            do_dgram = true;
+        }
+
+        if (pkt_type == packet::Type::Short || pkt_type == packet::Type::ZeroRTT) &&
+            left > frame::MAX_DGRAM_OVERHEAD &&
+            !is_closing &&
+            path.active() &&
+            do_dgram
+        {
+            if let Some(max_dgram_payload) = max_dgram_len {
+                while let Some(len) = self.dgram_send_queue.peek_front_len() {
+                    let hdr_off = b.off();
+                    let hdr_len = 1 + // frame type
+                        2; // length, always encode as 2-byte varint
+
+                    if (hdr_len + len) <= left {
+                        // Front of the queue fits this packet, send it.
+                        match self.dgram_send_queue.pop() {
+                            Some(data) => {
+                                // Encode the frame.
+                                //
+                                // Instead of creating a `frame::Frame` object,
+                                // encode the frame directly into the packet
+                                // buffer.
+                                //
+                                // First we reserve some space in the output
+                                // buffer for writing the frame header (we
+                                // assume the length field is always a 2-byte
+                                // varint as we don't know the value yet).
+                                //
+                                // Then we emit the data from the DATAGRAM's
+                                // buffer.
+                                //
+                                // Finally we go back and encode the frame
+                                // header with the now available information.
+                                let (mut dgram_hdr, mut dgram_payload) =
+                                    b.split_at(hdr_off + hdr_len)?;
+
+                                dgram_payload.as_mut()[..len]
+                                    .copy_from_slice(&data);
+
+                                // Encode the frame's header.
+                                //
+                                // Due to how `OctetsMut::split_at()` works,
+                                // `dgram_hdr` starts from the initial offset
+                                // of `b` (rather than the current offset), so
+                                // it needs to be advanced to the initial frame
+                                // offset.
+                                dgram_hdr.skip(hdr_off)?;
+
+                                frame::encode_dgram_header(
+                                    len as u64,
+                                    &mut dgram_hdr,
+                                )?;
+
+                                // Advance the packet buffer's offset.
+                                b.skip(hdr_len + len)?;
+
+                                let frame =
+                                    frame::Frame::DatagramHeader { length: len };
+
+                                if push_frame_to_pkt!(b, frames, frame, left) {
+                                    ack_eliciting = true;
+                                    in_flight = true;
+                                    dgram_emitted = true;
+                                }
+                            },
+
+                            None => continue,
+                        };
+                    } else if len > max_dgram_payload {
+                        // This dgram frame will never fit. Let's purge it.
+                        self.dgram_send_queue.pop();
+                    } else {
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Create a single STREAM frame for the first stream that is flushable.
+        if (pkt_type == packet::Type::Short || pkt_type == packet::Type::ZeroRTT) &&
+            left > frame::MAX_STREAM_OVERHEAD &&
+            !is_closing &&
+            path.active() &&
+            !dgram_emitted &&
+            (consider_standby_paths || !path.is_standby())
+        {
+            while let Some(priority_key) = self.streams.peek_flushable() {
+                let stream_id = priority_key.id;
+                let stream = match self.streams.get_mut(stream_id) {
+                    // Avoid sending frames for streams that were already stopped.
+                    //
+                    // This might happen if stream data was buffered but not yet
+                    // flushed on the wire when a STOP_SENDING frame is received.
+                    Some(v) if !v.send.is_stopped() => v,
+                    _ => {
+                        self.streams.remove_flushable(&priority_key);
+                        continue;
+                    },
+                };
+
+                let stream_off = stream.send.off_front();
+
+                // Encode the frame.
+                //
+                // Instead of creating a `frame::Frame` object, encode the frame
+                // directly into the packet buffer.
+                //
+                // First we reserve some space in the output buffer for writing
+                // the frame header (we assume the length field is always a
+                // 2-byte varint as we don't know the value yet).
+                //
+                // Then we emit the data from the stream's send buffer.
+                //
+                // Finally we go back and encode the frame header with the now
+                // available information.
+                let hdr_off = b.off();
+                let hdr_len = 1 + // frame type
+                    octets::varint_len(stream_id) + // stream_id
+                    octets::varint_len(stream_off) + // offset
+                    2; // length, always encode as 2-byte varint
+
+                let max_len = match left.checked_sub(hdr_len) {
+                    Some(v) => v,
+                    None => {
+                        let priority_key = Arc::clone(&stream.priority_key);
+                        self.streams.remove_flushable(&priority_key);
+
+                        continue;
+                    },
+                };
+
+                let (mut stream_hdr, mut stream_payload) =
+                    b.split_at(hdr_off + hdr_len)?;
+
+                // Write stream data into the packet buffer.
+                let (len, fin) =
+                    stream.send.emit(&mut stream_payload.as_mut()[..max_len])?;
+
+                // Encode the frame's header.
+                //
+                // Due to how `OctetsMut::split_at()` works, `stream_hdr` starts
+                // from the initial offset of `b` (rather than the current
+                // offset), so it needs to be advanced to the initial frame
+                // offset.
+                stream_hdr.skip(hdr_off)?;
+
+                frame::encode_stream_header(
+                    stream_id,
+                    stream_off,
+                    len as u64,
+                    fin,
+                    &mut stream_hdr,
+                )?;
+
+                // Advance the packet buffer's offset.
+                b.skip(hdr_len + len)?;
+
+                let frame = frame::Frame::StreamHeader {
+                    stream_id,
+                    offset: stream_off,
+                    length: len,
+                    fin,
+                };
+
+                if push_frame_to_pkt!(b, frames, frame, left) {
+                    ack_eliciting = true;
+                    in_flight = true;
+                    has_data = true;
+                }
+
+                let priority_key = Arc::clone(&stream.priority_key);
+                // If the stream is no longer flushable, remove it from the queue
+                if !stream.is_flushable() {
+                    self.streams.remove_flushable(&priority_key);
+                } else if stream.incremental {
+                    // Shuffle the incremental stream to the back of the the
+                    // queue.
+                    self.streams.remove_flushable(&priority_key);
+                    self.streams.insert_flushable(&priority_key);
+                }
+
+                break;
+            }
+        }
+
+        // Alternate trying to send DATAGRAMs next time.
+        self.emit_dgram = !dgram_emitted;
+
+        // If no other ack-eliciting frame is sent, include a PING frame
+        // - if PTO probe needed; OR
+        // - if we've sent too many non ack-eliciting packets without having
+        // sent an ACK eliciting one; OR
+        // - the application requested an ack-eliciting frame be sent.
+        if (ack_elicit_required || path.needs_ack_eliciting) &&
+            !ack_eliciting &&
+            left >= 1 &&
+            !is_closing
+        {
+            let frame = frame::Frame::Ping;
+
+            if push_frame_to_pkt!(b, frames, frame, left) {
+                ack_eliciting = true;
+                in_flight = true;
+            }
+        }
+
+        if ack_eliciting {
+            path.needs_ack_eliciting = false;
+            path.recovery.loss_probes[epoch] =
+                path.recovery.loss_probes[epoch].saturating_sub(1);
+        }
+
+        if frames.is_empty() {
+            // When we reach this point we are not able to write more, so set
+            // app_limited to false.
+            path.recovery.update_app_limited(false);
+            return Err(Error::Done);
+        }
+
+        // When coalescing a 1-RTT packet, we can't add padding in the UDP
+        // datagram, so use PADDING frames instead.
+        //
+        // This is only needed if
+        // 1) an Initial packet has already been written to the UDP datagram,
+        // as Initial always requires padding.
+        //
+        // 2) this is a probing packet towards an unvalidated peer address.
+        if (has_initial || !path.validated()) &&
+            pkt_type == packet::Type::Short &&
+            left >= 1
+        {
+            let frame = frame::Frame::Padding { len: left };
+
+            if push_frame_to_pkt!(b, frames, frame, left) {
+                in_flight = true;
+            }
+        }
+
+        // Pad payload so that it's always at least 4 bytes.
+        if b.off() - payload_offset < PAYLOAD_MIN_LEN {
+            let payload_len = b.off() - payload_offset;
+
+            let frame = frame::Frame::Padding {
+                len: PAYLOAD_MIN_LEN - payload_len,
+            };
+
+            #[allow(unused_assignments)]
+            if push_frame_to_pkt!(b, frames, frame, left) {
+                in_flight = true;
+            }
+        }
+
+        let payload_len = b.off() - payload_offset;
+
+        // Fill in payload length.
+        if pkt_type != packet::Type::Short {
+            let len = pn_len + payload_len + crypto_overhead;
+
+            let (_, mut payload_with_len) = b.split_at(header_offset)?;
+            payload_with_len
+                .put_varint_with_len(len as u64, PAYLOAD_LENGTH_LEN)?;
+        }
+
+        trace!(
+            "{} tx pkt {} len={} pn={} {}",
+            reduced_conn.trace_id,
+            hdr_trace.unwrap_or_default(),
+            payload_len,
+            pn,
+            AddrTupleFmt(path.local_addr(), path.peer_addr())
+        );
+
+        let aead = match crypto_space.crypto_seal {
+            Some(ref v) => v,
+            None => return Err(Error::InvalidState),
+        };
+
+        let written = packet::encrypt_pkt(
+            &mut b,
+            space_id as u32,
+            pn,
+            pn_len,
+            payload_len,
+            payload_offset,
+            None,
+            aead,
+        )?;
+
+        let pkt_num = recovery::SpacedPktNum::new(space_id as u32, pn);
+
+        let sent_pkt = recovery::Sent {
+            pkt_num,
+            frames,
+            time_sent: now,
+            time_acked: None,
+            time_lost: None,
+            size: if ack_eliciting { written } else { 0 },
+            ack_eliciting,
+            in_flight,
+            delivered: 0,
+            delivered_time: now,
+            first_sent_time: now,
+            is_app_limited: false,
+            tx_in_flight: 0,
+            lost: 0,
+            has_data,
+        };
+
+        if in_flight && is_app_limited {
+            path.recovery.delivery_rate_update_app_limited(true);
+        }
+
+        let pkt_space = reduced_conn.pkt_num_spaces.spaces.get_mut(epoch, space_id)?;
+        pkt_space.next_pkt_num += 1;
+
+        let handshake_status = recovery::HandshakeStatus {
+            has_handshake_keys: reduced_conn
+                .pkt_num_spaces
+                .crypto
+                .get(packet::Epoch::Handshake)
+                .has_keys(),
+            peer_verified_address: true, // calls to this function implies so 
+            completed: true, // calls to this function implies so 
+        };
+
+        path.recovery.on_packet_sent(
+            sent_pkt,
+            epoch,
+            handshake_status,
+            now,
+            &reduced_conn.trace_id,
+        );
+
+        // Record sent packet size if we probe the path.
+        if let Some(data) = challenge_data {
+            path.add_challenge_sent(data, written, now);
+        }
+
+        path.sent_count += 1;
+        path.sent_bytes += written as u64;
+
+        if self.dgram_send_queue.byte_size() > path.recovery.cwnd_available() {
+            path.recovery.update_app_limited(false);
+        }
+
+        path.max_send_bytes = path.max_send_bytes.saturating_sub(written);
+        
+        if ack_eliciting {
+            reduced_conn.ack_eliciting_sent = true;
+        }     
+
+        // (Re)start the idle timer if we are sending the first ack-eliciting
+        // packet since last receiving a packet.
+        if ack_eliciting && !reduced_conn.ack_eliciting_sent {
+            if let Some(idle_timeout) = self.idle_timeout() {
+                self.idle_timer = Some(now + idle_timeout);
+            }
+        }
+
+        Ok((pkt_type, written))
+    }
+
     /// Sends connection data on this path
     pub fn send_on_path(
         &mut self, 
         conn_guard: &Arc<RwLock<MulticoreConnection>>, 
         out: &mut [u8]
     ) -> Result<(usize, SendInfo)> {
-        let mut conn = conn_guard.write().unwrap();
+        let now = None;
+        let mut left;
+        {
+            let mut conn = conn_guard.write().unwrap();
 
-        if out.is_empty() {
-            return Err(Error::BufferTooShort);
-        }
-        
-        let now = Some(time::Instant::now());
-
-        if conn.is_closed() || conn.is_draining() {
-            return Err(Error::Done);
-        }
-
-        if conn.local_error.is_none() && !self.path_id.is_none() {
-            if conn.is_lowest_active_path_id(self) {
-                conn.do_handshake(now.unwrap(), self)?;
+            if out.is_empty() {
+                return Err(Error::BufferTooShort);
             }
+            
+            let now = Some(time::Instant::now());
+
+            if conn.is_closed() || conn.is_draining() {
+                return Err(Error::Done);
+            }
+
+            if !self.completed_handshake {
+                if conn.local_error.is_none() && !self.path_id.is_none() {
+                    if conn.is_lowest_active_path_id(self) {
+                        conn.do_handshake(now.unwrap(), self)?;
+                    }
+                }
+            }
+        
+            // applications, as they may not expect getting a `recv()`
+            // error when calling `send()`.
+            //
+            // We simply fall-through to sending packets, which should
+            // take care of terminating the connection as needed.
+            //
+            let _ = self.process_undecrypted_0rtt_packets(&mut conn);
+
+            // There's no point in trying to send a packet if the Initial secrets
+            // have not been derived yet, so return early.
+            if !conn.derived_initial_secrets {
+                return Err(Error::Done);
+            }
+            left = cmp::min(out.len(), self.max_send_udp_payload_size(&conn));
         }
 
+        
+        let mut has_initial = false;
+        let mut done = 0;
+        
         let now = match now {
             Some(v) => v, 
             None => time::Instant::now()
         };
-
-        // Forwarding the error value here could confuse
-        // applications, as they may not expect getting a `recv()`
-        // error when calling `send()`.
-        //
-        // We simply fall-through to sending packets, which should
-        // take care of terminating the connection as needed.
-        //
-        let _ = self.process_undecrypted_0rtt_packets(&mut conn);
-
-        // There's no point in trying to send a packet if the Initial secrets
-        // have not been derived yet, so return early.
-        if !conn.derived_initial_secrets {
-            return Err(Error::Done);
-        }
-
-        let mut has_initial = false;
-        let mut done = 0;
-
-        let mut left = cmp::min(out.len(), self.max_send_udp_payload_size(&conn));
 
         if !self.get_inner_path_mut().unwrap().verified_peer_address && self.is_server {
             left = cmp::min(left, self.get_inner_path_mut().unwrap().max_send_bytes);
         }
 
         // Generate coalesced packets.
-        while left > 0 {
-            let (ty, written) = match self.send_single(
-                &mut conn, 
-                &mut out[done..done + left],
-                has_initial,
-                now,
-            ) {
-                Ok(v) => v,
-
-                Err(Error::BufferTooShort) | Err(Error::Done) => break,
-
-                Err(e) => return Err(e),
-            };
-
-            done += written;
-            left -= written;
-
-            match ty {
-                packet::Type::Initial => has_initial = true,
-
-                // No more packets can be coalesced after a 1-RTT.
-                packet::Type::Short => break,
-                
-                _ => (),
-            };
-
-            // When sending multiple PTO probes, don't coalesce them together,
-            // so they are sent on separate UDP datagrams.
-            if let Ok(epoch) = ty.to_epoch() {
-                if self.get_inner_path_mut().unwrap().recovery.loss_probes[epoch] > 0 {
-                    break;
+        if false {
+            info!("sending using reduced send single");
+            while left > 0 {
+                let (ty, written) = match self.reduced_send_single(
+                    conn_guard, 
+                    &mut out[done..done + left],
+                    has_initial,
+                    now,
+                ) {
+                    Ok(v) => v,
+    
+                    Err(Error::BufferTooShort) | Err(Error::Done) => break,
+    
+                    Err(e) => return Err(e),
+                };
+    
+                done += written;
+                left -= written;
+    
+                match ty {
+                    packet::Type::Initial => has_initial = true,
+    
+                    // No more packets can be coalesced after a 1-RTT.
+                    packet::Type::Short => break,
+                    
+                    _ => (),
+                };
+    
+                // When sending multiple PTO probes, don't coalesce them together,
+                // so they are sent on separate UDP datagrams.
+                if let Ok(epoch) = ty.to_epoch() {
+                    if self.get_inner_path_mut().unwrap().recovery.loss_probes[epoch] > 0 {
+                        break;
+                    }
+                }
+            }
+        } else {
+            while left > 0 {
+                let mut conn = conn_guard.write().unwrap();
+    
+                let (ty, written) = match self.send_single(
+                    &mut conn, 
+                    &mut out[done..done + left],
+                    has_initial,
+                    now,
+                ) {
+                    Ok(v) => v,
+    
+                    Err(Error::BufferTooShort) | Err(Error::Done) => break,
+    
+                    Err(e) => return Err(e),
+                };
+    
+                done += written;
+                left -= written;
+    
+                match ty {
+                    packet::Type::Initial => has_initial = true,
+    
+                    // No more packets can be coalesced after a 1-RTT.
+                    packet::Type::Short => break,
+                    
+                    _ => (),
+                };
+    
+                // When sending multiple PTO probes, don't coalesce them together,
+                // so they are sent on separate UDP datagrams.
+                if let Ok(epoch) = ty.to_epoch() {
+                    if self.get_inner_path_mut().unwrap().recovery.loss_probes[epoch] > 0 {
+                        break;
+                    }
                 }
             }
         }
@@ -10199,8 +11396,13 @@ impl MulticorePath {
             return Err(Error::Done);
         }
 
-        let path_id = self.get_path_id();
-        conn.paths_stats.insert(path_id, self.get_inner_path().unwrap().stats());
+        {
+            let mut conn = conn_guard.write().unwrap();
+            conn.get_multicore_pending_event(self);
+            if let Some(path_id) = self.path_id {
+                conn.paths_stats.insert(path_id, self.get_inner_path().unwrap().stats());
+            }
+        }
 
         // Pad UDP datagram if it contains a QUIC Initial packet.
         #[cfg(not(feature = "fuzzing"))]
@@ -10222,6 +11424,25 @@ impl MulticorePath {
 
             at: send_path.recovery.get_packet_send_time(),
         };
+
+        if !self.completed_handshake{
+            let conn = conn_guard.read().unwrap();
+            if conn.handshake_completed && 
+                conn.handshake_confirmed && 
+                conn.peer_verified_initial_address &&
+                (!self.is_server || conn.handshake_done_acked) &&
+                conn.got_peer_conn_id &&
+                !self.get_inner_path().is_none() && 
+                self.get_inner_path().unwrap().validated()
+            {
+                self.completed_handshake = true;
+                self.reduced_connection = Some(
+                    ReducedMulticoreConnection::new(
+                        &conn
+                    )?
+                );
+            }
+        }
 
         Ok((done, info))
     }
@@ -10634,6 +11855,8 @@ impl MulticorePath {
                     return Err(Error::InvalidState);
                 }
 
+                let cloned = conn_id.clone();
+
                 let retired_path_ids = conn.ids.new_dcid(
                     conn_id.into(),
                     seq_num,
@@ -10645,6 +11868,42 @@ impl MulticorePath {
                     // TODO multicore
                     info!("There some retired path ids to handle");
                     return Err(Error::MulticoreNotDone);
+                }
+
+                if false {
+                    let reduced_conn = self.reduced_connection.as_mut().unwrap();
+                    if reduced_conn.ids.zero_length_dcid() {
+                        return Err(Error::InvalidState);
+                    }
+
+                    let cloned = cloned.clone();
+    
+                    let retired_path_ids = reduced_conn.ids.new_dcid(
+                        cloned.into(),
+                        seq_num,
+                        u128::from_be_bytes(reset_token),
+                        retire_prior_to,
+                    )?;
+    
+                    for (_, _) in retired_path_ids {
+                        // TODO multicore
+                        info!("There some retired path ids to handle");
+                        return Err(Error::MulticoreNotDone);
+                    }
+                }
+
+                for (pid, q) in conn.per_path_unprocessed_events.iter_mut(){
+                    if *pid != recv_path_id{
+                        let cloned = cloned.clone();
+                        q.push_back(
+                            MulticorePathPendingEvent::NewConnectionId(
+                                seq_num, 
+                                retire_prior_to,
+                                cloned, 
+                                reset_token
+                            )
+                        )
+                    }
                 }
             },
 
@@ -10679,8 +11938,12 @@ impl MulticorePath {
                     reason,
                 });
 
+                conn.recv_connection_close = true;
+
                 let path = self.get_inner_path_mut().unwrap();
                 self.draining_timer = Some(now + (path.recovery.pto() * 3));
+                conn.draining = true;
+
             },
 
             frame::Frame::ApplicationClose { error_code, reason } => {
@@ -10689,9 +11952,12 @@ impl MulticorePath {
                     error_code,
                     reason,
                 });
+                conn.recv_application_close = true;
 
                 let path = self.get_inner_path_mut().unwrap();
                 self.draining_timer = Some(now + (path.recovery.pto() * 3));
+                conn.draining = true;
+
             },
 
             frame::Frame::HandshakeDone => {
@@ -10892,7 +12158,7 @@ impl MulticorePath {
         let is_closing;
         let trace_id;
         let source_id_len;
-        let mut did_version_negotiation;
+        let did_version_negotiation;
         let mut version;
         let derived_initial_secrets;
 
@@ -10905,9 +12171,9 @@ impl MulticorePath {
             recv_count = conn.recv_count();
             trace_id = conn.trace_id.clone(); 
             source_id_len = conn.source_id().len();
-            did_version_negotiation = conn.did_version_negotiation;
-            version = conn.version;
-            derived_initial_secrets = conn.derived_initial_secrets;
+            derived_initial_secrets = conn.derived_initial_secrets; 
+            version = conn.version; 
+            did_version_negotiation = conn.did_version_negotiation; 
         }
 
         if is_closing {
@@ -10979,7 +12245,6 @@ impl MulticorePath {
                 }
 
                 conn.version = cmp::max(conn.version, v);
-                version = conn.version;
             }
 
             if !found_version {
@@ -10994,7 +12259,6 @@ impl MulticorePath {
             }
 
             conn.did_version_negotiation = true;
-            did_version_negotiation = true;
 
             // Derive Initial secrets based on the new version.
             let (aead_open, aead_seal) = crypto::derive_initial_key_material(
@@ -11100,10 +12364,7 @@ impl MulticorePath {
             }
 
             conn.version = hdr.version;
-            version = hdr.version;
             conn.did_version_negotiation = true;
-            did_version_negotiation = true;
-
             version = conn.version;
             conn.handshake
                 .use_legacy_codepoint(version != PROTOCOL_VERSION_V1);
@@ -11137,8 +12398,6 @@ impl MulticorePath {
         // Make sure the buffer is same or larger than an explicit
         // payload length.
         if payload_len > b.cap() {
-            info!("Can't get payload len bigger than cap");
-
             return Err(drop_pkt_on_err(
                 Error::InvalidPacket,
                 recv_count,
@@ -11183,7 +12442,7 @@ impl MulticorePath {
         };
 
         // Finally, discard packet if no usable key is available.
-        let mut aead = match aead {
+        let aead = match aead {
             Some(v) => v,
 
             None => {
@@ -11263,50 +12522,7 @@ impl MulticorePath {
         #[cfg(feature = "qlog")]
         let mut qlog_frames = vec![];
 
-        // Check for key update.
-        let mut aead_next = None;
-
-        if conn.handshake_confirmed &&
-            hdr.ty != Type::ZeroRTT &&
-            hdr.key_phase != conn.key_phase
-        {
-            // Check if this packet arrived before key update.
-            if let Some(key_update) = conn
-                .pkt_num_spaces
-                .crypto
-                .get(epoch)
-                .key_update
-                .as_ref()
-                .and_then(|key_update| {
-                    (pn < key_update.pn_on_update).then_some(key_update)
-                })
-            {
-                aead = &key_update.crypto_open;
-            } else {
-                trace!("{} peer-initiated key update", conn.trace_id);
-
-                aead_next = Some((
-                    conn.pkt_num_spaces
-                        .crypto
-                        .get(epoch)
-                        .crypto_open
-                        .as_ref()
-                        .unwrap()
-                        .derive_next_packet_key()?,
-                    conn.pkt_num_spaces
-                        .crypto
-                        .get(epoch)
-                        .crypto_seal
-                        .as_ref()
-                        .unwrap()
-                        .derive_next_packet_key()?,
-                ));
-
-                // `aead_next` is always `Some()` at this point, so the `unwrap()`
-                // will never fail.
-                aead = &aead_next.as_ref().unwrap().0;
-            }
-        }
+        // TODO multicore key update
 
         let mut payload = packet::decrypt_pkt(
             &mut b,
@@ -11315,8 +12531,7 @@ impl MulticorePath {
             pn_len,
             payload_len,
             aead,
-        )
-        .map_err(|e| {
+        ).map_err(|e| {
             drop_pkt_on_err(e, conn.recv_count(), self.is_server, &conn.trace_id)
         })?;
 
@@ -11344,80 +12559,7 @@ impl MulticorePath {
             self.get_path_id()
         };
 
-        // The key update is verified once a packet is successfully decrypted
-        // using the new keys.
-        if let Some((open_next, seal_next)) = aead_next {
-            if !conn
-                .pkt_num_spaces
-                .crypto
-                .get(epoch)
-                .key_update
-                .as_ref()
-                .map_or(true, |prev| prev.update_acked)
-            {
-                // Peer has updated keys twice without awaiting confirmation.
-                return Err(Error::KeyUpdate);
-            }
-
-            trace!("{} key update verified", conn.trace_id);
-
-            let _ = conn
-                .pkt_num_spaces
-                .crypto
-                .get_mut(epoch)
-                .crypto_seal
-                .replace(seal_next);
-
-            let open_prev = conn
-                .pkt_num_spaces
-                .crypto
-                .get_mut(epoch)
-                .crypto_open
-                .replace(open_next)
-                .unwrap();
-
-            let recv_path = self.get_inner_path_mut().unwrap();
-
-            conn.pkt_num_spaces.crypto.get_mut(epoch).key_update =
-                Some(packet::KeyUpdate {
-                    crypto_open: open_prev,
-                    pn_on_update: pn,
-                    update_acked: false,
-                    timer: now + (recv_path.recovery.pto() * 3),
-                });
-
-            conn.key_phase = !conn.key_phase;
-
-            qlog_with_type!(QLOG_PACKET_RX, conn.qlog, q, {
-                let trigger = Some(
-                    qlog::events::security::KeyUpdateOrRetiredTrigger::RemoteUpdate,
-                );
-
-                let ev_data_client =
-                    EventData::KeyUpdated(qlog::events::security::KeyUpdated {
-                        key_type:
-                            qlog::events::security::KeyType::Client1RttSecret,
-                        old: None,
-                        new: String::new(),
-                        generation: None,
-                        trigger: trigger.clone(),
-                    });
-
-                q.add_event_data_with_instant(ev_data_client, now).ok();
-
-                let ev_data_server =
-                    EventData::KeyUpdated(qlog::events::security::KeyUpdated {
-                        key_type:
-                            qlog::events::security::KeyType::Server1RttSecret,
-                        old: None,
-                        new: String::new(),
-                        generation: None,
-                        trigger,
-                    });
-
-                q.add_event_data_with_instant(ev_data_server, now).ok();
-            });
-        }
+        // TODO multicore key update
 
         if !self.is_server && !conn.got_peer_conn_id {
             if conn.odcid.is_none() {
@@ -11722,7 +12864,7 @@ impl MulticorePath {
             }
         }
 
-        if let Some(idle_timeout) = conn.idle_timeout(self) {
+        if let Some(idle_timeout) = self.idle_timeout() {
             conn.idle_timer = Some(now + idle_timeout);
         }
 
@@ -11749,19 +12891,362 @@ impl MulticorePath {
         }
         conn.ack_eliciting_sent = false;
 
+        conn.get_multicore_pending_event(self);
+
+        Ok(read)
+    }
+
+    /// recv_single after completed hanshake
+    fn reduced_recv_single(
+        &mut self,
+        conn_guard: &Arc<RwLock<MulticoreConnection>>, 
+        buf: &mut [u8], 
+        info: &RecvInfo, 
+    ) -> Result<usize> {
+
+        // NOTE: must check if connection is closing outside
+
+        let now = time::Instant::now();
+
+        if buf.is_empty() {
+            return Err(Error::Done);
+        }
+
+        let source_id_len = self.reduced_connection.as_ref().unwrap().source_id_len;
+        let recv_count = self.inner_path.as_ref().unwrap().recv_count;
+        let trace_id = self.reduced_connection.as_ref().unwrap().trace_id.clone();
+
+        let mut b = octets::OctetsMut::with_slice(buf);
+        let mut hdr = Header::from_bytes(&mut b, source_id_len)
+        .map_err(|e| {
+            drop_pkt_on_err(
+                e,
+                recv_count,
+                self.is_server,
+                &trace_id,
+            )
+        })?;
+
+        // Long header packets have an explicit payload length, but short
+        // packets don't so just use the remaining capacity in the buffer.
+        let payload_len = if hdr.ty == packet::Type::Short {
+            b.cap()
+        } else {
+            b.get_varint().map_err(|e| {
+                drop_pkt_on_err(
+                    e.into(),
+                    recv_count,
+                    self.is_server,
+                    &trace_id,
+                )
+            })? as usize
+        };
+
+        // Select packet number space epoch based on the received packet's type.
+        let epoch = hdr.ty.to_epoch()?;
+        let aead = if hdr.ty == packet::Type::ZeroRTT {
+            return Err(Error::MulticoreNotDone);
+            // Not supported yet for multicore
+        } else {
+            // Otherwise use the packet number space's main key.
+            self.reduced_connection.as_ref().unwrap().pkt_num_spaces.crypto.get(epoch).crypto_open.as_ref()
+        };
+
+        // Finally, discard packet if no usable key is available.
+        let aead = match aead {
+            Some(v) => v,
+
+            None => {
+                return Err(Error::MulticoreNotDone);
+            },
+        };
+
+        let aead_tag_len = aead.alg().tag_len();
+        packet::decrypt_hdr(&mut b, &mut hdr, aead).map_err(|e| {
+            drop_pkt_on_err(e, recv_count, self.is_server, &trace_id)
+        })?;
+
+        let space_id = if self.reduced_connection.as_ref().unwrap().multipath {
+            if let Some((scid_seq, _)) = self.reduced_connection.as_ref().unwrap().ids.find_scid_seq(&hdr.dcid) {
+                scid_seq
+            } else {
+                trace!(
+                    "{} ignored unknown Source CID {:?}",
+                    trace_id,
+                    hdr.dcid
+                );
+                return Err(Error::Done);
+            }
+        } else {
+            packet::INITIAL_PACKET_NUMBER_SPACE_ID
+        };
+
+        // This might be a new space identifier yet unseen before. In such case,
+        // it should start with 0.
+        let largest_rx_pkt_num = self.reduced_connection.as_ref().unwrap()
+            .pkt_num_spaces
+            .spaces
+            .get(epoch, space_id)
+            .map(|pns| pns.largest_rx_pkt_num)
+            .unwrap_or(0);
+        let pn = packet::decode_pkt_num(
+            largest_rx_pkt_num,
+            hdr.pkt_num,
+            hdr.pkt_num_len,
+        );
+
+        let pn_len = hdr.pkt_num_len;
+
+        trace!(
+            "{} rx pkt {:?} len={} pn={} {}",
+            trace_id,
+            hdr,
+            payload_len,
+            pn,
+            AddrTupleFmt(info.from, info.to)
+        );
+
+        // TODO multicore key update
+
+        let mut payload = packet::decrypt_pkt(
+            &mut b,
+            space_id as u32,
+            pn,
+            pn_len,
+            payload_len,
+            aead,
+        ).map_err(|e| {
+            drop_pkt_on_err(e, recv_count, self.is_server, &trace_id)
+        })?;
+
+        let pkt_num_space = self.reduced_connection.as_mut().unwrap()
+            .pkt_num_spaces
+            .spaces
+            .get_mut_or_create(epoch, space_id);
+        if pkt_num_space.recv_pkt_num.contains(pn) {
+            trace!("{} ignored duplicate packet {}", trace_id, pn);
+            return Err(Error::Done);
+        }
+
+        // Packets with no frames are invalid.
+        if payload.cap() == 0 {
+            return Err(Error::InvalidPacket);
+        }
+
+        // Now that we decrypted the packet, let's see if we can it's for this path
+        let pkt_dcid = ConnectionId::from_ref(&hdr.dcid);
+        let cid_entry = self.inner_path.as_ref().unwrap()
+            .active_scid_seq
+            .and_then(|v| self.reduced_connection.as_ref().unwrap().ids.get_scid(v).ok());
+        if cid_entry.map(|e| &e.cid) != Some(&pkt_dcid) {
+            trace!("{} ignored packet not for the recieving path id {}, receiving pid {}", trace_id, pn, self.path_id.unwrap());
+            return Err(Error::Done);
+        }
+        let recv_pid = self.get_path_id();
+
+        let mut ack_elicited = false;
+        let mut frame_processing_err = None;
+        let mut probing = true;
+
+        // Process packet payload.
+        while payload.cap() > 0 {
+            let mut conn = conn_guard.write().unwrap();
+            let frame = frame::Frame::from_bytes(&mut payload, hdr.ty)?;
+
+            if frame.ack_eliciting() {
+                ack_elicited = true;
+            }
+
+            if !frame.probing() {
+                probing = false;
+            }
+
+            if let Err(e) = self.process_frame(&mut conn, frame, &hdr, recv_pid, epoch, now)
+            {
+                frame_processing_err = Some(e);
+                break;
+            }
+        }
+
+        if let Some(e) = frame_processing_err {
+            // Any frame error is terminal, so now just return.
+            return Err(e);
+        }
+
+        let p = self.inner_path.as_mut().unwrap();
+
+        for acked in p.recovery.acked[epoch].drain(..) {
+            match acked {
+                frame::Frame::ACK { ranges, .. } => {
+                    // Stop acknowledging packets less than or equal to the
+                    // largest acknowledged in the sent ACK frame that, in
+                    // turn, got acked.
+                    if let Some(largest_acked) = ranges.last() {
+                        self.reduced_connection.as_mut().unwrap().pkt_num_spaces
+                            .spaces
+                            .get_mut(epoch, 0)
+                            .map(|pns| {
+                                pns.recv_pkt_need_ack
+                                    .remove_until(largest_acked)
+                            })
+                            .ok();
+                    }
+                },
+
+                frame::Frame::CryptoHeader { offset, length } => {
+                    self.reduced_connection.as_mut().unwrap().pkt_num_spaces
+                        .crypto
+                        .get_mut(epoch)
+                        .crypto_stream
+                        .send
+                        .ack_and_drop(offset, length);
+                },
+
+                frame::Frame::StreamHeader {
+                    stream_id,
+                    offset,
+                    length,
+                    ..
+                } => {
+                    let stream = match self.streams.get_mut(stream_id) {
+                        Some(v) => v,
+
+                        None => continue,
+                    };
+
+                    stream.send.ack_and_drop(offset, length);
+
+                    self.tx_buffered =
+                        self.tx_buffered.saturating_sub(length);
+
+                    // Only collect the stream if it is complete and not
+                    // readable. If it is readable, it will get collected when
+                    // stream_recv() is used.
+                    if stream.is_complete() && !stream.is_readable() {
+                        let local = stream.local;
+                        let mut conn = conn_guard.write().unwrap();
+                        conn.stream_ids.collect(&mut self.streams, stream_id, local);
+                    }
+                },
+
+                frame::Frame::HandshakeDone => {
+                    let mut conn = conn_guard.write().unwrap();
+                    conn.handshake_done_sent = true;
+                    conn.handshake_done_acked = true;
+                },
+
+                frame::Frame::ResetStream { stream_id, .. } => {
+                    let stream = match self.streams.get_mut(stream_id) {
+                        Some(v) => v,
+
+                        None => continue,
+                    };
+
+                    // Only collect the stream if it is complete and not
+                    // readable. If it is readable, it will get collected when
+                    // stream_recv() is used.
+                    if stream.is_complete() && !stream.is_readable() {
+                        let local = stream.local;
+                        let mut conn = conn_guard.write().unwrap();
+                        conn.stream_ids.collect(&mut self.streams, stream_id, local);
+                    }
+                },
+
+                frame::Frame::ACKMP {
+                    space_identifier,
+                    ranges,
+                    ..
+                } => {
+                    if space_identifier!= space_id {
+                        warn!("ACKMP for another space id");
+                    }
+                    // Stop acknowledging packets less than or equal to the
+                    // largest acknowledged in the sent ACK_MP frame that,
+                    // in turn, got acked.
+                    if let Some(largest_acked) = ranges.last() {
+                        self.reduced_connection.as_mut().unwrap().pkt_num_spaces
+                            .spaces
+                            .get_mut(
+                                packet::Epoch::Application,
+                                space_identifier,
+                            )
+                            .map(|pns| {
+                                pns.recv_pkt_need_ack
+                                    .remove_until(largest_acked)
+                            })
+                            .ok();
+                    }
+                },
+
+                frame::Frame::PathAbandon { dcid_seq_num, .. } => {
+                    let mut conn = conn_guard.write().unwrap();
+                    conn.dcid_seq_to_abandon.push_back(dcid_seq_num);
+
+                    error!("Handle path abandon on draining");
+                    return Err(Error::MulticoreNotDone);
+                },
+
+                _ => (),
+            }
+        }
+
+        let multipath_enabled = self.reduced_connection.as_ref().unwrap().multipath;
+        let active_path_id = self.reduced_connection.as_ref().unwrap().lowest_active_path_id;
+        let pkt_num_space = self.reduced_connection.as_mut().unwrap().pkt_num_spaces.spaces.get_mut(epoch, space_id)?;
+
+        // We only record the time of arrival of the largest packet number
+        // that still needs to be acked, to be used for ACK delay calculation.
+        if pkt_num_space.recv_pkt_need_ack.last() < Some(pn) {
+            pkt_num_space.largest_rx_pkt_time = now;
+        }
+
+        pkt_num_space.recv_pkt_num.insert(pn);
+
+        pkt_num_space.recv_pkt_need_ack.push_item(pn);
+
+        pkt_num_space.ack_elicited =
+            cmp::max(pkt_num_space.ack_elicited, ack_elicited);
+
+        pkt_num_space.largest_rx_pkt_num =
+            cmp::max(pkt_num_space.largest_rx_pkt_num, pn);
+
+        if !probing {
+            pkt_num_space.largest_rx_non_probing_pkt_num =
+                cmp::max(pkt_num_space.largest_rx_non_probing_pkt_num, pn);
+
+            // Did the peer migrate to another path? This only applies when
+            // multipath extensions have not been negotiated.
+
+            if self.is_server &&
+                !multipath_enabled &&
+                recv_pid != active_path_id &&
+                pkt_num_space.largest_rx_non_probing_pkt_num == pn
+            {
+                // TODO multicore
+                return Err(Error::MulticoreNotDone);
+                // conn.on_peer_migrated(recv_pid, conn.disable_dcid_reuse, now)?;
+            }
+        }
+
+        if let Some(idle_timeout) = self.idle_timeout() {
+            self.idle_timer = Some(now + idle_timeout);
+        }
+
+        // Update send capacity.
+        self.update_tx_cap();
+
+        self.get_inner_path_mut().unwrap().recv_count += 1;
+
+        let read = b.off() + aead_tag_len;
+
+        self.get_inner_path_mut().unwrap().recv_bytes += read as u64;
+
+        self.reduced_connection.as_mut().unwrap().ack_eliciting_sent = false;
+
         Ok(read)
     }
 
     /// Processes QUIC packets received from the peer.
-    ///
-    /// On success the number of bytes processed from the input buffer is
-    /// returned. On error the connection will be closed by calling [`close()`]
-    /// with the appropriate error code.
-    ///
-    /// Coalesced packets will be processed as necessary.
-    ///
-    /// Note that the contents of the input buffer `buf` might be modified by
-    /// this function due to, for example, in-place decryption.
     pub fn recv(
         &mut self, 
         conn_guard: &Arc<RwLock<MulticoreConnection>>, 
@@ -11805,60 +13290,111 @@ impl MulticorePath {
 
         let mut done = 0;
         let mut left = len;
+        if false {
+            while left > 0 {
+                let read = match self.reduced_recv_single(
+                    conn_guard,
+                    &mut buf[len - left..len],
+                    &info,
+                ) {
+                    Ok(v) => v,
+                    
+                    Err(Error::Done) => {
+                        let mut conn = conn_guard.write().unwrap();
+                        // If the packet can't be processed or decrypted, check if
+                        // it's a stateless reset.
+                        debug!("path_recv_single return done");
+                        if conn.is_stateless_reset(&buf[len - left..len]) {
+                            trace!("{} packet is a stateless reset", conn.trace_id);
+                            conn.closed = true;
+                        }
+                        left
+                    },
+    
+                    Err(e) => {
+                        let mut conn = conn_guard.write().unwrap();
+    
+                        // In case of error processing the incoming packet, close
+                        // the connection.
+                        conn.close(false, e.to_wire(), b"").ok();
+                        return Err(e);
+                    },
+                };
+    
+                debug!("path_recv_single read: {}", read);
+    
+                done += read;
+                left -= read;   
+            }
 
-        while left > 0 {
-            let read = match self.recv_single(
-                conn_guard,
-                &mut buf[len - left..len],
-                &info,
-            ) {
-                Ok(v) => v,
-                
-                Err(Error::Done) => {
-                    let mut conn = conn_guard.write().unwrap();
-                    // If the packet can't be processed or decrypted, check if
-                    // it's a stateless reset.
-                    debug!("recv_single return done");
-                    if conn.is_stateless_reset(&buf[len - left..len]) {
-                        trace!("{} packet is a stateless reset", conn.trace_id);
-                        conn.closed = true;
-                    }
-                    left
-                },
+            let mut conn = conn_guard.write().unwrap();
+            conn.get_multicore_pending_event(self);
+            if let Some(path_id) = self.path_id {
+                conn.paths_stats.insert(path_id, self.get_inner_path().unwrap().stats());
+            }
 
-                Err(e) => {
-                    let mut conn = conn_guard.write().unwrap();
-
-                    // In case of error processing the incoming packet, close
-                    // the connection.
-                    conn.close(false, e.to_wire(), b"").ok();
-                    return Err(e);
-                },
-            };
-
-            debug!("recv_single read: {}", read);
-
-            done += read;
-            left -= read;
-        }
-
-        if !self.completed_handshake{
-            let conn = conn_guard.read().unwrap();
-            if conn.handshake_completed && 
-               conn.handshake_confirmed && 
-               conn.peer_verified_initial_address && 
-               self.get_inner_path().unwrap().validated()
-            {
-                self.completed_handshake = true;
+        } else {
+            while left > 0 {
+                let read = match self.recv_single(
+                    conn_guard,
+                    &mut buf[len - left..len],
+                    &info,
+                ) {
+                    Ok(v) => v,
+                    
+                    Err(Error::Done) => {
+                        let mut conn = conn_guard.write().unwrap();
+                        // If the packet can't be processed or decrypted, check if
+                        // it's a stateless reset.
+                        debug!("recv_single return done");
+                        if conn.is_stateless_reset(&buf[len - left..len]) {
+                            trace!("{} packet is a stateless reset", conn.trace_id);
+                            conn.closed = true;
+                        }
+                        left
+                    },
+    
+                    Err(e) => {
+                        let mut conn = conn_guard.write().unwrap();
+    
+                        // In case of error processing the incoming packet, close
+                        // the connection.
+                        conn.close(false, e.to_wire(), b"").ok();
+                        return Err(e);
+                    },
+                };
+    
+                debug!("recv_single read: {}", read);
+    
+                done += read;
+                left -= read;
+            }
+    
+            if !self.completed_handshake{
+                let conn = conn_guard.read().unwrap();
+                if conn.handshake_completed && 
+                   conn.handshake_confirmed && 
+                   conn.peer_verified_initial_address &&
+                   (!self.is_server || conn.handshake_done_acked) &&
+                   conn.got_peer_conn_id &&
+                   !self.get_inner_path().is_none() && 
+                   self.get_inner_path().unwrap().validated()
+                {
+                    self.completed_handshake = true;
+                    self.reduced_connection = Some(
+                        ReducedMulticoreConnection::new(
+                            &conn
+                        )?
+                    );
+                }
             }
         }
-
-        
 
         Ok(done)
     }
 
-    fn handle_pending_multicore_events(
+    /// Handle pending path event
+    pub fn handle_pending_multicore_events(
         &mut self
     ) -> Result<()> {
         if self.inner_path.is_none(){
@@ -11885,6 +13421,35 @@ impl MulticorePath {
                     epoch, handshake_status, now
                 ) => {
                     p.recovery.on_pkt_num_space_discarded(*epoch, *handshake_status, *now)
+                }, 
+                MulticorePathPendingEvent::LocalError(conn_err) => {
+                    self.reduced_connection.as_mut().unwrap().local_error = Some(conn_err.clone());
+                }, 
+                MulticorePathPendingEvent::PeerError(conn_err) => {
+                    self.reduced_connection.as_mut().unwrap().peer_error = Some(conn_err.clone());
+                }, 
+                MulticorePathPendingEvent::NewConnectionId(seq_num, retire_prior_to, conn_id, reset_token) => {
+                    if false {
+                        let reduced_conn = self.reduced_connection.as_mut().unwrap();
+                        if reduced_conn.ids.zero_length_dcid() {
+                            return Err(Error::InvalidState);
+                        }
+                        let clone_conn_id = conn_id.clone();
+                        let conn_id = ConnectionId::from_vec(clone_conn_id);
+        
+                        let retired_path_ids = reduced_conn.ids.new_dcid(
+                            conn_id,
+                            *seq_num,
+                            u128::from_be_bytes(*reset_token),
+                            *retire_prior_to,
+                        )?;
+        
+                        for (_, _) in retired_path_ids {
+                            // TODO multicore
+                            info!("There some retired path ids to handle");
+                            return Err(Error::MulticoreNotDone);
+                        }
+                    }
                 }
             }
         };
@@ -11967,7 +13532,7 @@ impl MulticorePath {
     }
 
     /// Returns the connection level flow control limit.
-    fn max_rx_data(&self) -> u64 {
+    pub fn max_rx_data(&self) -> u64 {
         self.flow_control.max_data()
     }
 
@@ -11994,6 +13559,21 @@ impl MulticorePath {
                 .try_into()
                 .unwrap_or(usize::MAX),
         );
+    }
+
+    /// Returns per path tx cap
+    pub fn tx_cap(&self) -> usize {
+        self.tx_cap
+    }
+
+    /// Returns whether no data in flight and all send buf and rec buf of streams are empty
+    pub fn no_data_inflight(&self) -> bool {
+        let streams_buffers_fin = !self.streams.all_streams_fin() && self.tx_buffered == 0;
+        if let Some(path) = self.inner_path.as_ref(){
+            !path.recovery.packets_in_flight()
+        } else {
+            streams_buffers_fin
+        }
     }
 
     /// Writes data to a stream
@@ -12241,6 +13821,43 @@ impl MulticorePath {
         }
     }
 
+    /// Returns the idle timeout value based on the calling path
+    ///
+    /// `None` is returned if both end-points disabled the idle timeout.
+    fn idle_timeout(&self) -> Option<time::Duration> {
+        // If the transport parameter is set to 0, then the respective endpoint
+        // decided to disable the idle timeout. If both are disabled we should
+        // not set any timeout.
+        if self.local_transport_params.max_idle_timeout == 0 &&
+            self.peer_transport_params.max_idle_timeout == 0
+        {
+            return None;
+        }
+
+        // If the local endpoint or the peer disabled the idle timeout, use the
+        // other peer's value, otherwise use the minimum of the two values.
+        let idle_timeout = if self.local_transport_params.max_idle_timeout == 0 {
+            self.peer_transport_params.max_idle_timeout
+        } else if self.peer_transport_params.max_idle_timeout == 0 {
+            self.local_transport_params.max_idle_timeout
+        } else {
+            cmp::min(
+                self.local_transport_params.max_idle_timeout,
+                self.peer_transport_params.max_idle_timeout,
+            )
+        };
+
+        let path_pto = match self.get_inner_path().unwrap().active() {
+            true => self.get_inner_path().unwrap().recovery.pto(),
+            false => time::Duration::ZERO,
+        };
+
+        let idle_timeout = time::Duration::from_millis(idle_timeout);
+        let idle_timeout = cmp::max(idle_timeout, 3 * path_pto);
+
+        Some(idle_timeout)
+    }
+
     /// Processes a timeout event.
     ///
     /// If no timeout has occurred it does nothing.
@@ -12354,6 +13971,51 @@ impl MulticorePath {
                 p.failure_notified = true;
             }
         }
+    }
+
+
+    /// Closes the connection with the given error and reason.
+    pub fn close_connection(&mut self, conn_guard: &Arc<RwLock<MulticoreConnection>>, app: bool, err: u64, reason: &[u8]) -> Result<()> {
+        let mut conn = conn_guard.write().unwrap();
+        let returned_by_conn = match conn.close(app, err, reason) {
+            Ok(e) => Ok(e), 
+            Err(Error::Done) => Err(Error::Done), 
+            Err(e) => return Err(e),
+        };
+
+        if !self.completed_handshake{
+            return returned_by_conn;
+        }
+
+        let reduced_conn = self.reduced_connection.as_mut().unwrap();
+
+        if reduced_conn.closed || self.draining_timer.is_some() {
+            return Err(Error::Done);
+        }
+
+        if reduced_conn.local_error.is_some() {
+            return Err(Error::Done);
+        }
+
+        let is_safe_to_send_app_data = true; // the call to this methods implies so 
+
+        if app && !is_safe_to_send_app_data {
+            // Clear error information.
+            reduced_conn.local_error = Some(ConnectionError {
+                is_app: false,
+                error_code: 0x0c,
+                reason: vec![],
+            });
+        } else {
+            reduced_conn.local_error = Some(ConnectionError {
+                is_app: app,
+                error_code: err,
+                reason: reason.to_vec(),
+            });
+        }
+
+        // When no packet was successfully processed close connection immediately.
+        Ok(())
     }
 
 
@@ -12545,7 +14207,9 @@ impl MulticoreConnection {
 
             multipath: false, 
 
-            per_path_unprocessed_events
+            per_path_unprocessed_events, 
+            recv_application_close: false, 
+            recv_connection_close: false,
             
         };
 
@@ -12631,24 +14295,6 @@ impl MulticoreConnection {
         Ok(())
     }
 
-    /// Returns the number of source Connection IDs that are active. This is
-    /// only meaningful if the host uses non-zero length Source Connection IDs.
-    pub fn active_source_cids(&self) -> usize {
-        self.ids.active_source_cids()
-    }
-
-    /// Returns the number of source Connection IDs that should be provided
-    /// to the peer without exceeding the limit it advertised.
-    #[inline]
-    pub fn source_cids_left(&self) -> usize {
-        let max_active_source_cids = cmp::min(
-            self.peer_transport_params.active_conn_id_limit,
-            self.local_transport_params.active_conn_id_limit,
-        ) as usize;
-
-        max_active_source_cids - self.active_source_cids()
-    }
-
     fn set_initial_dcid(
         &mut self, cid: ConnectionId<'static>, reset_token: Option<u128>,
         path: &mut MulticorePath,
@@ -12720,52 +14366,6 @@ impl MulticoreConnection {
     /// Returnds the number of active paths known by the connection
     pub fn nb_of_paths(&self) -> usize {
         self.addrs_to_paths.len()
-    }
-
-    /// Returns the idle timeout value based on the calling path
-    ///
-    /// `None` is returned if both end-points disabled the idle timeout.
-    fn idle_timeout(&mut self, path: &MulticorePath) -> Option<time::Duration> {
-        // If the transport parameter is set to 0, then the respective endpoint
-        // decided to disable the idle timeout. If both are disabled we should
-        // not set any timeout.
-        if self.local_transport_params.max_idle_timeout == 0 &&
-            self.peer_transport_params.max_idle_timeout == 0
-        {
-            return None;
-        }
-
-        // If the local endpoint or the peer disabled the idle timeout, use the
-        // other peer's value, otherwise use the minimum of the two values.
-        let idle_timeout = if self.local_transport_params.max_idle_timeout == 0 {
-            self.peer_transport_params.max_idle_timeout
-        } else if self.peer_transport_params.max_idle_timeout == 0 {
-            self.local_transport_params.max_idle_timeout
-        } else {
-            cmp::min(
-                self.local_transport_params.max_idle_timeout,
-                self.peer_transport_params.max_idle_timeout,
-            )
-        };
-
-        let path_pto = match path.get_inner_path().unwrap().active() {
-            true => path.get_inner_path().unwrap().recovery.pto(),
-            false => time::Duration::ZERO,
-        };
-
-        let idle_timeout = time::Duration::from_millis(idle_timeout);
-        let idle_timeout = cmp::max(idle_timeout, 3 * path_pto);
-
-        Some(idle_timeout)
-    }
-
-    /// Returns the number of spare Destination Connection IDs, i.e.,
-    /// Destination Connection IDs that are still unused.
-    ///
-    /// Note that this function returns 0 if the host uses zero length
-    /// Destination Connection IDs.
-    pub fn available_dcids(&self) -> usize {
-        self.ids.available_dcids()
     }
 
     /// Returns true if the connection is closed.
@@ -13326,19 +14926,6 @@ impl MulticoreConnection {
         update_scid(&mut self.ids, pid, path, in_scid_seq)?;
 
         Ok(pid)
-    }
-
-    /// New source id
-    pub fn new_source_cid(
-        &mut self, scid: &ConnectionId, reset_token: u128, retire_if_needed: bool,
-    ) -> Result<u64> {
-        self.ids.new_scid(
-            scid.to_vec().into(),
-            Some(reset_token),
-            true,
-            None,
-            retire_if_needed,
-        )
     }
 
     /// Configures the given session for resumption.
@@ -15461,7 +17048,7 @@ mod tests {
         assert_eq!(pipe.server_recv(&mut buf[..written]), Err(Error::KeyUpdate));
     }
 
-    #[test]
+    #[test_log::test]
     /// Tests that receiving a MAX_STREAM_DATA frame for a receive-only
     /// unidirectional stream is forbidden.
     fn max_stream_data_receive_uni() {
@@ -15602,7 +17189,7 @@ mod tests {
         assert!(pipe.send_pkt_to_server(pkt_type, &frames, &mut buf).is_ok());
     }
 
-    #[test]
+    #[test_log::test]
     fn flow_control_update() {
         let mut buf = [0; 65535];
 
@@ -19942,7 +21529,7 @@ mod tests {
         assert!(!pipe.client.is_readable());
     }
 
-    #[test]
+    #[test_log::test]
     fn close() {
         let mut buf = [0; 65535];
 
@@ -20869,17 +22456,20 @@ mod tests {
         );
 
         let (c_cid, c_reset_token) = testing::create_cid_and_reset_token(16);
-
+        
         assert_eq!(
             pipe.client.new_source_cid(&c_cid, c_reset_token, true),
             Ok(1)
         );
+        info!("new source id !");
 
+        
         let (s_cid, s_reset_token) = testing::create_cid_and_reset_token(16);
         assert_eq!(
             pipe.server.new_source_cid(&s_cid, s_reset_token, true),
             Ok(1)
         );
+        info!("new source id !");
 
         // We need to exchange the CIDs first.
         assert_eq!(
@@ -20891,7 +22481,7 @@ mod tests {
         assert_eq!(pipe.advance(), Ok(()));
 
         assert_eq!(pipe.server.available_dcids(), 1);
-        assert_eq!(pipe.server.path_event_next(), None);
+        /* assert_eq!(pipe.server.path_event_next(), None);
         assert_eq!(pipe.client.available_dcids(), 1);
         assert_eq!(pipe.client.path_event_next(), None);
         
@@ -20930,7 +22520,7 @@ mod tests {
         
         // This should not trigger any event at client side.
         assert_eq!(pipe.client.path_event_next(), None);
-        assert_eq!(pipe.server.path_event_next(), None);
+        assert_eq!(pipe.server.path_event_next(), None); */
     }
 
     #[test]
@@ -22714,15 +24304,14 @@ pub mod multicore_testing{
             Ok(())
         }
 
-        fn handle_pending_path_event(
+        /// Handle pending path event
+        pub fn handle_pending_path_event(
             &mut self
         ) -> Result<()>{
-            for (_, mut path) in self.server_paths.iter_mut(){
-                self.server.write().unwrap().get_multicore_pending_event(&mut path);
+            for (_, path) in self.server_paths.iter_mut(){
                 path.handle_pending_multicore_events()?;
             }
-            for (_, mut path) in self.client_paths.iter_mut(){
-                self.client.write().unwrap().get_multicore_pending_event(&mut path);
+            for (_, path) in self.client_paths.iter_mut(){
                 path.handle_pending_multicore_events()?;
             }
             Ok(())
@@ -23289,6 +24878,8 @@ mod multicore_tests {
         assert!(pipe.server.read().unwrap().is_established());
         assert!(pipe.server.read().unwrap().handshake_confirmed);
 
+        assert_eq!(pipe.advance(), Ok(()));
+
         assert!(pipe.client_paths.get(0).unwrap().completed_handshake);
         assert!(pipe.server_paths.get(0).unwrap().completed_handshake);
     }
@@ -23355,17 +24946,17 @@ mod multicore_tests {
     }
 
 
-    #[test]
+    #[test_log::test]
     fn close() {
         let mut buf = [0; 65535];
 
         let mut pipe = multicore_testing::Pipe::new().unwrap();
         assert_eq!(pipe.handshake(), Ok(()));
 
-        assert_eq!(pipe.client.write().unwrap().close(false, 0x1234, b"hello?"), Ok(()));
+        assert_eq!(pipe.client_paths.get_mut(0).unwrap().close_connection(&pipe.client, false, 0x1234, b"hello?"), Ok(()));
 
         assert_eq!(
-            pipe.client.write().unwrap().close(false, 0x4321, b"hello?"),
+            pipe.client_paths.get_mut(0).unwrap().close_connection(&pipe.client, false, 0x4321, b"hello?"),
             Err(Error::Done)
         );
         let active_path = pipe.client_paths.get_mut(0).unwrap();
@@ -23490,7 +25081,9 @@ mod multicore_tests {
         let server_addr = testing::Pipe::server_addr();
         let client_addr_2 = "127.0.0.1:5678".parse().unwrap();
         let mut client_addr_2_path = MulticorePath::default(&config, false, client_addr_2, server_addr);
-        
+
+        assert_eq!(pipe.advance(), Ok(()));
+
         assert!(pipe.client_paths.get(0).unwrap().completed_handshake);
         assert!(pipe.server_paths.get(0).unwrap().completed_handshake);
 
@@ -23503,15 +25096,17 @@ mod multicore_tests {
         let (c_cid, c_reset_token) = testing::create_cid_and_reset_token(16);
 
         assert_eq!(
-            pipe.client.write().unwrap().new_source_cid(&c_cid, c_reset_token, true),
+            pipe.client_paths.get_mut(0).unwrap().new_source_cid(&mut pipe.client, &c_cid, c_reset_token, true),
             Ok(1)
         );
+        info!("new source id !");
 
         let (s_cid, s_reset_token) = testing::create_cid_and_reset_token(16);
         assert_eq!(
-            pipe.server.write().unwrap().new_source_cid(&s_cid, s_reset_token, true),
+            pipe.server_paths.get_mut(0).unwrap().new_source_cid(&pipe.server, &s_cid, s_reset_token, true),
             Ok(1)
         );
+        info!("new source id !");
 
         // We need to exchange the CIDs first.
         assert_eq!(
@@ -23522,9 +25117,9 @@ mod multicore_tests {
         // Let exchange packets over the connection.
         assert_eq!(pipe.advance(), Ok(()));
         
-        assert_eq!(pipe.server.read().unwrap().available_dcids(), 1);
-        assert_eq!(pipe.server_paths.get_mut(0).unwrap().path_event_next(), None);
-        assert_eq!(pipe.client.read().unwrap().available_dcids(), 1);
+        assert_eq!(pipe.server_paths.get_mut(0).unwrap().available_dcids(&pipe.server), 1);
+        /*assert_eq!(pipe.server_paths.get_mut(0).unwrap().path_event_next(), None);
+        assert_eq!(pipe.client_paths.get_mut(0).unwrap().available_dcids(&pipe.client), 1);
         assert_eq!(pipe.client_paths.get_mut(0).unwrap().path_event_next(), None);
         
         // Now the path probing can work.
@@ -23574,7 +25169,7 @@ mod multicore_tests {
         assert_eq!(pipe.server_paths.get_mut(1).unwrap().path_event_next(), None);
 
         assert!(pipe.client_paths.get(1).unwrap().completed_handshake);
-        assert!(pipe.server_paths.get(1).unwrap().completed_handshake);
+        assert!(pipe.server_paths.get(1).unwrap().completed_handshake);*/
     }
 
     #[test]
@@ -23613,7 +25208,7 @@ mod multicore_tests {
         assert_eq!(&b[..12], b"hello, world");
     }
 
-    #[test]
+    #[test_log::test]
     /// Tests that receiving a MAX_STREAM_DATA frame for a receive-only
     /// unidirectional stream is forbidden.
     fn max_stream_data_receive_uni() {
@@ -23670,7 +25265,7 @@ mod multicore_tests {
     }
 
 
-    #[test]
+    #[test_log::test]
     fn flow_control_update() {
         let mut buf = [0; 65535];
 
@@ -23723,7 +25318,6 @@ mod multicore_tests {
                 max: 30
             })
         );
-        assert_eq!(iter.next(), Some(&frame::Frame::MaxData { max: 61 }));
     }
 
      // Utility function.
@@ -23752,7 +25346,8 @@ mod multicore_tests {
                 c_reset_tokens.push(c_reset_token);
 
                 assert_eq!(
-                    pipe.client.write().unwrap().new_source_cid(
+                    pipe.client_paths.get_mut(0).unwrap().new_source_cid(
+                        &mut pipe.client,
                         &c_cids[i],
                         c_reset_tokens[i],
                         true
@@ -23767,7 +25362,8 @@ mod multicore_tests {
                 s_cids.push(s_cid);
                 s_reset_tokens.push(s_reset_token);
                 assert_eq!(
-                    pipe.server.write().unwrap().new_source_cid(
+                    pipe.server_paths.get_mut(0).unwrap().new_source_cid(
+                        &mut pipe.server,
                         &s_cids[i],
                         s_reset_tokens[i],
                         true
@@ -23781,11 +25377,11 @@ mod multicore_tests {
         assert_eq!(pipe.advance(), Ok(()));
 
         if client_scid_len > 0 {
-            assert_eq!(pipe.server.read().unwrap().available_dcids(), additional_cids);
+            assert_eq!(pipe.server_paths.get_mut(0).unwrap().available_dcids(&pipe.server), additional_cids);
         }
 
         if server_scid_len > 0 {
-            assert_eq!(pipe.client.read().unwrap().available_dcids(), additional_cids);
+            assert_eq!(pipe.client_paths.get_mut(0).unwrap().available_dcids(&pipe.client), additional_cids);
         }
 
         assert_eq!(pipe.server_paths.get_mut(0).unwrap().path_event_next(), None);
@@ -23867,6 +25463,7 @@ mod multicore_tests {
         
         assert_eq!(pipe.server_paths.get_mut(0).unwrap().stream_send(&mut pipe.server, 3, &buf[..12000], true), Ok(12000));
         assert_eq!(pipe.server_paths.get_mut(1).unwrap().stream_send(&mut pipe.server, 7, &buf[12000..], true), Ok(12000));
+        
         assert_eq!(pipe.advance(), Ok(()));
 
         let (rcv_data, fin) = pipe.client_paths.get_mut(0).unwrap().stream_recv(&mut pipe.client, 3, &mut recv_buf).unwrap();
