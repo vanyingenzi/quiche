@@ -124,7 +124,6 @@ fn server_thread(
 
             trace!("[Path Thread] processed {} bytes", read);
 
-
             if rx_finish_channel.is_some() && !scid_sent {
                 // TODO multicore retired scid
 
@@ -338,7 +337,7 @@ fn server_thread(
             if continue_write {
                 trace!("pause writing");
             } else if total_write >= max_send_burst {
-                trace!("pause writing",);
+                trace!("pause writing");
                 continue_write = true;
             }
         }
@@ -458,7 +457,7 @@ pub fn multicore_start_server(args: ServerArgs, conn_args: CommonArgs) {
             wait_for_new_connection(&mut config, &args, &mut keylog, local_addr);
 
         let client = MulticoreClient {
-            conn: Arc::new(RwLock::new(conn)),
+            conn,
             next_stream_id: Arc::new(RwLock::new(3)),
         };
         let client = Arc::new(client);
@@ -513,7 +512,7 @@ pub fn multicore_start_server(args: ServerArgs, conn_args: CommonArgs) {
 fn wait_for_new_connection(
     config: &mut Config, args: &ServerArgs, keylog: &mut Option<File>,
     local_addr: std::net::SocketAddr,
-) -> (MulticoreConnection, MulticorePath) {
+) -> (Arc<RwLock<MulticoreConnection>>, MulticorePath) {
     let rng = SystemRandom::new();
 
     let mut buf = [0; MAX_BUF_SIZE];
@@ -680,8 +679,7 @@ fn wait_for_new_connection(
 
             debug!("New connection: dcid={:?} scid={:?}", hdr.dcid, scid);
 
-            #[allow(unused_mut)]
-            let (mut conn, init_path) = quiche::multicore_accept(
+            let (mut conn, mut init_path) = quiche::multicore_accept(
                 &scid,
                 odcid.as_ref(),
                 local_addr,
@@ -696,8 +694,24 @@ fn wait_for_new_connection(
                 }
             }
 
-            // TODO multicore qlog
-            return (conn, init_path);
+            let conn_guard = Arc::new(RwLock::new(conn));
+
+            let recv_info = quiche::RecvInfo {
+                to: local_addr,
+                from,
+            };
+
+            let read = match init_path.recv(&conn_guard, pkt_buf, recv_info) {
+                Ok(v) => v,
+
+                Err(e) => {
+                    error!("[Path Thread] recv failed: {:?}", e);
+                    continue 'read;
+                },
+            };
+
+            trace!("[Listener] processed {} bytes", read);
+            return (conn_guard, init_path);
         }
     }
 }

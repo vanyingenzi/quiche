@@ -2,7 +2,7 @@
 
 RUST_PLATFORM="x86_64-unknown-linux-gnu"
 FILE_SIZE=2
-NB_RUNS=10
+NB_RUNS=5
 
 RED='\033[0;31m'
 RESET='\033[0m'
@@ -78,7 +78,7 @@ mcmpquic_iteration_loop() {
         fi
         runtime=$(echo "$end - $start" | bc)
         total_runtime=$(echo "$total_runtime + $runtime" | bc)
-        kill  ${server_pid} 1>/dev/null 2>&1
+        kill ${server_pid} 1>/dev/null 2>&1
     done
     average_runtime=$(echo "scale=9; $total_runtime / $NB_RUNS" | bc)
     MCPQUIC_AVERAGE_EXEC_TIME=$average_runtime
