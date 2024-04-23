@@ -192,7 +192,6 @@ fn server_thread(
 
         if stream_id.is_some() && create_send_stream && !can_close_conn {
             for stream_id in path.writable() {
-                info!("stream id {} writable", stream_id);
                 let fin = path.tx_cap() >= to_send - sent;
                 let written = match path.stream_send(
                     &client.conn,

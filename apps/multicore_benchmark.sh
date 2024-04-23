@@ -2,7 +2,7 @@
 
 RUST_PLATFORM="x86_64-unknown-linux-gnu"
 FILE_SIZE=2
-NB_RUNS=5
+NB_RUNS=10
 
 RED='\033[0;31m'
 RESET='\033[0m'
@@ -90,7 +90,7 @@ mpquic_iteration_loop() {
     local server_pid server_port client_port_1 client_port_2 error_code
     local total_runtime=0
     for iter in $(seq 1 ${NB_RUNS}); do
-        echo "Benchmarking Multi-Path QUIC [MPQUIC]- Iteration $iter" >&2
+        echo "Benchmarking Multi-Path QUIC [MPQUIC] - Iteration $iter" >&2
         client_port_1=6788
         client_port_2=6789
 

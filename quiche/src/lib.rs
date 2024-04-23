@@ -10104,33 +10104,6 @@ impl MulticorePath {
         Ok((pkt_type, written))
     }
 
-    fn process_undecrypted_0rtt_packets(&mut self, conn: &mut MulticoreConnection) -> Result<()> {
-        // Process previously undecryptable 0-RTT packets if the decryption key
-        // is now available
-
-        if conn
-            .pkt_num_spaces
-            .crypto
-            .get(packet::Epoch::Application)
-            .crypto_0rtt_open
-            .is_some()
-        {
-            if conn.undecryptable_pkts.len() > 1 {
-                info!("Undecrypted packets len is not zero");
-                return Err(Error::MulticoreNotDone); // TODO multicore
-                /*while let Some((mut pkt, info)) = conn.undecryptable_pkts.pop_front()
-                {
-                    if let Err(e) = self.recv(&mut pkt, info) {
-                        conn.undecryptable_pkts.clear();
-    
-                        return Err(e);
-                    }
-                }*/
-            }
-        }
-        Ok(())
-    }
-
     /// Used after handshake and complete path validation on path
     fn reduced_write_pkt_type(
         &mut self, conn_guard: &Arc<RwLock<MulticoreConnection>>
@@ -11260,43 +11233,52 @@ impl MulticorePath {
         Ok((pkt_type, written))
     }
 
+    fn reduced_max_send_udp_payload_size(&self) -> usize {
+        if self.get_inner_path().unwrap().active(){
+            let max_datagram_size = self.get_inner_path().unwrap().recovery.max_datagram_size();
+            
+            // We cap the maximum packet size to 16KB or so, so that it can be
+            // always encoded with a 2-byte varint.
+            return cmp::min(16383, max_datagram_size);
+            
+        }
+
+        // Allow for 1200 bytes (minimum QUIC packet size) during the
+        // handshake.
+        MIN_CLIENT_INITIAL_LEN
+    }
+
     /// Sends connection data on this path
     pub fn send_on_path(
         &mut self, 
         conn_guard: &Arc<RwLock<MulticoreConnection>>, 
         out: &mut [u8]
     ) -> Result<(usize, SendInfo)> {
-        let now = None;
         let mut left;
-        {
-            let mut conn = conn_guard.write().unwrap();
+        
+        if out.is_empty() {
+            return Err(Error::BufferTooShort);
+        }
 
-            if out.is_empty() {
-                return Err(Error::BufferTooShort);
+        let now = time::Instant::now();
+
+        if self.completed_multipath_handshake {
+            let reduced_conn = self.reduced_connection.as_ref().unwrap();
+            if reduced_conn.closed || self.draining_timer.is_some(){
+                return Err(Error::Done);
             }
-            
-            let now = Some(time::Instant::now());
-
+            left = cmp::min(out.len(), self.reduced_max_send_udp_payload_size());
+        } else {
+            let mut conn = conn_guard.write().unwrap();
             if conn.is_closed() || conn.is_draining() {
                 return Err(Error::Done);
             }
 
-            if !self.completed_multipath_handshake {
-                if conn.local_error.is_none() && !self.path_id.is_none() {
-                    if conn.is_lowest_active_path_id(self) {
-                        conn.do_handshake(now.unwrap(), self)?;
-                    }
+            if conn.local_error.is_none() && !self.path_id.is_none() {
+                if conn.is_lowest_active_path_id(self) {
+                    conn.do_handshake(now, self)?;
                 }
             }
-        
-            // applications, as they may not expect getting a `recv()`
-            // error when calling `send()`.
-            //
-            // We simply fall-through to sending packets, which should
-            // take care of terminating the connection as needed.
-            //
-            let _ = self.process_undecrypted_0rtt_packets(&mut conn);
-
             // There's no point in trying to send a packet if the Initial secrets
             // have not been derived yet, so return early.
             if !conn.derived_initial_secrets {
@@ -11304,16 +11286,10 @@ impl MulticorePath {
             }
             left = cmp::min(out.len(), self.max_send_udp_payload_size(&conn));
         }
-
         
         let mut has_initial = false;
         let mut done = 0;
         
-        let now = match now {
-            Some(v) => v, 
-            None => time::Instant::now()
-        };
-
         if !self.get_inner_path_mut().unwrap().verified_peer_address && self.is_server {
             left = cmp::min(left, self.get_inner_path_mut().unwrap().max_send_bytes);
         }
@@ -13855,6 +13831,7 @@ impl MulticorePath {
 
         let mut done = 0;
         let mut left = len;
+        
         if self.completed_multipath_handshake {
             while left > 0 {
                 let read = match self.reduced_recv_single(
@@ -13872,6 +13849,7 @@ impl MulticorePath {
                         if conn.is_stateless_reset(&buf[len - left..len]) {
                             trace!("{} packet is a stateless reset", conn.trace_id);
                             conn.closed = true;
+                            self.reduced_connection.as_mut().unwrap().closed = true;
                         }
                         left
                     },
@@ -14241,9 +14219,6 @@ impl MulticorePath {
         self.tx_buffered += sent;
 
         // TODO add qlog
-        info!("stream id {} writable {} incremental {}", stream_id, writable, incremental);
-        info!("stream id {} writable {} incremental {}", stream_id, writable, incremental);
-
         if sent == 0 && !buf.is_empty() {
             return Err(Error::Done);
         }
@@ -14427,6 +14402,9 @@ impl MulticorePath {
                 trace!("{} draining timeout expired", conn.trace_id);
 
                 conn.closed = true;
+                if self.completed_multipath_handshake{
+                    self.reduced_connection.as_mut().unwrap().closed = true;
+                }
             }
 
             // Draining timer takes precedence over all other timers. If it is
@@ -14440,6 +14418,7 @@ impl MulticorePath {
                 trace!("{} idle timeout expired", conn.trace_id);
 
                 conn.closed = true;
+                self.reduced_connection.as_mut().unwrap().closed = true;
                 conn.timed_out = true;
                 return;
             }
