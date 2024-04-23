@@ -14039,6 +14039,29 @@ impl MulticorePath {
         self.events.pop_front()
     }
 
+    fn reduced_get_or_create_stream(
+        &mut self, 
+        conn_guard: &Arc<RwLock<MulticoreConnection>>,
+        id: u64, local: bool,
+    ) -> Result<&mut stream::Stream> {
+        let has_stream = !self.streams.get(id).is_none();
+        match has_stream {
+            true => Ok(self.streams.get_mut(id).unwrap()), 
+            false => {
+                let mut conn = conn_guard.write().unwrap();
+                conn.stream_ids.create_stream(
+                    &mut self.streams,
+                    id,
+                    &self.local_transport_params,
+                    &self.peer_transport_params,
+                    local,
+                    self.is_server,
+                )?;
+                Ok(self.streams.get_mut(id).unwrap())
+            }
+        }
+    }
+
     /// Returns the mutable stream with the given ID if it exists, or creates
     /// a new one otherwise.
     fn get_or_create_stream(
@@ -14129,8 +14152,7 @@ impl MulticorePath {
 
         let cap = self.tx_cap;
         // Get existing stream or create a new one.
-        let mut conn = conn_guard.write().unwrap();
-        let stream = self.get_or_create_stream(&mut conn, stream_id, true)?;
+        let stream = self.reduced_get_or_create_stream(&conn_guard, stream_id, true)?;
 
         let was_writable = stream.is_writable();
 
