@@ -145,7 +145,7 @@ pub fn handle_done_paths(
     if let Some(rx) = rx_finish_channel {
         match rx.try_recv() {
             Ok(v) => {
-                debug!("received message {:?}", v);
+                info!("received message {:?}", v);
                 *nb_active_paths -= 1;
             },
             Err(TryRecvError::Empty) => {},

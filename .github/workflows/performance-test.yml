@@ -1,0 +1,25 @@
+name: Benchmark Test
+
+on: [push]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+        with:
+          submodules: recursive
+
+      - uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+
+      - uses: actions-rs/cargo@v1
+        with:
+          command: build
+          args: --release
+    
+      - name: Run benchmark script
+        run: |
+          cd apps
+          bash multicore_benchmark.sh

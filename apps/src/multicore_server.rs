@@ -124,76 +124,6 @@ fn server_thread(
 
             trace!("[Path Thread] processed {} bytes", read);
 
-            if !create_send_stream {
-                if is_in_early_data || is_established {
-                    let app_proto;
-                    {
-                        let conn = client.conn.read().unwrap();
-                        app_proto = conn.application_proto().to_vec();
-                    }
-
-                    #[allow(clippy::box_default)]
-                    if alpns::MMPQUIC.contains(&app_proto.as_slice()) {
-                        create_send_stream = true;
-                        {
-                            let mut next_stream_id =
-                                client.next_stream_id.write().unwrap();
-                            stream_id = Some(next_stream_id.clone());
-                            *next_stream_id += 4; // We are using server unidirectional streams
-                                                  // Create the stream
-                        }
-                        path.stream_send(
-                            &client.conn,
-                            stream_id.unwrap(),
-                            &[0u8; 0],
-                            false,
-                        )
-                        .unwrap();
-                    } else {
-                        let mut conn = client.conn.write().unwrap();
-                        error!("APLN not mMPQUIC");
-                        conn.close(true, 0, b"APLN not mMPQUIC".as_slice())
-                            .unwrap();
-                    }
-                } else {
-                    let conn = client.conn.read().unwrap();
-                    is_in_early_data = conn.is_in_early_data();
-                    is_established = conn.is_established();
-                }
-            }
-
-            if stream_id.is_some() && create_send_stream && !can_close_conn {
-                for stream_id in path.writable() {
-                    let fin = path.tx_cap() >= to_send - sent;
-                    let written = match path.stream_send(
-                        &client.conn,
-                        stream_id,
-                        &body[sent..],
-                        fin,
-                    ) {
-                        Ok(v) => v,
-                        Err(quiche::Error::Done) => 0,
-                        Err(e) => {
-                            error!(
-                                "An error occured on stream id {:?}: {:?}",
-                                stream_id, e
-                            );
-                            0
-                        },
-                    };
-                    let fin = written == to_send - sent;
-                    trace!("Written {} to stream id {}", written, stream_id);
-                    sent += written;
-
-                    if fin {
-                        info!(
-                            "path {:?} <-> {:?} done sending",
-                            local_addr, peer_addr
-                        );
-                        can_close_conn = true;
-                    }
-                }
-            }
 
             if rx_finish_channel.is_some() && !scid_sent {
                 // TODO multicore retired scid
@@ -201,10 +131,98 @@ fn server_thread(
                 // Provides as many CIDs as possible.
                 while path.source_cids_left(&client.conn) > 0 {
                     let (scid, reset_token) = generate_cid_and_reset_token(&rng);
-                    if path.new_source_cid(&client.conn, &scid, reset_token, false).is_err() {
+                    if path
+                        .new_source_cid(&client.conn, &scid, reset_token, false)
+                        .is_err()
+                    {
                         break;
                     }
                     scid_sent = true;
+                }
+            }
+        }
+
+        if !create_send_stream {
+            if (is_in_early_data || is_established) && path.is_active() {
+                let app_proto;
+                {
+                    let conn = client.conn.read().unwrap();
+                    app_proto = conn.application_proto().to_vec();
+                }
+
+                #[allow(clippy::box_default)]
+                if alpns::MMPQUIC.contains(&app_proto.as_slice()) {
+                    create_send_stream = true;
+                    {
+                        let mut next_stream_id =
+                            client.next_stream_id.write().unwrap();
+                        stream_id = Some(next_stream_id.clone());
+                        *next_stream_id += 4; // We are using server unidirectional streams
+                                              // Create the stream
+                    }
+                    match path.stream_send(
+                        &client.conn,
+                        stream_id.unwrap(),
+                        &[0u8; 0],
+                        false,
+                    ) {
+                        Ok(..) => {
+                            info!("initiated stream {}", stream_id.unwrap());
+                        },
+                        Err(e) => {
+                            error!("stream id {} stream init send created an error {}", stream_id.unwrap(), e);
+                        },
+                    };
+                } else {
+                    error!("APLN not mMPQUIC");
+                    path.close_connection(
+                        &client.conn,
+                        true,
+                        0,
+                        b"APLN not mMPQUIC".as_slice(),
+                    )
+                    .unwrap();
+                }
+            } else {
+                let conn = client.conn.read().unwrap();
+                is_in_early_data = conn.is_in_early_data();
+                is_established = conn.is_established();
+            }
+        }
+
+        if stream_id.is_some() && create_send_stream && !can_close_conn {
+            for stream_id in path.writable() {
+                info!("stream id {} writable", stream_id);
+                let fin = path.tx_cap() >= to_send - sent;
+                let written = match path.stream_send(
+                    &client.conn,
+                    stream_id,
+                    &body[sent..],
+                    fin,
+                ) {
+                    Ok(v) => v,
+                    Err(quiche::Error::Done) => {
+                        error!("stream id {} returned done", stream_id);
+                        0
+                    },
+                    Err(e) => {
+                        error!(
+                            "An error occured on stream id {:?}: {:?}",
+                            stream_id, e
+                        );
+                        0
+                    },
+                };
+                let fin = written == to_send - sent;
+                trace!("Written {} to stream id {}", written, stream_id);
+                sent += written;
+
+                if fin {
+                    info!(
+                        "path {:?} <-> {:?} done sending",
+                        local_addr, peer_addr
+                    );
+                    can_close_conn = true;
                 }
             }
         }
@@ -285,8 +303,8 @@ fn server_thread(
                         path.peer_addr(),
                         e
                     );
-                    let mut conn = client.conn.write().unwrap();
-                    conn.close(false, 0x1, b"fail").ok();
+                    path.close_connection(&client.conn, false, 0x1, b"fail")
+                        .ok();
                     break;
                 },
             };
@@ -804,7 +822,6 @@ fn handle_path_events(
         match qe {
             quiche::PathEvent::New(local_addr, peer_addr) => {
                 info!("Seen new path ({}, {})", local_addr, peer_addr);
-
                 // Directly probe the new path.
                 path.probe_path(conn_guard)
                     .map_err(|e| error!("cannot probe: {}", e))
@@ -817,6 +834,8 @@ fn handle_path_events(
                     path.set_active(true)
                         .map_err(|e| error!("cannot set path active: {}", e))
                         .ok();
+                } else {
+                    warn!("Can't set path active not multipath");
                 }
             },
 

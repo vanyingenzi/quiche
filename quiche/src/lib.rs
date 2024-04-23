@@ -2798,7 +2798,6 @@ impl Connection {
         };
 
 
-
         // This might be a new space identifier yet unseen before. In such case,
         // it should start with 0.
         let largest_rx_pkt_num = self
@@ -3616,8 +3615,6 @@ impl Connection {
 
             at: send_path.recovery.get_packet_send_time(),
         };
-
-
 
         Ok((done, info))
     }
@@ -8010,6 +8007,7 @@ impl Connection {
             .map(|(_, p)| p.recovery.cwnd_available())
             .filter(|cwnd| *cwnd != std::usize::MAX)
             .sum();
+        // info!("[update_tx_cap] cwin_available: {}, (max_tx_data - tx_data) {}", cwin_available, self.max_tx_data - self.tx_data);
         self.tx_cap = cmp::min(
             cwin_available,
             (self.max_tx_data - self.tx_data)
@@ -8353,8 +8351,6 @@ pub enum MulticorePathPendingEvent {
     PeerError(ConnectionError),
     /// A local error that occured
     LocalError(ConnectionError),
-    /// A change in the connection IDs
-    NewConnectionId(u64, u64, Vec<u8>, [u8; 16]),
 }
 
 /// A structured to be used to get connection information locally
@@ -8404,6 +8400,7 @@ impl ReducedMulticoreConnection {
     fn new(conn: &MulticoreConnection) -> Result<Self> {
         let mut pkt_num_spaces = packet::PktNumSpaceMap::new();
         pkt_num_spaces.spaces = conn.pkt_num_spaces.spaces.clone();
+
         let crypto_space = conn.pkt_num_spaces.crypto.get(packet::Epoch::Application);
         let (aead_open, aead_seal) = {
             (
@@ -8427,7 +8424,7 @@ impl ReducedMulticoreConnection {
             pkt_num_spaces, 
             closed: conn.closed, 
             alpn: conn.alpn.clone(),
-            multipath: conn.multipath, 
+            multipath: conn.multipath,
             ack_eliciting_sent: conn.ack_eliciting_sent, 
             version: conn.version, 
             source_id_len: conn.source_id().len(), 
@@ -8459,7 +8456,7 @@ pub struct MulticorePath {
     //// A resusable buffer used by Recovery
     // newly_acked: Vec<recovery::Acked>,
     // Whether the connection handshake has been complemented
-    completed_handshake: bool,
+    completed_multipath_handshake: bool,
     /// Receiver flow controller.
     flow_control: flowcontrol::FlowControl, // ? Move to each stream as we are doing per stream flow control
     /// Whether we send MAX_DATA frame.
@@ -8520,7 +8517,7 @@ impl MulticorePath {
             is_server, 
             local_addr, 
             peer_addr,
-            completed_handshake: false, 
+            completed_multipath_handshake: false, 
             dgram_recv_queue: dgram::DatagramQueue::new(
                 config.dgram_recv_max_queue_len,
             ),
@@ -8570,7 +8567,7 @@ impl MulticorePath {
             is_server, 
             local_addr, 
             peer_addr,
-            completed_handshake: false, 
+            completed_multipath_handshake: false, 
             dgram_recv_queue: dgram::DatagramQueue::new(
                 config.dgram_recv_max_queue_len,
             ),
@@ -8832,13 +8829,8 @@ impl MulticorePath {
     pub fn available_dcids(
         &self,        
         conn_guard: &Arc<RwLock<MulticoreConnection>>,
-    ) -> usize {
-        if self.completed_handshake {
-            info!("Read from reduced connection");
-            self.reduced_connection.as_ref().unwrap().ids.available_dcids()
-        } else {
-            conn_guard.read().unwrap().ids.available_dcids()
-        }
+    ) -> usize {        
+        conn_guard.read().unwrap().ids.available_dcids()
     }
 
 
@@ -8862,23 +8854,13 @@ impl MulticorePath {
         reset_token: u128, 
         retire_if_needed: bool,
     ) -> Result<u64> {
-        if self.completed_handshake {
-            self.reduced_connection.as_mut().unwrap().ids.new_scid(
-                scid.to_vec().into(),
-                Some(reset_token),
-                true,
-                None,
-                retire_if_needed,
-            )
-        } else {
-            conn_guard.write().unwrap().ids.new_scid(
-                scid.to_vec().into(),
-                Some(reset_token),
-                true,
-                None,
-                retire_if_needed,
-            )
-        }
+        conn_guard.write().unwrap().ids.new_scid(
+            scid.to_vec().into(),
+            Some(reset_token),
+            true,
+            None,
+            retire_if_needed,
+        )
     }
 
     fn send_single(
@@ -8994,7 +8976,9 @@ impl MulticorePath {
                     }
                 },
 
-                frame::Frame::MaxData { .. } => unreachable!(),
+                frame::Frame::MaxData { .. } => {
+                    self.almost_full = true;
+                },
 
                 frame::Frame::NewConnectionId { seq_num, .. } => {
                     conn.ids.mark_advertise_new_scid_seq(seq_num, true);
@@ -9161,7 +9145,7 @@ impl MulticorePath {
         let payload_offset = b.off();
 
         let cwnd_available =
-        self.inner_path.as_mut().unwrap().recovery.cwnd_available().saturating_sub(overhead);
+            self.inner_path.as_mut().unwrap().recovery.cwnd_available().saturating_sub(overhead);
 
         let left_before_packing_ack_frame = left;
 
@@ -9208,7 +9192,6 @@ impl MulticorePath {
         }
 
         // Create ACK_MP frames if needed.
-        // NOTE : multicore for simplicity we don't send ack for other space ids
         if multiple_application_data_pkt_num_spaces &&
             !is_closing &&
             self.inner_path.as_mut().unwrap().active()
@@ -9412,8 +9395,9 @@ impl MulticorePath {
                 }
             }
 
-            // We don't create MAX_DATA stream as flow control is done per path and not per whole connection
-            /*if self.almost_full &&
+
+            // Create MAX_DATA frame as needed. NOTE: This is per path and not per connection
+            if self.almost_full &&
                 flow_control.max_data() < flow_control.max_data_next()
             {
                 // Autotune the connection window size.
@@ -9432,7 +9416,7 @@ impl MulticorePath {
                     ack_eliciting = true;
                     in_flight = true;
                 }
-            }*/
+            }
 
             // Create STOP_SENDING frames as needed.
             for (stream_id, error_code) in self
@@ -10212,8 +10196,8 @@ impl MulticorePath {
                 self.streams.has_blocked() ||
                 self.streams.has_reset() ||
                 self.streams.has_stopped() ||
-                reduced_conn.ids.has_new_scids() ||
-                reduced_conn.ids.has_retire_dcids() ||
+                conn.ids.has_new_scids() ||
+                conn.ids.has_retire_dcids() ||
                 conn.has_path_abandon() ||
                 conn.has_path_status() ||
                 send_path.needs_ack_eliciting ||
@@ -10257,15 +10241,9 @@ impl MulticorePath {
         };
 
         let epoch = pkt_type.to_epoch()?;
-        let multiple_application_data_pkt_num_spaces = self.reduced_connection.as_ref().unwrap().multipath && epoch == packet::Epoch::Application;
+        let multiple_application_data_pkt_num_spaces = 
+            self.reduced_connection.as_ref().unwrap().multipath && epoch == packet::Epoch::Application;
         let p = self.inner_path.as_mut().unwrap();
-        let dcid_seq = p
-            .active_dcid_seq.ok_or(Error::OutOfIdentifiers)?;
-        let space_id = if multiple_application_data_pkt_num_spaces {
-            dcid_seq
-        } else {
-            packet::INITIAL_PACKET_NUMBER_SPACE_ID
-        };
         for lost in p.recovery.lost[epoch].drain(..) {
             match lost {
                 frame::Frame::CryptoHeader { offset, length } => {
@@ -10352,7 +10330,9 @@ impl MulticorePath {
                     }
                 },
 
-                frame::Frame::MaxData { .. } => unreachable!(),
+                frame::Frame::MaxData { max } => {
+                    self.max_tx_data = cmp::max(self.max_tx_data, max);
+                },
 
                 frame::Frame::NewConnectionId { seq_num, .. } => {
                     let mut conn = conn_guard.write().unwrap();
@@ -10367,15 +10347,13 @@ impl MulticorePath {
                 frame::Frame::ACKMP {
                     space_identifier, ..
                 } => {
-                    if space_identifier == space_id{
-                        self.reduced_connection.as_mut().unwrap().pkt_num_spaces
-                            .spaces
-                            .get_mut(epoch, space_identifier)
-                            .map(|pns| {
-                                pns.ack_elicited = true;
-                            })
-                            .ok();
-                    }
+                    self.reduced_connection.as_mut().unwrap().pkt_num_spaces
+                        .spaces
+                        .get_mut(epoch, space_identifier)
+                        .map(|pns| {
+                            pns.ack_elicited = true;
+                        })
+                        .ok();
                 },
 
                 _ => (),
@@ -10390,6 +10368,7 @@ impl MulticorePath {
         let crypto_space = reduced_conn.pkt_num_spaces.crypto.get_mut(epoch);
 
         let mut left = b.cap();
+
         let dcid_seq = self.inner_path.as_mut().unwrap()
             .active_dcid_seq.ok_or(Error::OutOfIdentifiers)?;
         let space_id = if multiple_application_data_pkt_num_spaces {
@@ -10397,6 +10376,7 @@ impl MulticorePath {
         } else {
             packet::INITIAL_PACKET_NUMBER_SPACE_ID
         };
+
         let pkt_space = reduced_conn
             .pkt_num_spaces
             .spaces
@@ -10495,7 +10475,7 @@ impl MulticorePath {
         let payload_offset = b.off();
 
         let cwnd_available =
-        self.inner_path.as_mut().unwrap().recovery.cwnd_available().saturating_sub(overhead);
+            self.inner_path.as_mut().unwrap().recovery.cwnd_available().saturating_sub(overhead);
 
         let left_before_packing_ack_frame = left;
 
@@ -10619,12 +10599,13 @@ impl MulticorePath {
         }
 
         if pkt_type == packet::Type::Short && !is_closing {
+            let mut conn = conn_guard.write().unwrap();
             // Create NEW_CONNECTION_ID frames as needed.
-            while let Some(seq_num) = reduced_conn.ids.next_advertise_new_scid_seq() {
-                let frame = reduced_conn.ids.get_new_connection_id_frame_for(seq_num)?;
+            while let Some(seq_num) = conn.ids.next_advertise_new_scid_seq() {
+                let frame = conn.ids.get_new_connection_id_frame_for(seq_num)?;
 
                 if push_frame_to_pkt!(b, frames, frame, left) {
-                    reduced_conn.ids.mark_advertise_new_scid_seq(seq_num, false);
+                    conn.ids.mark_advertise_new_scid_seq(seq_num, false);
 
                     ack_eliciting = true;
                     in_flight = true;
@@ -10691,7 +10672,27 @@ impl MulticorePath {
                 }
             }
 
-            // We don't create MAX_DATA stream as flow control is done per path and not per whole connection
+            // Create MAX_DATA frame as needed. NOTE: This is per path and not per connection
+            if self.almost_full &&
+                flow_control.max_data() < flow_control.max_data_next()
+            {
+                // Autotune the connection window size.
+                flow_control.autotune_window(now, self.inner_path.as_mut().unwrap().recovery.rtt());
+
+                let frame = frame::Frame::MaxData {
+                    max: flow_control.max_data_next(),
+                };
+
+                if push_frame_to_pkt!(b, frames, frame, left) {
+                    self.almost_full = false;
+
+                    // Commits the new max_rx_data limit.
+                    flow_control.update_max_data(now);
+
+                    ack_eliciting = true;
+                    in_flight = true;
+                }
+            }
 
             // Create STOP_SENDING frames as needed.
             for (stream_id, error_code) in self
@@ -11280,7 +11281,7 @@ impl MulticorePath {
                 return Err(Error::Done);
             }
 
-            if !self.completed_handshake {
+            if !self.completed_multipath_handshake {
                 if conn.local_error.is_none() && !self.path_id.is_none() {
                     if conn.is_lowest_active_path_id(self) {
                         conn.do_handshake(now.unwrap(), self)?;
@@ -11318,8 +11319,8 @@ impl MulticorePath {
         }
 
         // Generate coalesced packets.
-        if self.completed_handshake {
-            info!("sending using reduced send single");
+        if self.completed_multipath_handshake {
+            debug!("sending using reduced {:?} <-> {:?}", self.local_addr(), self.peer_addr());
             while left > 0 {
                 let (ty, written) = match self.reduced_send_single(
                     conn_guard, 
@@ -11427,17 +11428,18 @@ impl MulticorePath {
             at: send_path.recovery.get_packet_send_time(),
         };
 
-        if !self.completed_handshake{
+        if !self.completed_multipath_handshake{
             let conn = conn_guard.read().unwrap();
             if conn.handshake_completed && 
                 conn.handshake_confirmed && 
                 conn.peer_verified_initial_address &&
                 (!self.is_server || conn.handshake_done_acked) &&
                 conn.got_peer_conn_id &&
+                conn.multipath &&
                 !self.get_inner_path().is_none() && 
                 self.get_inner_path().unwrap().validated()
             {
-                self.completed_handshake = true;
+                self.completed_multipath_handshake = true;
                 self.reduced_connection = Some(
                     ReducedMulticoreConnection::new(
                         &conn
@@ -11477,6 +11479,606 @@ impl MulticorePath {
             (self.tx_data.saturating_sub(self.last_tx_data)) <
                 cwin_available as u64 &&
             cwin_available > 0
+    }
+
+    fn reduced_process_frame(
+        &mut self, conn_guard: &Arc<RwLock<MulticoreConnection>>, frame: frame::Frame, _hdr: &packet::Header,
+        recv_path_id: usize, epoch: packet::Epoch, now: time::Instant,
+    ) -> Result<()> {
+        let reduced_conn = self.reduced_connection.as_ref().unwrap();
+        trace!("{} rx frm {:?}", reduced_conn.trace_id, frame);
+        match frame {
+            frame::Frame::Padding { .. } => (),
+
+            frame::Frame::Ping => (),
+
+            frame::Frame::ACK {
+                ranges, ack_delay, ..
+            } => {
+                let ack_delay = ack_delay
+                    .checked_mul(2_u64.pow(
+                        reduced_conn.peer_transport_params.ack_delay_exponent as u32,
+                    ))
+                    .ok_or(Error::InvalidFrame)?;
+
+                let handshake_status = reduced_conn.handshake_status;
+
+                if reduced_conn.multipath && epoch == packet::Epoch::Application  {
+                    if let Some(_) =
+                        reduced_conn.ids.get_scid(0).ok().and_then(|e| e.path_id)
+                    {
+                        let is_app_limited =
+                            self.delivery_rate_check_if_app_limited();
+                        let p = self.inner_path.as_mut().unwrap();
+                        if is_app_limited {
+                            p.recovery.delivery_rate_update_app_limited(true);
+                        }
+                        p.recovery.on_ack_received(
+                            0,
+                            &ranges,
+                            ack_delay,
+                            epoch,
+                            handshake_status,
+                            now,
+                            &reduced_conn.trace_id,
+                            &mut Vec::new(),
+                        )?;
+                    }
+                } else {
+                    // This ACK may acknowledge several packets on different
+                    // paths.
+                    let mut conn = conn_guard.write().unwrap();
+                    let pids: Vec<usize> = conn.per_path_unprocessed_events.keys().map(|pd| *pd).collect();
+                    for pid in pids {
+                        if pid == recv_path_id {
+                            let is_app_limited =
+                                self.delivery_rate_check_if_app_limited();
+                            let p = self.inner_path.as_mut().unwrap();
+                            if is_app_limited {
+                                p.recovery.delivery_rate_update_app_limited(true);
+                            }
+                            p.recovery.on_ack_received(
+                                0,
+                                &ranges,
+                                ack_delay,
+                                epoch,
+                                handshake_status,
+                                now,
+                                &conn.trace_id,
+                                &mut Vec::new(),
+                            )?;
+                        } else {
+                            conn.per_path_unprocessed_events.get_mut(&pid).unwrap().push_back(
+                                MulticorePathPendingEvent::PacketOnACKReceived(
+                                    pid,
+                                    0,
+                                    ranges.clone(), 
+                                    ack_delay,
+                                    epoch, 
+                                    handshake_status,
+                                    now, 
+                                    reduced_conn.trace_id.clone(), 
+                                )
+                            );
+                        }
+                    }
+                }
+            },
+
+            frame::Frame::ResetStream {
+                stream_id,
+                error_code,
+                final_size,
+            } => {
+                // Peer can't send on our unidirectional streams.
+                if !stream::is_bidi(stream_id) &&
+                    stream::is_local(stream_id, self.is_server)
+                {
+                    return Err(Error::InvalidStreamState(stream_id));
+                }
+
+                let max_rx_data_left = self.max_rx_data() - self.rx_data;
+
+                // Get existing stream or create a new one, but if the stream
+                // has already been closed and collected, ignore the frame.
+                //
+                // This can happen if e.g. an ACK frame is lost, and the peer
+                // retransmits another frame before it realizes that the stream
+                // is gone.
+                //
+                // Note that it makes it impossible to check if the frame is
+                // illegal, since we have no state, but since we ignore the
+                // frame, it should be fine.
+                let stream = {
+                    let mut conn = conn_guard.write().unwrap();
+                    match self.get_or_create_stream(&mut conn, stream_id, false) {
+                        Ok(v) => v,
+
+                        Err(Error::Done) => return Ok(()),
+
+                        Err(e) => return Err(e),
+                    }
+                };
+
+                let was_readable = stream.is_readable();
+                let priority_key = Arc::clone(&stream.priority_key);
+
+                let max_off_delta =
+                    stream.recv.reset(error_code, final_size)? as u64;
+
+                if max_off_delta > max_rx_data_left {
+                    return Err(Error::FlowControl);
+                }
+
+                if !was_readable && stream.is_readable() {
+                    self.streams.insert_readable(&priority_key);
+                }
+
+                self.rx_data += max_off_delta;
+            },
+
+            frame::Frame::StopSending {
+                stream_id,
+                error_code,
+            } => {
+                // STOP_SENDING on a receive-only stream is a fatal error.
+                if !stream::is_local(stream_id, self.is_server) &&
+                    !stream::is_bidi(stream_id)
+                {
+                    return Err(Error::InvalidStreamState(stream_id));
+                }
+
+                // Get existing stream or create a new one, but if the stream
+                // has already been closed and collected, ignore the frame.
+                //
+                // This can happen if e.g. an ACK frame is lost, and the peer
+                // retransmits another frame before it realizes that the stream
+                // is gone.
+                //
+                // Note that it makes it impossible to check if the frame is
+                // illegal, since we have no state, but since we ignore the
+                // frame, it should be fine.
+                let stream = {
+                    let mut conn = conn_guard.write().unwrap();
+                    match self.get_or_create_stream(&mut conn, stream_id, false) {
+                        Ok(v) => v,
+
+                        Err(Error::Done) => return Ok(()),
+
+                        Err(e) => return Err(e),
+                    }
+                };
+
+                let was_writable = stream.is_writable();
+
+                let priority_key = Arc::clone(&stream.priority_key);
+
+                // Try stopping the stream.
+                if let Ok((final_size, unsent)) = stream.send.stop(error_code) {
+                    // Claw back some flow control allowance from data that was
+                    // buffered but not actually sent before the stream was
+                    // reset.
+                    //
+                    // Note that `tx_cap` will be updated later on, so no need
+                    // to touch it here.
+                    self.tx_data = self.tx_data.saturating_sub(unsent);
+
+                    self.tx_buffered =
+                        self.tx_buffered.saturating_sub(unsent as usize);
+
+                    self.streams.insert_reset(stream_id, error_code, final_size);
+
+                    if !was_writable {
+                        self.streams.insert_writable(&priority_key);
+                    }
+                }
+            },
+
+            frame::Frame::Crypto { .. } => unreachable!(), // To be passed to the other process frame
+
+            frame::Frame::CryptoHeader { .. } => unreachable!(),
+
+            // TODO: implement stateless retry
+            frame::Frame::NewToken { .. } => (),
+
+            frame::Frame::Stream { stream_id, data } => {
+                // Peer can't send on our unidirectional streams.
+                if !stream::is_bidi(stream_id) &&
+                    stream::is_local(stream_id, self.is_server)
+                {
+                    return Err(Error::InvalidStreamState(stream_id));
+                }
+
+                let max_rx_data_left = self.max_rx_data() - self.rx_data;
+
+                // Get existing stream or create a new one, but if the stream
+                // has already been closed and collected, ignore the frame.
+                //
+                // This can happen if e.g. an ACK frame is lost, and the peer
+                // retransmits another frame before it realizes that the stream
+                // is gone.
+                //
+                // Note that it makes it impossible to check if the frame is
+                // illegal, since we have no state, but since we ignore the
+                // frame, it should be fine.
+                let stream = {
+                    let mut conn = conn_guard.write().unwrap();
+                    match self.get_or_create_stream(&mut conn, stream_id, false) {
+                        Ok(v) => v,
+
+                        Err(Error::Done) => return Ok(()),
+
+                        Err(e) => return Err(e),
+                    }
+                };
+
+                // Check for the connection-level flow control limit.
+                let max_off_delta =
+                    data.max_off().saturating_sub(stream.recv.max_off());
+
+                if max_off_delta > max_rx_data_left {
+                    return Err(Error::FlowControl);
+                }
+
+                let was_readable = stream.is_readable();
+                let priority_key = Arc::clone(&stream.priority_key);
+
+                let was_draining = stream.recv.is_draining();
+
+                stream.recv.write(data)?;
+
+                if !was_readable && stream.is_readable() {
+                    self.streams.insert_readable(&priority_key);
+                }
+
+                self.rx_data += max_off_delta;
+
+                if was_draining {
+                    // When a stream is in draining state it will not queue
+                    // incoming data for the application to read, so consider
+                    // the received data as consumed, which might trigger a flow
+                    // control update.
+                    self.flow_control.add_consumed(max_off_delta);
+
+                    if self.should_update_max_data() {
+                        self.almost_full = true;
+                    }
+                }
+            },
+
+            frame::Frame::StreamHeader { .. } => unreachable!(),
+
+            frame::Frame::MaxData { max } => {
+                self.max_tx_data = cmp::max(self.max_tx_data, max);
+            },
+
+            frame::Frame::MaxStreamData { stream_id, max } => {
+                // Peer can't receive on its own unidirectional streams.
+                if !stream::is_bidi(stream_id) &&
+                    !stream::is_local(stream_id, self.is_server)
+                {
+                    return Err(Error::InvalidStreamState(stream_id));
+                }
+
+                // Get existing stream or create a new one, but if the stream
+                // has already been closed and collected, ignore the frame.
+                //
+                // This can happen if e.g. an ACK frame is lost, and the peer
+                // retransmits another frame before it realizes that the stream
+                // is gone.
+                //
+                // Note that it makes it impossible to check if the frame is
+                // illegal, since we have no state, but since we ignore the
+                // frame, it should be fine.
+                let stream = {
+                    let mut conn = conn_guard.write().unwrap();
+                    match self.get_or_create_stream(&mut conn, stream_id, false) {
+                        Ok(v) => v,
+
+                        Err(Error::Done) => return Ok(()),
+
+                        Err(e) => return Err(e),
+                    }
+                };
+
+                let was_flushable = stream.is_flushable();
+
+                stream.send.update_max_data(max);
+
+                let writable = stream.is_writable();
+
+                let priority_key = Arc::clone(&stream.priority_key);
+
+                // If the stream is now flushable push it to the flushable queue,
+                // but only if it wasn't already queued.
+                if stream.is_flushable() && !was_flushable {
+                    let priority_key = Arc::clone(&stream.priority_key);
+                    self.streams.insert_flushable(&priority_key);
+                }
+
+                if writable {
+                    self.streams.insert_writable(&priority_key);
+                }
+            },
+
+            frame::Frame::MaxStreamsBidi { max } => {
+                if max > MAX_STREAM_ID {
+                    return Err(Error::InvalidFrame);
+                }
+
+                let mut conn = conn_guard.write().unwrap();
+                conn.stream_ids.update_peer_max_streams_bidi(max);
+            },
+
+            frame::Frame::MaxStreamsUni { max } => {
+                if max > MAX_STREAM_ID {
+                    return Err(Error::InvalidFrame);
+                }
+
+                let mut conn = conn_guard.write().unwrap();
+                conn.stream_ids.update_peer_max_streams_uni(max);
+            },
+
+            frame::Frame::DataBlocked { .. } => (),
+
+            frame::Frame::StreamDataBlocked { .. } => (),
+
+            frame::Frame::StreamsBlockedBidi { limit } =>
+                if limit > MAX_STREAM_ID {
+                    return Err(Error::InvalidFrame);
+                },
+
+            frame::Frame::StreamsBlockedUni { limit } =>
+                if limit > MAX_STREAM_ID {
+                    return Err(Error::InvalidFrame);
+                },
+
+            frame::Frame::NewConnectionId {
+                seq_num,
+                retire_prior_to,
+                conn_id,
+                reset_token,
+            } => {
+                let mut conn = conn_guard.write().unwrap();
+                if conn.ids.zero_length_dcid() {
+                    return Err(Error::InvalidState);
+                }
+
+                let retired_path_ids = conn.ids.new_dcid(
+                    conn_id.into(),
+                    seq_num,
+                    u128::from_be_bytes(reset_token),
+                    retire_prior_to,
+                )?;
+
+                for (_, _) in retired_path_ids {
+                    // TODO multicore
+                    info!("There some retired path ids to handle");
+                    return Err(Error::MulticoreNotDone);
+                }
+            },
+
+            frame::Frame::RetireConnectionId { .. } => {
+                info!("There some retired connection ids to handle");
+                return Err(Error::MulticoreNotDone);
+            },
+
+            frame::Frame::PathChallenge { data } => {
+                self.get_inner_path_mut().unwrap()
+                    .on_challenge_received(data);
+            },
+
+            frame::Frame::PathResponse { data } => {
+                if self.get_inner_path_mut().unwrap().on_response_received(data) {
+                    let local_addr = self.local_addr;
+                    let peer_addr = self.peer_addr;
+
+                    // TODO multicore Handle Migrating
+
+                    // Notifies the application.
+                    self.notify_event(PathEvent::Validated(local_addr, peer_addr));
+                }
+            },
+
+            frame::Frame::ConnectionClose {
+                error_code, reason, ..
+            } => {
+                let mut conn = conn_guard.write().unwrap();
+                conn.peer_error = Some(ConnectionError {
+                    is_app: false,
+                    error_code,
+                    reason: reason.clone(),
+                });
+
+                conn.recv_connection_close = true;
+
+                
+                let path = self.inner_path.as_mut().unwrap();
+                self.draining_timer = Some(now + (path.recovery.pto() * 3));
+                conn.draining = true;
+
+                let reduced_conn = self.reduced_connection.as_mut().unwrap();
+                reduced_conn.peer_error = Some(
+                    ConnectionError {
+                        is_app: false,
+                        error_code,
+                        reason,
+                    }
+                );
+
+                // TODO multicore notify other threads
+
+            },
+
+            frame::Frame::ApplicationClose { error_code, reason } => {
+                let mut conn = conn_guard.write().unwrap();
+                conn.peer_error = Some(ConnectionError {
+                    is_app: true,
+                    error_code,
+                    reason: reason.clone(),
+                });
+                conn.recv_application_close = true;
+
+                let path = self.get_inner_path_mut().unwrap();
+                self.draining_timer = Some(now + (path.recovery.pto() * 3));
+                conn.draining = true;
+
+                let reduced_conn = self.reduced_connection.as_mut().unwrap();
+                reduced_conn.peer_error = Some(
+                    ConnectionError {
+                        is_app: false,
+                        error_code,
+                        reason,
+                    }
+                );
+
+                // TODO multicore notify other threads
+            },
+
+            frame::Frame::HandshakeDone => {
+                let mut conn = conn_guard.write().unwrap();
+                if self.is_server {
+                    return Err(Error::InvalidPacket);
+                }
+
+                conn.peer_verified_initial_address = true;
+
+                conn.handshake_confirmed = true;
+
+                // Once the handshake is confirmed, we can drop Handshake keys.
+                conn.drop_epoch_state(packet::Epoch::Handshake, now, self);
+            }
+
+            frame::Frame::Datagram { data } => {
+                let conn = conn_guard.write().unwrap();
+                // Close the connection if DATAGRAMs are not enabled.
+                // quiche always advertises support for 64K sized DATAGRAM
+                // frames, as recommended by the standard, so we don't need a
+                // size check.
+                if !conn.dgram_enabled() {
+                    return Err(Error::InvalidState);
+                }
+
+                // If recv queue is full, discard oldest
+                if self.dgram_recv_queue.is_full() {
+                    self.dgram_recv_queue.pop();
+                }
+
+                self.dgram_recv_queue.push(data)?;
+            },
+
+            frame::Frame::ACKMP {
+                space_identifier,
+                ranges,
+                ack_delay,
+                ..
+            } => {
+                if !(reduced_conn.multipath && epoch == packet::Epoch::Application) {
+                    return Err(Error::MultiPathViolation);
+                }
+                let ack_delay = ack_delay
+                    .checked_mul(2_u64.pow(
+                        reduced_conn.peer_transport_params.ack_delay_exponent as u32,
+                    ))
+                    .ok_or(Error::InvalidFrame)?;
+
+
+                // If an endpoint receives an ACK_MP frame with a packet number
+                // space ID which was never issued by endpoints (i.e., with a
+                // sequence number larger than the largest one advertised), it
+                // MUST treat this as a connection error of type
+                // MP_PROTOCOL_VIOLATION and close the connection.
+                if space_identifier > reduced_conn.ids.largest_dcid_seq() {
+                    return Err(Error::MultiPathViolation);
+                }
+
+                // If an endpoint receives an ACK_MP frame with a packet number
+                // space ID which is no more active (e.g., retired by a
+                // RETIRE_CONNECTION_ID frame or belonging to closed paths), it
+                // MUST ignore the ACK_MP frame without causing a connection
+                // error.
+                if let Ok(e) = reduced_conn.ids.get_dcid(space_identifier) {
+                    if let Some(path_id) = e.path_id {
+                        if path_id == self.path_id.unwrap(){
+                            let is_app_limited = self.delivery_rate_check_if_app_limited();
+                            let p = self.inner_path.as_mut().unwrap();
+                            if is_app_limited {
+                                p.recovery.delivery_rate_update_app_limited(true);
+                            }
+                            p.recovery.on_ack_received(
+                                space_identifier as u32,
+                                &ranges,
+                                ack_delay,
+                                epoch,
+                                reduced_conn.handshake_status,
+                                now,
+                                &reduced_conn.trace_id,
+                                &mut Vec::new(),
+                            )?;
+                        } else {
+                            let mut conn = conn_guard.write().unwrap();
+                            // TODO multipath 
+                            conn.per_path_unprocessed_events.get_mut(&path_id).unwrap().push_back(
+                                MulticorePathPendingEvent::PacketOnACKReceived(
+                                    path_id,
+                                    0,
+                                    ranges.clone(), 
+                                    ack_delay,
+                                    epoch, 
+                                    reduced_conn.handshake_status,
+                                    now, 
+                                    reduced_conn.trace_id.clone(), 
+                                )
+                            );
+                        }
+                    }
+                }
+            },
+
+            frame::Frame::DatagramHeader { .. } => unreachable!(),
+
+            frame::Frame::PathAbandon {
+                ..
+            } => {
+                // TODO multipath
+                info!("There's a path abandon");
+                return Err(Error::MulticoreNotDone); 
+            },
+
+            frame::Frame::PathStandby {
+                ..
+            } => {
+                // TODO multipath
+                info!("There's a path standby");
+                return Err(Error::MulticoreNotDone);
+            }, 
+
+            frame::Frame::PathAvailable {
+                dcid_seq_num,
+                seq_num,
+            } => {
+                let conn = conn_guard.write().unwrap();
+                if !conn.use_path_pkt_num_space(epoch) {
+                    return Err(Error::MultiPathViolation);
+                }
+                let pid = conn
+                    .ids
+                    .get_dcid(dcid_seq_num)?
+                    .path_id
+                    .ok_or(Error::InvalidFrame)?;
+                if pid != self.path_id.unwrap(){
+                    return Err(Error::InvalidState);
+                }
+                let p = self.get_inner_path_mut().unwrap(); 
+                if seq_num >= p.expected_path_status_seq_num {
+                    p.expected_path_status_seq_num = seq_num.saturating_add(1);
+                    let addr = (p.local_addr(), p.peer_addr());
+                    self.events
+                        .push_back(PathEvent::PeerPathStatus(addr, true.into()));
+                }
+            },
+        };
+        Ok(())
     }
 
     fn process_frame(
@@ -11857,8 +12459,6 @@ impl MulticorePath {
                     return Err(Error::InvalidState);
                 }
 
-                let cloned = conn_id.clone();
-
                 let retired_path_ids = conn.ids.new_dcid(
                     conn_id.into(),
                     seq_num,
@@ -11870,42 +12470,6 @@ impl MulticorePath {
                     // TODO multicore
                     info!("There some retired path ids to handle");
                     return Err(Error::MulticoreNotDone);
-                }
-
-                if self.completed_handshake {
-                    let reduced_conn = self.reduced_connection.as_mut().unwrap();
-                    if reduced_conn.ids.zero_length_dcid() {
-                        return Err(Error::InvalidState);
-                    }
-
-                    let cloned = cloned.clone();
-    
-                    let retired_path_ids = reduced_conn.ids.new_dcid(
-                        cloned.into(),
-                        seq_num,
-                        u128::from_be_bytes(reset_token),
-                        retire_prior_to,
-                    )?;
-    
-                    for (_, _) in retired_path_ids {
-                        // TODO multicore
-                        info!("There some retired path ids to handle");
-                        return Err(Error::MulticoreNotDone);
-                    }
-                }
-
-                for (pid, q) in conn.per_path_unprocessed_events.iter_mut(){
-                    if *pid != recv_path_id{
-                        let cloned = cloned.clone();
-                        q.push_back(
-                            MulticorePathPendingEvent::NewConnectionId(
-                                seq_num, 
-                                retire_prior_to,
-                                cloned, 
-                                reset_token
-                            )
-                        )
-                    }
                 }
             },
 
@@ -13052,7 +13616,6 @@ impl MulticorePath {
 
         // Process packet payload.
         while payload.cap() > 0 {
-            let mut conn = conn_guard.write().unwrap();
             let frame = frame::Frame::from_bytes(&mut payload, hdr.ty)?;
 
             if frame.ack_eliciting() {
@@ -13063,7 +13626,7 @@ impl MulticorePath {
                 probing = false;
             }
 
-            if let Err(e) = self.process_frame(&mut conn, frame, &hdr, recv_pid, epoch, now)
+            if let Err(e) = self.reduced_process_frame(conn_guard, frame, &hdr, recv_pid, epoch, now)
             {
                 frame_processing_err = Some(e);
                 break;
@@ -13292,7 +13855,7 @@ impl MulticorePath {
 
         let mut done = 0;
         let mut left = len;
-        if self.completed_handshake {
+        if self.completed_multipath_handshake {
             while left > 0 {
                 let read = match self.reduced_recv_single(
                     conn_guard,
@@ -13372,17 +13935,18 @@ impl MulticorePath {
                 left -= read;
             }
     
-            if !self.completed_handshake{
+            if !self.completed_multipath_handshake{
                 let conn = conn_guard.read().unwrap();
                 if conn.handshake_completed && 
                    conn.handshake_confirmed && 
+                    conn.multipath &&  
                    conn.peer_verified_initial_address &&
                    (!self.is_server || conn.handshake_done_acked) &&
                    conn.got_peer_conn_id &&
                    !self.get_inner_path().is_none() && 
                    self.get_inner_path().unwrap().validated()
                 {
-                    self.completed_handshake = true;
+                    self.completed_multipath_handshake = true;
                     self.reduced_connection = Some(
                         ReducedMulticoreConnection::new(
                             &conn
@@ -13429,30 +13993,7 @@ impl MulticorePath {
                 }, 
                 MulticorePathPendingEvent::PeerError(conn_err) => {
                     self.reduced_connection.as_mut().unwrap().peer_error = Some(conn_err.clone());
-                }, 
-                MulticorePathPendingEvent::NewConnectionId(seq_num, retire_prior_to, conn_id, reset_token) => {
-                    if self.completed_handshake {
-                        let reduced_conn = self.reduced_connection.as_mut().unwrap();
-                        if reduced_conn.ids.zero_length_dcid() {
-                            return Err(Error::InvalidState);
-                        }
-                        let clone_conn_id = conn_id.clone();
-                        let conn_id = ConnectionId::from_vec(clone_conn_id);
-        
-                        let retired_path_ids = reduced_conn.ids.new_dcid(
-                            conn_id,
-                            *seq_num,
-                            u128::from_be_bytes(*reset_token),
-                            *retire_prior_to,
-                        )?;
-        
-                        for (_, _) in retired_path_ids {
-                            // TODO multicore
-                            info!("There some retired path ids to handle");
-                            return Err(Error::MulticoreNotDone);
-                        }
-                    }
-                }
+                },
             }
         };
         Ok(())
@@ -13478,6 +14019,16 @@ impl MulticorePath {
         path.active_dcid_seq.ok_or(Error::InvalidState)
     }
 
+    /// Is path active
+    #[inline]
+    pub fn is_active(&self) -> bool{
+        if let Some(p) = self.get_inner_path(){
+            p.active() 
+        } else {
+            false
+        }
+    }
+
     /// Request the usage of the provided 4-tuple to send non-probing packets.
     pub fn set_active(
         &mut self, 
@@ -13495,6 +14046,7 @@ impl MulticorePath {
         let requested_state = request.requested_state();
         let path = self.inner_path.as_mut().unwrap();
         path.set_state(requested_state)?;
+
         if path.is_closing(){
             return Err(Error::MulticoreNotDone);
         }
@@ -13548,13 +14100,10 @@ impl MulticorePath {
 
     /// Updates send capacity.
     fn update_tx_cap(&mut self) {
-        let cwin_available = self
-            .inner_path
-            .as_mut()
-            .unwrap()
-            .stats()
-            .cwnd_available;
+        let p = self.inner_path.as_ref().unwrap();
+        let cwin_available = if p.active() { p.recovery.cwnd_available() } else { 0 };
         let cwin_available = if cwin_available != std::usize::MAX { cwin_available } else { 0 };
+        // info!("({:?} <-> {:?}) [update_tx_cap] cwin_available: {}, (max_tx_data - tx_data) {}", self.local_addr(), self.peer_addr(), cwin_available, self.max_tx_data - self.tx_data);
         self.tx_cap = cmp::min(
             cwin_available,
             (self.max_tx_data - self.tx_data)
@@ -13595,12 +14144,12 @@ impl MulticorePath {
         //
         // Note that this is separate from "send capacity" as that also takes
         // congestion control into consideration.
+
         if self.max_tx_data - self.tx_data < buf.len() as u64 {
             self.blocked_limit = Some(self.max_tx_data);
         }
 
         let cap = self.tx_cap;
-
         // Get existing stream or create a new one.
         let mut conn = conn_guard.write().unwrap();
         let stream = self.get_or_create_stream(&mut conn, stream_id, true)?;
@@ -13692,6 +14241,8 @@ impl MulticorePath {
         self.tx_buffered += sent;
 
         // TODO add qlog
+        info!("stream id {} writable {} incremental {}", stream_id, writable, incremental);
+        info!("stream id {} writable {} incremental {}", stream_id, writable, incremental);
 
         if sent == 0 && !buf.is_empty() {
             return Err(Error::Done);
@@ -13702,7 +14253,6 @@ impl MulticorePath {
             self.streams.remove_writable(&priority_key);
             self.streams.insert_writable(&priority_key);
         }
-
         Ok(sent)
     }
 
@@ -13985,7 +14535,7 @@ impl MulticorePath {
             Err(e) => return Err(e),
         };
 
-        if !self.completed_handshake{
+        if !self.completed_multipath_handshake{
             return returned_by_conn;
         }
 
@@ -14605,6 +15155,8 @@ impl MulticoreConnection {
         path.path_id = Some(pid);
 
         path.peer_transport_params = self.peer_transport_params.clone();
+        path.update_tx_cap();
+
         path.multipath = self.multipath;
 
         if self.is_server {
@@ -14803,7 +15355,7 @@ impl MulticoreConnection {
     }
 
     /// Closes the connection with the given error and reason.
-    pub fn close(&mut self, app: bool, err: u64, reason: &[u8]) -> Result<()> {
+    fn close(&mut self, app: bool, err: u64, reason: &[u8]) -> Result<()> {
         if self.is_closed() || self.draining {
             return Err(Error::Done);
         }
@@ -14916,8 +15468,9 @@ impl MulticoreConnection {
 
         path.peer_transport_params = self.peer_transport_params.clone();
         // On any path event update tx cap
-        path.max_tx_data = path.peer_transport_params.initial_max_data;
+        path.max_tx_data = self.peer_transport_params.initial_max_data;
         path.update_tx_cap();
+
         path.multipath = self.multipath;
 
         self.paths_stats.insert(path.get_path_id(), path.stats()); 
@@ -17134,7 +17687,7 @@ mod tests {
         assert_eq!(pipe.server.send(&mut buf), Err(Error::Done));
     }
 
-    #[test]
+    #[test_log::test]
     fn flow_control_limit() {
         let mut buf = [0; 65535];
 
@@ -22463,15 +23016,11 @@ mod tests {
             pipe.client.new_source_cid(&c_cid, c_reset_token, true),
             Ok(1)
         );
-        info!("new source id !");
-
-        
         let (s_cid, s_reset_token) = testing::create_cid_and_reset_token(16);
         assert_eq!(
             pipe.server.new_source_cid(&s_cid, s_reset_token, true),
             Ok(1)
         );
-        info!("new source id !");
 
         // We need to exchange the CIDs first.
         assert_eq!(
@@ -22483,7 +23032,7 @@ mod tests {
         assert_eq!(pipe.advance(), Ok(()));
 
         assert_eq!(pipe.server.available_dcids(), 1);
-        /* assert_eq!(pipe.server.path_event_next(), None);
+        assert_eq!(pipe.server.path_event_next(), None);
         assert_eq!(pipe.client.available_dcids(), 1);
         assert_eq!(pipe.client.path_event_next(), None);
         
@@ -22522,7 +23071,7 @@ mod tests {
         
         // This should not trigger any event at client side.
         assert_eq!(pipe.client.path_event_next(), None);
-        assert_eq!(pipe.server.path_event_next(), None); */
+        assert_eq!(pipe.server.path_event_next(), None);
     }
 
     #[test]
@@ -24149,6 +24698,25 @@ pub mod multicore_testing{
             Pipe::with_config(&mut config)
         }
 
+        pub fn multipath_new() -> Result<Pipe> {
+            let mut config = Config::new(crate::PROTOCOL_VERSION)?;
+            config.load_cert_chain_from_pem_file("examples/cert.crt")?;
+            config.load_priv_key_from_pem_file("examples/cert.key")?;
+            config.set_application_protos(&[b"proto1", b"proto2"])?;
+            config.set_initial_max_data(30);
+            config.set_initial_max_stream_data_bidi_local(15);
+            config.set_initial_max_stream_data_bidi_remote(15);
+            config.set_initial_max_stream_data_uni(10);
+            config.set_initial_max_streams_bidi(3);
+            config.set_initial_max_streams_uni(3);
+            config.set_max_idle_timeout(180_000);
+            config.verify_peer(false);
+            config.set_ack_delay_exponent(8);
+            config.set_multipath(true);
+
+            Pipe::with_config(&mut config)
+        }
+
         pub fn client_addr() -> SocketAddr {
             "127.0.0.1:1234".parse().unwrap()
         }
@@ -24336,7 +24904,10 @@ pub mod multicore_testing{
                     Err(e) => return Err(e),
                 };
 
-                self.handle_pending_path_event()?;
+                match self.handle_pending_path_event() {
+                    Ok(_) | Err(Error::Done) => {},
+                    Err(e) => return Err(e)
+                };
 
                 match multicore_emit_flight(&self.server, &mut self.server_paths) {
                     Ok(flight) => {
@@ -24350,7 +24921,10 @@ pub mod multicore_testing{
                     Err(e) => return Err(e),
                 };
 
-                self.handle_pending_path_event()?;
+                match self.handle_pending_path_event() {
+                    Ok(_) | Err(Error::Done) => {},
+                    Err(e) => return Err(e)
+                };
             }
 
             Ok(())
@@ -24645,13 +25219,17 @@ pub mod multicore_testing{
             None => return Err(Error::InvalidState),
         };
 
-        // We don't support multipath in this method.
-        assert!(!multipath_multiple_spaces);
-        let path_seq = packet::INITIAL_PACKET_NUMBER_SPACE_ID as u32;
+        let dcid_seq = p
+            .active_dcid_seq.ok_or(Error::OutOfIdentifiers)?;
+        let space_id = if multipath_multiple_spaces {
+            dcid_seq
+        } else {
+            packet::INITIAL_PACKET_NUMBER_SPACE_ID
+        };
 
         let written = packet::encrypt_pkt(
             &mut b,
-            path_seq,
+            space_id as u32,
             pn,
             pn_len,
             payload_len,
@@ -24673,7 +25251,7 @@ pub mod multicore_testing{
     ) -> Result<usize> {
         
         let send_path = paths.get(0).unwrap();
-        if send_path.completed_handshake {
+        if send_path.completed_multipath_handshake {
             return encode_pkt_on_path_after_completed_handshake(conn_guard, paths, pkt_type, frames, buf);
         }
         
@@ -24978,9 +25556,89 @@ mod multicore_tests {
         assert!(pipe.server.read().unwrap().handshake_confirmed);
 
         assert_eq!(pipe.advance(), Ok(()));
+    }
 
-        assert!(pipe.client_paths.get(0).unwrap().completed_handshake);
-        assert!(pipe.server_paths.get(0).unwrap().completed_handshake);
+    #[test_log::test]
+    fn multipath_handshake_confirmation() {
+        let mut pipe = multicore_testing::Pipe::multipath_new().unwrap();
+
+        // Client sends initial flight.
+        let flight = multicore_testing::multicore_emit_flight(&pipe.client, &mut pipe.client_paths).unwrap();
+        multicore_testing::multicore_process_flight(&mut pipe.server, &mut pipe.server_paths, flight).unwrap();
+
+        // Server sends initial flight.
+        let flight = multicore_testing::multicore_emit_flight(&mut pipe.server, &mut pipe.server_paths,).unwrap();
+
+        assert!(!pipe.client.read().unwrap().is_established());
+        assert!(!pipe.client.read().unwrap().handshake_confirmed);
+
+        assert!(!pipe.server.read().unwrap().is_established());
+        assert!(!pipe.server.read().unwrap().handshake_confirmed);
+
+        multicore_testing::multicore_process_flight(&pipe.client, &mut pipe.client_paths, flight).unwrap();
+
+        // Client sends Handshake packet and completes handshake.
+        let flight = multicore_testing::multicore_emit_flight(&pipe.client, &mut pipe.client_paths).unwrap();
+
+        assert!(pipe.client.read().unwrap().is_established());
+        assert!(!pipe.client.read().unwrap().handshake_confirmed);
+
+        assert!(!pipe.server.read().unwrap().is_established());
+        assert!(!pipe.server.read().unwrap().handshake_confirmed);
+
+        multicore_testing::multicore_process_flight(&mut pipe.server,  &mut pipe.server_paths, flight).unwrap();
+
+        // Server completes and confirms handshake, and sends HANDSHAKE_DONE.
+        let flight = multicore_testing::multicore_emit_flight(&mut pipe.server, &mut pipe.server_paths).unwrap();
+
+        assert!(pipe.client.read().unwrap().is_established());
+        assert!(!pipe.client.read().unwrap().handshake_confirmed);
+
+        assert!(pipe.server.read().unwrap().is_established());
+        assert!(pipe.server.read().unwrap().handshake_confirmed);
+
+        multicore_testing::multicore_process_flight(&pipe.client, &mut pipe.client_paths, flight).unwrap();
+
+        // Client acks 1-RTT packet, and confirms handshake.
+        let flight = multicore_testing::multicore_emit_flight(&pipe.client, &mut pipe.client_paths).unwrap();
+
+        assert!(pipe.client.read().unwrap().is_established());
+        assert!(pipe.client.read().unwrap().handshake_confirmed);
+
+        assert!(pipe.server.read().unwrap().is_established());
+        assert!(pipe.server.read().unwrap().handshake_confirmed);
+
+        multicore_testing::multicore_process_flight(&mut pipe.server, &mut pipe.server_paths, flight).unwrap();
+
+        assert!(pipe.client.read().unwrap().is_established());
+        assert!(pipe.client.read().unwrap().handshake_confirmed);
+
+        assert!(pipe.server.read().unwrap().is_established());
+        assert!(pipe.server.read().unwrap().handshake_confirmed);
+
+        assert_eq!(pipe.advance(), Ok(()));
+
+        let stats = pipe.server_paths.get_mut(0).unwrap().get_inner_path().unwrap().stats();
+        assert_eq!(
+            stats.cwnd,
+            stats.cwnd_available
+        );
+
+        assert_eq!(
+            stats.cwnd_available,
+            12000
+        );
+
+        let stats = pipe.client_paths.get_mut(0).unwrap().get_inner_path().unwrap().stats();
+        assert_eq!(
+            stats.cwnd,
+            stats.cwnd_available
+        );
+
+        assert_eq!(
+            stats.cwnd_available,
+            12000
+        );
     }
 
     #[test_log::test]
@@ -25183,9 +25841,6 @@ mod multicore_tests {
 
         assert_eq!(pipe.advance(), Ok(()));
 
-        assert!(pipe.client_paths.get(0).unwrap().completed_handshake);
-        assert!(pipe.server_paths.get(0).unwrap().completed_handshake);
-
         // We cannot probe a new path if there are not enough identifiers.
         assert_eq!(
             client_addr_2_path.probe_path(&mut pipe.client),
@@ -25198,14 +25853,11 @@ mod multicore_tests {
             pipe.client_paths.get_mut(0).unwrap().new_source_cid(&mut pipe.client, &c_cid, c_reset_token, true),
             Ok(1)
         );
-        info!("new source id !");
-
         let (s_cid, s_reset_token) = testing::create_cid_and_reset_token(16);
         assert_eq!(
             pipe.server_paths.get_mut(0).unwrap().new_source_cid(&pipe.server, &s_cid, s_reset_token, true),
             Ok(1)
         );
-        info!("new source id !");
 
         // We need to exchange the CIDs first.
         assert_eq!(
@@ -25217,7 +25869,7 @@ mod multicore_tests {
         assert_eq!(pipe.advance(), Ok(()));
         
         assert_eq!(pipe.server_paths.get_mut(0).unwrap().available_dcids(&pipe.server), 1);
-        /*assert_eq!(pipe.server_paths.get_mut(0).unwrap().path_event_next(), None);
+        assert_eq!(pipe.server_paths.get_mut(0).unwrap().path_event_next(), None);
         assert_eq!(pipe.client_paths.get_mut(0).unwrap().available_dcids(&pipe.client), 1);
         assert_eq!(pipe.client_paths.get_mut(0).unwrap().path_event_next(), None);
         
@@ -25267,8 +25919,116 @@ mod multicore_tests {
         assert_eq!(pipe.server_paths.get_mut(0).unwrap().path_event_next(), None);
         assert_eq!(pipe.server_paths.get_mut(1).unwrap().path_event_next(), None);
 
-        assert!(pipe.client_paths.get(1).unwrap().completed_handshake);
-        assert!(pipe.server_paths.get(1).unwrap().completed_handshake);*/
+    }
+
+    #[test_log::test]
+    fn multipath_path_validation() {
+        let mut config = Config::new(crate::PROTOCOL_VERSION).unwrap();
+        config
+            .load_cert_chain_from_pem_file("examples/cert.crt")
+            .unwrap();
+        config
+            .load_priv_key_from_pem_file("examples/cert.key")
+            .unwrap();
+        config
+            .set_application_protos(&[b"proto1", b"proto2"])
+            .unwrap();
+        config.verify_peer(false);
+        config.set_active_connection_id_limit(2);
+        config.set_multipath(true);
+
+        let mut pipe = multicore_testing::Pipe::with_config(&mut config).unwrap();
+        assert_eq!(pipe.handshake(), Ok(()));
+
+        assert_eq!(pipe.client_paths.get_mut(0).unwrap().completed_multipath_handshake, true);
+
+        let server_addr = testing::Pipe::server_addr();
+        let client_addr_2 = "127.0.0.1:5678".parse().unwrap();
+        let mut client_addr_2_path = MulticorePath::default(&config, false, client_addr_2, server_addr);
+
+        assert_eq!(pipe.advance(), Ok(()));
+
+        assert_eq!(pipe.server_paths.get_mut(0).unwrap().completed_multipath_handshake, true);
+
+
+        // We cannot probe a new path if there are not enough identifiers.
+        assert_eq!(
+            client_addr_2_path.probe_path(&mut pipe.client),
+            Err(Error::OutOfIdentifiers)
+        );
+        
+        let (c_cid, c_reset_token) = testing::create_cid_and_reset_token(16);
+
+        assert_eq!(
+            pipe.client_paths.get_mut(0).unwrap().new_source_cid(&mut pipe.client, &c_cid, c_reset_token, true),
+            Ok(1)
+        );
+        let (s_cid, s_reset_token) = testing::create_cid_and_reset_token(16);
+        assert_eq!(
+            pipe.server_paths.get_mut(0).unwrap().new_source_cid(&pipe.server, &s_cid, s_reset_token, true),
+            Ok(1)
+        );
+
+        // We need to exchange the CIDs first.
+        assert_eq!(
+            client_addr_2_path.probe_path(&mut pipe.client),
+            Err(Error::OutOfIdentifiers)
+        );
+
+        // Let exchange packets over the connection.
+        assert_eq!(pipe.advance(), Ok(()));
+        
+        assert_eq!(pipe.server_paths.get_mut(0).unwrap().available_dcids(&pipe.server), 1);
+        assert_eq!(pipe.server_paths.get_mut(0).unwrap().path_event_next(), None);
+        assert_eq!(pipe.client_paths.get_mut(0).unwrap().available_dcids(&pipe.client), 1);
+        assert_eq!(pipe.client_paths.get_mut(0).unwrap().path_event_next(), None);
+        
+        // Now the path probing can work.
+        assert_eq!(client_addr_2_path.probe_path(&mut pipe.client), Ok(1));
+        pipe.client_paths.insert(client_addr_2_path);
+
+        let mut server_client_addr_2_path = 
+            MulticorePath::default(&config, true, server_addr,  client_addr_2);
+
+        // But the server cannot probe a yet-unseen path.
+        assert_eq!(
+            server_client_addr_2_path.probe_path(&mut pipe.server),
+            Err(Error::InvalidState),
+        );
+
+        pipe.server_paths.insert(server_client_addr_2_path);
+        
+        assert_eq!(pipe.advance(), Ok(()));
+        
+        // The path should be validated at some point.
+        assert_eq!(
+            pipe.client_paths.get_mut(1).unwrap().path_event_next(),
+            Some(PathEvent::Validated(client_addr_2, server_addr)),
+        );
+        
+        assert_eq!(pipe.client_paths.get_mut(1).unwrap().path_event_next(), None);
+        
+        // The server should be notified of this new path.
+        assert_eq!(
+            pipe.server_paths.get_mut(1).unwrap().path_event_next(),
+            Some(PathEvent::New(server_addr, client_addr_2)),
+        );
+
+        assert_eq!(
+            pipe.server_paths.get_mut(1).unwrap().path_event_next(),
+            Some(PathEvent::Validated(server_addr, client_addr_2)),
+        );
+        assert_eq!(pipe.server_paths.get_mut(1).unwrap().path_event_next(), None);
+        
+        // The server can later probe the path again.
+        assert_eq!(pipe.server_paths.get_mut(1).unwrap().probe_path(&mut pipe.server), Ok(1));
+        
+        // This should not trigger any event at client side.
+        assert_eq!(pipe.client_paths.get_mut(0).unwrap().path_event_next(), None);
+        assert_eq!(pipe.client_paths.get_mut(1).unwrap().path_event_next(), None);
+        assert_eq!(pipe.server_paths.get_mut(0).unwrap().path_event_next(), None);
+        assert_eq!(pipe.server_paths.get_mut(1).unwrap().path_event_next(), None);
+
     }
 
     #[test]
@@ -25335,10 +26095,10 @@ mod multicore_tests {
     }
 
     #[test]
-    fn flow_control_limit() {
+    fn multipath_flow_control_limit() {
         let mut buf = [0; 65535];
 
-        let mut pipe = multicore_testing::Pipe::new().unwrap();
+        let mut pipe = multicore_testing::Pipe::multipath_new().unwrap();
         assert_eq!(pipe.handshake(), Ok(()));
 
         let frames = [
@@ -25362,7 +26122,6 @@ mod multicore_tests {
             Err(Error::FlowControl),
         );
     }
-
 
     #[test_log::test]
     fn flow_control_update() {
@@ -25417,6 +26176,8 @@ mod multicore_tests {
                 max: 30
             })
         );
+
+        assert_eq!(iter.next(), Some(&frame::Frame::MaxData { max: 61 }));
     }
 
      // Utility function.
@@ -25533,7 +26294,7 @@ mod multicore_tests {
             pipe.client_paths.get_mut(1).unwrap().path_event_next(),
             Some(PathEvent::Validated(client_addr_2, server_addr)),
         );
-
+        
         assert_eq!(pipe.client_paths.get_mut(1).unwrap().path_event_next(), None);
 
         assert_eq!(pipe.client_paths.get_mut(0).unwrap().get_inner_path().unwrap().active(), true);
@@ -25574,30 +26335,154 @@ mod multicore_tests {
         assert_eq!(rcv_data, 12000);
 
         let stats = pipe.server_paths.get_mut(0).unwrap().get_inner_path().unwrap().stats();
-        assert_eq!(
-            stats.cwnd,
-            stats.cwnd_available
+        assert!(
+            stats.cwnd_available >=
+            12000
         );
         let stats = pipe.server_paths.get_mut(1).unwrap().get_inner_path().unwrap().stats();
-        assert_eq!(
-            stats.cwnd,
-            stats.cwnd_available
+        assert!(
+            stats.cwnd_available >=
+            12000
         );
         let stats = pipe.client_paths.get_mut(0).unwrap().get_inner_path().unwrap().stats();
-        assert_eq!(
-            stats.cwnd,
-            stats.cwnd_available
+        assert!(
+            stats.cwnd_available >= 
+            12000
         );
         let stats = pipe.client_paths.get_mut(1).unwrap().get_inner_path().unwrap().stats();
-        assert_eq!(
-            stats.cwnd,
-            stats.cwnd_available
+        assert!(
+            stats.cwnd_available >=
+            12000
         );
 
         // TODO multicore handle in path abandon while connection is active
     }
 
+    #[test_log::test]
+    fn multipath_flow_control_update(){
+        let mut config = Config::new(crate::PROTOCOL_VERSION).unwrap();
+        config
+            .load_cert_chain_from_pem_file("examples/cert.crt")
+            .unwrap();
+        config
+            .load_priv_key_from_pem_file("examples/cert.key")
+            .unwrap();
+        config
+            .set_application_protos(&[b"proto1", b"proto2"])
+            .unwrap();
+        config.verify_peer(false);
+        config.set_active_connection_id_limit(3);
+        config.set_initial_max_data(6000);
+        config.set_initial_max_stream_data_uni(6000);
+        config.set_initial_max_streams_uni(2);
+        // To test with enabled datagrams.
+        config.enable_dgram(true, 10, 10);
+        config.set_multipath(true);
 
+        let initial_per_path_congestion_window = config.max_send_udp_payload_size * config.initial_congestion_window_packets;
+
+        let mut pipe = pipe_with_exchanged_cids(&mut config, 16, 16, 1);
+        assert_eq!(pipe.client.read().unwrap().multipath, true);
+        assert_eq!(pipe.server.read().unwrap().multipath, true);
+
+        //let client_addr = testing::Pipe::client_addr();
+        let server_addr = testing::Pipe::server_addr();
+        let client_addr_2 = "127.0.0.1:5678".parse().unwrap();
+
+        let mut client_addr_2_path = MulticorePath::default(&config, false, client_addr_2, server_addr);
+        assert_eq!(client_addr_2_path.probe_path(&mut pipe.client), Ok(1));
+        pipe.client_paths.insert(client_addr_2_path);
+
+        let server_client_addr_2_path = 
+            MulticorePath::default(&config, true, server_addr,  client_addr_2);
+        pipe.server_paths.insert(server_client_addr_2_path);
+
+        assert_eq!(pipe.advance(), Ok(()));
+        assert_eq!(
+            pipe.client_paths.get_mut(1).unwrap().path_event_next(),
+            Some(PathEvent::Validated(client_addr_2, server_addr)),
+        );
+        assert_eq!(
+            pipe.client_paths.get_mut(1).unwrap().set_active(true), 
+            Ok(())
+        );
+
+        assert_eq!(
+            pipe.server_paths.get_mut(1).unwrap().path_event_next(),
+            Some(PathEvent::New(server_addr, client_addr_2)),
+        );
+
+        pipe.server_paths.get_mut(1).unwrap().probe_path(&pipe.server).ok();
+        assert_eq!(pipe.advance(), Ok(()));
+
+        assert_eq!(
+            pipe.server_paths.get_mut(1).unwrap().path_event_next(), 
+            Some(PathEvent::Validated(server_addr, client_addr_2)),
+        );
+
+        assert_eq!(
+            pipe.server_paths.get_mut(1).unwrap().set_active(true), 
+            Ok(())
+        );
+
+        assert_eq!(pipe.client_paths.get_mut(1).unwrap().path_event_next(), None);
+
+        assert_eq!(pipe.server.read().unwrap().nb_of_paths(), 2);
+        assert_eq!(pipe.client.read().unwrap().nb_of_paths(), 2);
+
+        // Flush the ACK_MP on the newly active path.
+        assert_eq!(pipe.advance(), Ok(()));
+
+        const DATA_BYTES: usize = 24000;
+        let buf = [42; DATA_BYTES];
+        let mut recv_buf = [0; DATA_BYTES];
+        assert_eq!(initial_per_path_congestion_window * 2, DATA_BYTES);
+        
+        assert_eq!(pipe.server_paths.get_mut(0).unwrap().tx_cap, 6000);
+        assert_eq!(pipe.server_paths.get_mut(1).unwrap().tx_cap, 6000);
+
+        assert_eq!(pipe.server_paths.get_mut(0).unwrap().stream_send(&mut pipe.server, 3, &buf[..12000], false), Ok(6000));
+        assert_eq!(pipe.server_paths.get_mut(1).unwrap().stream_send(&mut pipe.server, 7, &buf[12000..], false), Ok(6000));
+        
+        assert_eq!(pipe.advance(), Ok(()));
+
+        let (rcv_data, fin) = pipe.client_paths.get_mut(0).unwrap().stream_recv(&mut pipe.client, 3, &mut recv_buf).unwrap();
+        assert_eq!(fin, false);
+        assert_eq!(rcv_data, 6000);
+        
+        let (rcv_data, fin) = pipe.client_paths.get_mut(1).unwrap().stream_recv(&mut pipe.client, 7, &mut recv_buf).unwrap();
+        assert_eq!(fin, false);
+        assert_eq!(rcv_data, 6000);
+
+        assert_eq!(pipe.server_paths.get_mut(0).unwrap().tx_cap, 0);
+        assert_eq!(pipe.server_paths.get_mut(1).unwrap().tx_cap, 0);
+
+        assert_eq!(pipe.advance(), Ok(()));
+
+        assert_eq!(pipe.server_paths.get_mut(0).unwrap().stream_send(&mut pipe.server, 3, &buf[..], true), Ok(6000));
+        assert_eq!(pipe.server_paths.get_mut(1).unwrap().stream_send(&mut pipe.server, 7, &buf[..], true), Ok(6000));
+        
+        assert_eq!(pipe.advance(), Ok(()));
+
+        let (rcv_data, fin) = pipe.client_paths.get_mut(0).unwrap().stream_recv(&mut pipe.client, 3, &mut recv_buf).unwrap();
+        assert_eq!(fin, false);
+        assert_eq!(rcv_data, 6000);
+        
+        let (rcv_data, fin) = pipe.client_paths.get_mut(1).unwrap().stream_recv(&mut pipe.client, 7, &mut recv_buf).unwrap();
+        assert_eq!(fin, false);
+        assert_eq!(rcv_data, 6000);
+
+        assert_eq!(pipe.advance(), Ok(()));
+
+        assert_eq!(pipe.client_paths.get_mut(0).unwrap().stream_recv(&mut pipe.client, 3, &mut recv_buf), Err(Error::Done));
+        assert_eq!(pipe.client_paths.get_mut(1).unwrap().stream_recv(&mut pipe.client, 7, &mut recv_buf), Err(Error::Done));
+
+        assert_eq!(pipe.advance(), Ok(()));
+        
+        assert!(pipe.server_paths.get_mut(0).unwrap().tx_cap >= 6000);
+        assert!(pipe.server_paths.get_mut(1).unwrap().tx_cap >= 6000);
+
+    }
 }
 
 pub use crate::packet::ConnectionId;

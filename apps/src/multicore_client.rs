@@ -90,8 +90,7 @@ fn write_packets_on_socket(
 
             Err(e) => {
                 error!("{} -> {}: send failed: {:?}", local_addr, peer_addr, e);
-                let mut conn = conn_guard.write().unwrap();
-                conn.close(false, 0x1, b"fail").ok();
+                path.close_connection(&conn_guard, false, 0x1, b"fail").ok();
                 break;
             },
         };
@@ -281,7 +280,6 @@ fn client_thread(
 
         if initiate_connection && !scid_sent {
             // TODO multicore retired scid
-
             while path.source_cids_left(&conn_guard) > 0 {
                 let (scid, reset_token) = generate_cid_and_reset_token(&rng);
                 if path.new_source_cid(&conn_guard, &scid, reset_token, false).is_err() {
@@ -320,8 +318,7 @@ fn client_thread(
             }
         } else if nb_active_paths == 1 && can_close_conn && !requested_conn_close
         {
-            let mut conn = conn_guard.write().unwrap();
-            conn.close(true, 0, b"").unwrap();
+            path.close_connection(&conn_guard, true, 0, b"").unwrap();
             requested_conn_close = true;
         }
     }

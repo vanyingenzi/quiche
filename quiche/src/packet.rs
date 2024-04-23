@@ -863,7 +863,7 @@ pub struct KeyUpdate {
     pub timer: time::Instant,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct PktNumSpace {
     pub largest_rx_pkt_num: u64,
 
@@ -977,7 +977,7 @@ impl fmt::Debug for PktNumSpaceCrypto {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct PktNumSpaceImplMap {
     pkt_num_spaces: [PktNumSpace; Epoch::Application as usize],
     application_pkt_num_spaces: BTreeMap<u64, PktNumSpace>,
@@ -1131,7 +1131,7 @@ impl PktNumSpaceMap {
     }
 }
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, Debug)]
 pub struct PktNumWindow {
     lower: u64,
     window: u128,

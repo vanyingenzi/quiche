@@ -1,8 +1,8 @@
 #!/bin/bash
 
 RUST_PLATFORM="x86_64-unknown-linux-gnu"
-FILE_SIZE=1
-NB_RUNS=10
+FILE_SIZE=2
+NB_RUNS=5
 
 RED='\033[0;31m'
 RESET='\033[0m'
@@ -55,21 +55,21 @@ mcmpquic_iteration_loop() {
         sudo pkill quiche-server
         sudo fuser -k 4433/udp
 
-        RUST_LOG=info ../target/release/quiche-server \
+        ../target/release/quiche-server \
             --root "${ROOT_DIR}" \
             --key "$(pwd)/src/bin/cert.key" \
             --cert "$(pwd)/src/bin/cert.crt" \
             --multicore-transfer ${FILESIZE_BYTES} \
-            --multipath --multicore 1>server.logs 2>&1 &
+            --multipath --multicore 1>/dev/null 2>&1 &
         server_pid=$!
 
         # Run client
         start=$(date +%s.%N)
-        RUST_LOG=info ../target/release/quiche-client \
+        ../target/release/quiche-client \
             "https://127.0.0.1:4433" \
             -A 127.0.0.1:${client_port_1} \
             -A 127.0.0.1:${client_port_2} \
-            --multipath --multicore --no-verify --wire-version 1 1>/dev/null 2>client.logs
+            --multipath --multicore --no-verify --wire-version 1 1>/dev/null 2>&1
         error_code=$?
         end=$(date +%s.%N)
         if [ $error_code -ne 0 ]; then
@@ -96,6 +96,8 @@ mpquic_iteration_loop() {
 
         # Run server
         sudo pkill quiche-server
+        sudo fuser -k 4433/udp
+        
         ../target/release/quiche-server \
             --root "${ROOT_DIR}" \
             --key "$(pwd)/src/bin/cert.key" \
