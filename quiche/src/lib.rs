@@ -11233,6 +11233,15 @@ impl MulticorePath {
         Ok((pkt_type, written))
     }
 
+    /// Sets expected peer addr
+    pub fn set_peer_addr(&mut self, peer_addr: SocketAddr) -> Result<()> {
+        if self.inner_path.is_some(){
+            return Err(Error::MulticoreNotDone); // This is too late to do do
+        }
+        self.peer_addr = peer_addr;
+        Ok(())
+    }
+    
     fn reduced_max_send_udp_payload_size(&self) -> usize {
         if self.get_inner_path().unwrap().active(){
             let max_datagram_size = self.get_inner_path().unwrap().recovery.max_datagram_size();

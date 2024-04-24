@@ -326,7 +326,7 @@ fn client_thread(
 }
 
 pub fn multicore_connect(
-    args: ClientArgs, conn_args: CommonArgs,
+    args: ClientArgs, common_args: CommonArgs,
     _output_sink: impl FnMut(String) + 'static,
 ) -> Result<(), ClientError> {
     // We'll only connect to the first server provided in URL list.
@@ -340,7 +340,7 @@ pub fn multicore_connect(
     };
 
     let (sockets_addrs, local_addr) =
-        multicore_prepare_addresses(&peer_addr, &args);
+        multicore_prepare_addresses(&peer_addr, &args, &common_args);
 
     let mut addrs = Vec::with_capacity(sockets_addrs.len());
     addrs.push(local_addr);
@@ -352,13 +352,13 @@ pub fn multicore_connect(
 
     // Warn the user if there are more usable addresses than the advertised
     // `active_connection_id_limit`.
-    if addrs.len() as u64 > conn_args.max_active_cids {
+    if addrs.len() as u64 > common_args.max_active_cids {
         warn!(
             "{} addresses provided, but configuration restricts to at most {} \
                active CIDs; increase the --max-active-cids parameter to use all \
                the provided addresses",
             addrs.len(),
-            conn_args.max_active_cids
+            common_args.max_active_cids
         );
     }
 
@@ -378,23 +378,23 @@ pub fn multicore_connect(
         config.verify_peer(!args.no_verify);
     }
 
-    config.set_application_protos(&conn_args.alpns).unwrap();
+    config.set_application_protos(&common_args.alpns).unwrap();
 
-    config.set_max_idle_timeout(conn_args.idle_timeout);
+    config.set_max_idle_timeout(common_args.idle_timeout);
     config.set_max_recv_udp_payload_size(MAX_DATAGRAM_SIZE);
     config.set_max_send_udp_payload_size(MAX_DATAGRAM_SIZE);
-    config.set_initial_max_data(conn_args.max_data);
-    config.set_initial_max_stream_data_bidi_local(conn_args.max_stream_data);
-    config.set_initial_max_stream_data_bidi_remote(conn_args.max_stream_data);
-    config.set_initial_max_stream_data_uni(conn_args.max_stream_data);
-    config.set_initial_max_streams_bidi(conn_args.max_streams_bidi);
-    config.set_initial_max_streams_uni(conn_args.max_streams_uni);
-    config.set_disable_active_migration(!conn_args.enable_active_migration);
-    config.set_active_connection_id_limit(conn_args.max_active_cids);
-    config.set_multipath(conn_args.multipath);
+    config.set_initial_max_data(common_args.max_data);
+    config.set_initial_max_stream_data_bidi_local(common_args.max_stream_data);
+    config.set_initial_max_stream_data_bidi_remote(common_args.max_stream_data);
+    config.set_initial_max_stream_data_uni(common_args.max_stream_data);
+    config.set_initial_max_streams_bidi(common_args.max_streams_bidi);
+    config.set_initial_max_streams_uni(common_args.max_streams_uni);
+    config.set_disable_active_migration(!common_args.enable_active_migration);
+    config.set_active_connection_id_limit(common_args.max_active_cids);
+    config.set_multipath(common_args.multipath);
 
-    config.set_max_connection_window(conn_args.max_window);
-    config.set_max_stream_window(conn_args.max_stream_window);
+    config.set_max_connection_window(common_args.max_window);
+    config.set_max_stream_window(common_args.max_stream_window);
 
     let mut keylog = None;
 
@@ -410,23 +410,23 @@ pub fn multicore_connect(
         config.log_keys();
     }
 
-    if conn_args.no_grease {
+    if common_args.no_grease {
         config.grease(false);
     }
 
-    if conn_args.early_data {
+    if common_args.early_data {
         config.enable_early_data();
     }
 
     config
-        .set_cc_algorithm_name(&conn_args.cc_algorithm)
+        .set_cc_algorithm_name(&common_args.cc_algorithm)
         .unwrap();
 
-    if conn_args.disable_hystart {
+    if common_args.disable_hystart {
         config.enable_hystart(false);
     }
 
-    if conn_args.dgrams_enabled {
+    if common_args.dgrams_enabled {
         config.enable_dgram(true, 1000, 1000);
     }
 
@@ -465,7 +465,7 @@ pub fn multicore_connect(
     let conn_guard = Arc::new(RwLock::new(conn));
     let mut threads_join = Vec::new();
     let cloned_conn_guard = conn_guard.clone();
-    let multipath_requested = conn_args.multipath;
+    let multipath_requested = common_args.multipath;
     let (tx, rx) = channel();
     let active_threads = sockets_addrs.len();
     threads_join.push(thread::spawn(move || {
@@ -514,7 +514,7 @@ pub fn multicore_connect(
 }
 
 fn multicore_prepare_addresses(
-    peer_addr: &std::net::SocketAddr, args: &ClientArgs,
+    peer_addr: &std::net::SocketAddr, args: &ClientArgs, common_args: &CommonArgs
 ) -> (
     Vec<(std::net::SocketAddr, std::net::SocketAddr)>,
     std::net::SocketAddr,
@@ -522,10 +522,16 @@ fn multicore_prepare_addresses(
     use std::str::FromStr;
     let mut local_tuples = vec![];
     let mut first_local_addr: Option<std::net::SocketAddr> = None;
+    let mut peer_tuples = vec![];
+
+    info!("server addresses: {:?}", common_args.server_addresses);
+
+    if args.addrs.len() != common_args.server_addresses.len() {
+        panic!("Clients addrs are not equal to server addresses");
+    }
 
     for src_addr in args.addrs.iter().filter(|sa| {
-        (sa.is_ipv4() && peer_addr.is_ipv4())
-            || (sa.is_ipv6() && peer_addr.is_ipv6())
+        sa.is_ipv4() || sa.is_ipv6()
     }) {
         local_tuples.push(src_addr.clone());
         if first_local_addr.is_none() {
@@ -533,11 +539,16 @@ fn multicore_prepare_addresses(
         }
     }
 
+    for dst_addr in common_args.server_addresses.iter().filter(|a| {
+        a.is_ipv4() || a.is_ipv6()
+    }) {
+        peer_tuples.push(dst_addr.clone());
+    }
+
     let mut tuples = vec![];
-    let mut peer_addr = peer_addr.clone();
-    for src in local_tuples {
-        tuples.push((src, peer_addr));
-        peer_addr = increment_port(peer_addr);
+
+    for i in 0..local_tuples.len(){
+        tuples.push((local_tuples[i], peer_tuples[i]));
     }
 
     // If there is no such address, rely on the default INADDR_IN or IN6ADDR_ANY

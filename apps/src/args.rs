@@ -60,7 +60,8 @@ pub struct CommonArgs {
     pub initial_cwnd_packets: u64,
     pub multipath: bool,
     pub multicore: bool, // ! [Under development]
-    pub cpu_affinity: bool // ! [Under development]
+    pub cpu_affinity: bool, // ! [Under development]
+    pub server_addresses: Vec<SocketAddr>,
 }
 
 /// Creates a new `CommonArgs` structure using the provided [`Docopt`].
@@ -211,6 +212,11 @@ impl Args for CommonArgs {
         let multipath = args.get_bool("--multipath");
         let multicore = args.get_bool("--multicore");
         let cpu_affinity = args.get_bool("--cpu-affinity");
+        let server_addresses = args
+            .get_vec("--server-address")
+            .into_iter()
+            .filter_map(|a| a.parse().ok())
+            .collect();
 
         CommonArgs {
             alpns,
@@ -237,7 +243,8 @@ impl Args for CommonArgs {
             initial_cwnd_packets,
             multipath,
             multicore,
-            cpu_affinity
+            cpu_affinity,
+            server_addresses
         }
     }
 }
@@ -269,7 +276,8 @@ impl Default for CommonArgs {
             initial_cwnd_packets: 10,
             multipath: false,
             multicore: false,
-            cpu_affinity: false
+            cpu_affinity: false, 
+            server_addresses: vec![]
         }
     }
 }
@@ -310,6 +318,7 @@ Options:
   --multipath              Enable multipath support.
   --multicore              Enable multicore support. [Under development]
   --cpu-affinity           CPU affinity. [Under development]
+  --server-address ADDR ...    Specify the server addresses.
   -A --address ADDR ...    Specify addresses to be used instead of the unspecified address. Non-routable addresses will lead to connectivity issues.
   -R --rm-addr TIMEADDR ...   Specify addresses to stop using after the provided time (format time,addr).
   -S --status TIMEADDRSTAT ...   Specify availability status to advertise to the peer after the provided time (format time,addr,available).
@@ -560,6 +569,7 @@ Options:
   --multipath                 Enable multipath support.
   --multicore                 Enable multicore support. [Under development]
   --cpu-affinity              CPU affinity. [Under development]
+  --server-address ADDR ...    Specify the server addresses.
   --multicore-transfer BYTES  The bytes to send. [Under development]
   -h --help                   Show this screen.
 ";

@@ -59,17 +59,20 @@ mcmpquic_iteration_loop() {
             --root "${ROOT_DIR}" \
             --key "$(pwd)/src/bin/cert.key" \
             --cert "$(pwd)/src/bin/cert.crt" \
+            --server-address 127.0.0.2:3344 \
             --multicore-transfer ${FILESIZE_BYTES} \
             --multipath --multicore 1>/dev/null 2>&1 &
         server_pid=$!
 
         # Run client
         start=$(date +%s.%N)
-        ../target/release/quiche-client \
+        RUST_BACKTRACE=1 ../target/release/quiche-client \
             "https://127.0.0.1:4433" \
             -A 127.0.0.1:${client_port_1} \
             -A 127.0.0.1:${client_port_2} \
-            --multipath --multicore --no-verify --wire-version 1 1>/dev/null 2>&1
+            --server-address 127.0.0.1:4433 \
+            --server-address 127.0.0.2:3344 \
+            --multipath --multicore --no-verify --wire-version 1 1>/dev/null
         error_code=$?
         end=$(date +%s.%N)
         if [ $error_code -ne 0 ]; then

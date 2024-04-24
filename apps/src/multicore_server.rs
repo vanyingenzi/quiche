@@ -40,10 +40,9 @@ fn server_thread(
     );
 
     info!(
-        "[Server Thread] Thread ID : {:?} Started with path {:?} <-> {:?}",
+        "[Server Thread] Thread ID : {:?} Started with path {:?}",
         thread::current().id(),
-        local_addr,
-        peer_addr
+        local_addr
     );
 
     // All the followings are one time flags. They switch from false to true
@@ -63,6 +62,7 @@ fn server_thread(
     let mut nb_active_paths = nb_initiated_paths;
     let mut can_close_conn = false;
     let mut scid_sent = false;
+    let mut has_set_peer_addr = rx_finish_channel.is_some();
     let rng = SystemRandom::new();
 
     loop {
@@ -111,6 +111,11 @@ fn server_thread(
                 to: local_addr,
                 from,
             };
+
+            if !has_set_peer_addr{
+                path.set_peer_addr(from).unwrap();
+                has_set_peer_addr = true;
+            }
 
             // Process potentially coalesced packets.
             let read = match path.recv(&client.conn, &mut buf[..len], recv_info) {
@@ -353,7 +358,7 @@ fn server_thread(
     }
 }
 
-pub fn multicore_start_server(args: ServerArgs, conn_args: CommonArgs) {
+pub fn multicore_start_server(args: ServerArgs, common_args: CommonArgs) {
     env_logger::builder()
         .default_format_timestamp_nanos(true)
         .init();
@@ -391,26 +396,26 @@ pub fn multicore_start_server(args: ServerArgs, conn_args: CommonArgs) {
     config.load_cert_chain_from_pem_file(&args.cert).unwrap();
     config.load_priv_key_from_pem_file(&args.key).unwrap();
 
-    config.set_application_protos(&conn_args.alpns).unwrap();
+    config.set_application_protos(&common_args.alpns).unwrap();
 
-    config.set_max_idle_timeout(conn_args.idle_timeout);
+    config.set_max_idle_timeout(common_args.idle_timeout);
     config.set_max_recv_udp_payload_size(max_datagram_size);
     config.set_max_send_udp_payload_size(max_datagram_size);
-    config.set_initial_max_data(conn_args.max_data);
-    config.set_initial_max_stream_data_bidi_local(conn_args.max_stream_data);
-    config.set_initial_max_stream_data_bidi_remote(conn_args.max_stream_data);
-    config.set_initial_max_stream_data_uni(conn_args.max_stream_data);
-    config.set_initial_max_streams_bidi(conn_args.max_streams_bidi);
-    config.set_initial_max_streams_uni(conn_args.max_streams_uni);
-    config.set_disable_active_migration(!conn_args.enable_active_migration);
-    config.set_active_connection_id_limit(conn_args.max_active_cids);
+    config.set_initial_max_data(common_args.max_data);
+    config.set_initial_max_stream_data_bidi_local(common_args.max_stream_data);
+    config.set_initial_max_stream_data_bidi_remote(common_args.max_stream_data);
+    config.set_initial_max_stream_data_uni(common_args.max_stream_data);
+    config.set_initial_max_streams_bidi(common_args.max_streams_bidi);
+    config.set_initial_max_streams_uni(common_args.max_streams_uni);
+    config.set_disable_active_migration(!common_args.enable_active_migration);
+    config.set_active_connection_id_limit(common_args.max_active_cids);
     config.set_initial_congestion_window_packets(
-        usize::try_from(conn_args.initial_cwnd_packets).unwrap(),
+        usize::try_from(common_args.initial_cwnd_packets).unwrap(),
     );
-    config.set_multipath(conn_args.multipath);
+    config.set_multipath(common_args.multipath);
 
-    config.set_max_connection_window(conn_args.max_window);
-    config.set_max_stream_window(conn_args.max_stream_window);
+    config.set_max_connection_window(common_args.max_window);
+    config.set_max_stream_window(common_args.max_stream_window);
 
     config.enable_pacing(pacing);
 
@@ -428,23 +433,23 @@ pub fn multicore_start_server(args: ServerArgs, conn_args: CommonArgs) {
         config.log_keys();
     }
 
-    if conn_args.early_data {
+    if common_args.early_data {
         config.enable_early_data();
     }
 
-    if conn_args.no_grease {
+    if common_args.no_grease {
         config.grease(false);
     }
 
     config
-        .set_cc_algorithm_name(&conn_args.cc_algorithm)
+        .set_cc_algorithm_name(&common_args.cc_algorithm)
         .unwrap();
 
-    if conn_args.disable_hystart {
+    if common_args.disable_hystart {
         config.enable_hystart(false);
     }
 
-    if conn_args.dgrams_enabled {
+    if common_args.dgrams_enabled {
         config.enable_dgram(true, 1000, 1000);
     }
 
@@ -466,7 +471,6 @@ pub fn multicore_start_server(args: ServerArgs, conn_args: CommonArgs) {
         let nb_initiated_paths = 2; // Hard coded
         let clone_client_arc = client.clone();
 
-        let local_addr = init_path.local_addr();
         let peer_addr = init_path.peer_addr();
 
         let mut joins = Vec::new();
@@ -481,22 +485,31 @@ pub fn multicore_start_server(args: ServerArgs, conn_args: CommonArgs) {
             )
         }));
 
-        let new_local_addr = increment_port(local_addr);
-        let new_peer_addr = increment_port(peer_addr);
-        let additional_path =
-            MulticorePath::default(&config, true, new_local_addr, new_peer_addr);
-        let copied_args = args.clone();
+        for local in common_args.server_addresses.iter() {
+            if *local == local_addr {
+                continue;
+            }
+            let additional_path = MulticorePath::default(
+                &config,
+                true,
+                *local,
+                peer_addr,
+            );
+            let copied_args = args.clone();
+            let cloned_client = client.clone();
+            let tx_clone = tx.clone();
 
-        joins.push(thread::spawn(move || {
-            server_thread(
-                client,
-                additional_path,
-                copied_args,
-                nb_initiated_paths,
-                Some(tx),
-                None,
-            )
-        }));
+            joins.push(thread::spawn(move || {
+                server_thread(
+                    cloned_client,
+                    additional_path,
+                    copied_args,
+                    nb_initiated_paths,
+                    Some(tx_clone),
+                    None,
+                )
+            }));
+        }
 
         for join_handle in joins {
             match join_handle.join() {
