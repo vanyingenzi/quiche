@@ -56,6 +56,7 @@ fn multicore_initiate_connection(
     let (write, send_info) = path
         .send_on_path(conn_guard, out)
         .expect("initial send failed");
+    
     while let Err(e) = socket.send_to(&out[..write], send_info.to) {
         if e.kind() == std::io::ErrorKind::WouldBlock {
             trace!(
@@ -506,6 +507,7 @@ pub fn multicore_connect(
             Ok(..) => {},
             Err(e) => {
                 error!("Join return: error {:?}", e);
+                return Err(ClientError::Other("Error in thread".into()));
             },
         }
     }

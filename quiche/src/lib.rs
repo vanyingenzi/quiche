@@ -8829,7 +8829,7 @@ impl MulticorePath {
     pub fn available_dcids(
         &self,        
         conn_guard: &Arc<RwLock<MulticoreConnection>>,
-    ) -> usize {        
+    ) -> usize {
         conn_guard.read().unwrap().ids.available_dcids()
     }
 
@@ -8842,8 +8842,7 @@ impl MulticorePath {
             self.peer_transport_params.active_conn_id_limit,
             self.local_transport_params.active_conn_id_limit,
         ) as usize;
-        let conn = conn_guard.read().unwrap();
-        max_active_source_cids - conn.ids.active_source_cids()
+        max_active_source_cids - conn_guard.read().unwrap().ids.active_source_cids()
     }
 
     /// New source id
@@ -10113,7 +10112,7 @@ impl MulticorePath {
             .as_ref()
             .map_or(false, |conn_err| !conn_err.is_app)
         {
-            // TODO multicore remove as this server as a checker
+            // TODO multicore
             let conn = conn_guard.read().unwrap();
             let epoch = match conn.handshake.write_level() {
                 crypto::Level::Initial => unreachable!(),
@@ -10571,7 +10570,7 @@ impl MulticorePath {
             }
         }
 
-        if pkt_type == packet::Type::Short && !is_closing {
+        if pkt_type == packet::Type::Short && !is_closing && reduced_conn.lowest_active_path_id == self.path_id.unwrap() {
             let mut conn = conn_guard.write().unwrap();
             // Create NEW_CONNECTION_ID frames as needed.
             while let Some(seq_num) = conn.ids.next_advertise_new_scid_seq() {
@@ -11687,8 +11686,7 @@ impl MulticorePath {
                 // illegal, since we have no state, but since we ignore the
                 // frame, it should be fine.
                 let stream = {
-                    let mut conn = conn_guard.write().unwrap();
-                    match self.get_or_create_stream(&mut conn, stream_id, false) {
+                    match self.reduced_get_or_create_stream(conn_guard, stream_id, false) {
                         Ok(v) => v,
 
                         Err(Error::Done) => return Ok(()),
@@ -14425,7 +14423,7 @@ impl MulticorePath {
         }
         let now = time::Instant::now();
         let mut conn = conn_guard.write().unwrap();
-
+        
         // TODO multicore do better timeout handling
 
         if let Some(draining_timer) = self.draining_timer {

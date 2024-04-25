@@ -48,8 +48,8 @@ mcmpquic_iteration_loop() {
     local total_runtime=0
     for iter in $(seq 1 ${NB_RUNS}); do
         echo "Benchmarking multicore Multi-Path QUIC [mcMPQUIC] - Iteration $iter"
-        client_port_1=6788
-        client_port_2=6789
+        client_port_1=$(get_unused_port)
+        client_port_2=$(get_unused_port)
 
         # Run server
         sudo pkill quiche-server
@@ -66,13 +66,13 @@ mcmpquic_iteration_loop() {
 
         # Run client
         start=$(date +%s.%N)
-        RUST_BACKTRACE=1 ../target/release/quiche-client \
+        ../target/release/quiche-client \
             "https://127.0.0.1:4433" \
             -A 127.0.0.1:${client_port_1} \
             -A 127.0.0.1:${client_port_2} \
             --server-address 127.0.0.1:4433 \
             --server-address 127.0.0.2:3344 \
-            --multipath --multicore --no-verify --wire-version 1 1>/dev/null
+            --multipath --multicore --no-verify --wire-version 1 1>/dev/null 2>&1
         error_code=$?
         end=$(date +%s.%N)
         if [ $error_code -ne 0 ]; then
@@ -94,8 +94,8 @@ mpquic_iteration_loop() {
     local total_runtime=0
     for iter in $(seq 1 ${NB_RUNS}); do
         echo "Benchmarking Multi-Path QUIC [MPQUIC] - Iteration $iter" >&2
-        client_port_1=6788
-        client_port_2=6789
+        client_port_1=$(get_unused_port)
+        client_port_2=$(get_unused_port)
 
         # Run server
         sudo pkill quiche-server

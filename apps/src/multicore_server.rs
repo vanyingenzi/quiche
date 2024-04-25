@@ -351,7 +351,6 @@ fn server_thread(
             let conn = client.conn.read().unwrap();
             if conn.is_closed() {
                 info!("connection collected {:?}", conn.stats(),);
-
                 return;
             }
         }
