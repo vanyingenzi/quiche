@@ -28,42 +28,33 @@ use crate::args::*;
 use crate::common::*;
 
 use std::collections::HashMap;
-use std::net::ToSocketAddrs;
 
-use std::io::prelude::*;
-use std::rc::Rc;
-use std::cell::RefCell;
 use ring::rand::*;
 use slab::Slab;
+use std::io::prelude::*;
 
 const MAX_DATAGRAM_SIZE: usize = 1350;
 
 pub fn connect(
-    args: ClientArgs, conn_args: CommonArgs,
-    output_sink: impl FnMut(String) + 'static,
+    args: ClientArgs, common_args: CommonArgs,
+    _output_sink: impl FnMut(String) + 'static,
 ) -> Result<(), ClientError> {
     let mut buf = [0; 65535];
     let mut out = [0; MAX_DATAGRAM_SIZE];
-
-    let output_sink =
-        Rc::new(RefCell::new(output_sink)) as Rc<RefCell<dyn FnMut(_)>>;
 
     // Setup the event loop.
     let mut poll = mio::Poll::new().unwrap();
     let mut events = mio::Events::with_capacity(1024);
 
-    // We'll only connect to the first server provided in URL list.
-    let connect_url = &args.urls[0];
-
     // Resolve server address.
     let peer_addr = if let Some(addr) = &args.connect_to {
         addr.parse().expect("--connect-to is expected to be a string containing an IPv4 or IPv6 address with a port. E.g. 192.0.2.0:443")
     } else {
-        connect_url.to_socket_addrs().unwrap().next().unwrap()
+        return Err(ClientError::Other("Can't find the address to connect to".into()));
     };
 
-    let (sockets, src_addr_to_token, local_addr) =
-        create_sockets(&mut poll, &peer_addr, &args);
+    let (sockets, src_addr_to_token, local_addr, token_to_peer_addr) =
+        create_sockets(&mut poll, &peer_addr, &args, &common_args);
     let mut addrs = Vec::with_capacity(sockets.len());
     addrs.push(local_addr);
     for src in src_addr_to_token.keys() {
@@ -74,13 +65,13 @@ pub fn connect(
 
     // Warn the user if there are more usable addresses than the advertised
     // `active_connection_id_limit`.
-    if addrs.len() as u64 > conn_args.max_active_cids {
+    if addrs.len() as u64 > common_args.max_active_cids {
         warn!(
             "{} addresses provided, but configuration restricts to at most {} \
                active CIDs; increase the --max-active-cids parameter to use all \
                the provided addresses",
             addrs.len(),
-            conn_args.max_active_cids
+            common_args.max_active_cids
         );
     }
 
@@ -103,23 +94,23 @@ pub fn connect(
         config.verify_peer(!args.no_verify);
     }
 
-    config.set_application_protos(&conn_args.alpns).unwrap();
+    config.set_application_protos(&common_args.alpns).unwrap();
 
-    config.set_max_idle_timeout(conn_args.idle_timeout);
+    config.set_max_idle_timeout(common_args.idle_timeout);
     config.set_max_recv_udp_payload_size(MAX_DATAGRAM_SIZE);
     config.set_max_send_udp_payload_size(MAX_DATAGRAM_SIZE);
-    config.set_initial_max_data(conn_args.max_data);
-    config.set_initial_max_stream_data_bidi_local(conn_args.max_stream_data);
-    config.set_initial_max_stream_data_bidi_remote(conn_args.max_stream_data);
-    config.set_initial_max_stream_data_uni(conn_args.max_stream_data);
-    config.set_initial_max_streams_bidi(conn_args.max_streams_bidi);
-    config.set_initial_max_streams_uni(conn_args.max_streams_uni);
-    config.set_disable_active_migration(!conn_args.enable_active_migration);
-    config.set_active_connection_id_limit(conn_args.max_active_cids);
-    config.set_multipath(conn_args.multipath);
+    config.set_initial_max_data(common_args.max_data);
+    config.set_initial_max_stream_data_bidi_local(common_args.max_stream_data);
+    config.set_initial_max_stream_data_bidi_remote(common_args.max_stream_data);
+    config.set_initial_max_stream_data_uni(common_args.max_stream_data);
+    config.set_initial_max_streams_bidi(common_args.max_streams_bidi);
+    config.set_initial_max_streams_uni(common_args.max_streams_uni);
+    config.set_disable_active_migration(!common_args.enable_active_migration);
+    config.set_active_connection_id_limit(common_args.max_active_cids);
+    config.set_multipath(common_args.multipath);
 
-    config.set_max_connection_window(conn_args.max_window);
-    config.set_max_stream_window(conn_args.max_stream_window);
+    config.set_max_connection_window(common_args.max_window);
+    config.set_max_stream_window(common_args.max_stream_window);
 
     let mut keylog = None;
 
@@ -135,27 +126,27 @@ pub fn connect(
         config.log_keys();
     }
 
-    if conn_args.no_grease {
+    if common_args.no_grease {
         config.grease(false);
     }
 
-    if conn_args.early_data {
+    if common_args.early_data {
         config.enable_early_data();
     }
 
     config
-        .set_cc_algorithm_name(&conn_args.cc_algorithm)
+        .set_cc_algorithm_name(&common_args.cc_algorithm)
         .unwrap();
 
-    if conn_args.disable_hystart {
+    if common_args.disable_hystart {
         config.enable_hystart(false);
     }
 
-    if conn_args.dgrams_enabled {
+    if common_args.dgrams_enabled {
         config.enable_dgram(true, 1000, 1000);
     }
 
-    let mut http_conn: Option<Box<dyn HttpConn>> = None;
+    let mut app_conn: Option<AdaptedMcMPQUICConnClient> = None;
 
     let mut app_proto_selected = false;
 
@@ -168,7 +159,7 @@ pub fn connect(
 
     // Create a QUIC connection and initiate handshake.
     let mut conn = quiche::connect(
-        connect_url.domain(),
+        Some("quic.tech"),
         &scid,
         local_addr,
         peer_addr,
@@ -251,7 +242,7 @@ pub fn connect(
 
         // Read incoming UDP packets from the socket and feed them to quiche,
         // until there are no more packets to read.
-        for event in &events {  
+        for event in &events {
             let token = event.token().into();
             let socket = &sockets[token];
             let local_addr = socket.local_addr().unwrap();
@@ -275,7 +266,7 @@ pub fn connect(
 
                 trace!("{}: got {} bytes", local_addr, len);
 
-                if let Some(target_path) = conn_args.dump_packet_path.as_ref() {
+                if let Some(target_path) = common_args.dump_packet_path.as_ref() {
                     let path = format!("{target_path}/{pkt_count}.pkt");
 
                     if let Ok(f) = std::fs::File::create(path) {
@@ -329,7 +320,7 @@ pub fn connect(
                 }
             }
 
-            if let Some(h_conn) = http_conn {
+            if let Some(h_conn) = app_conn {
                 if h_conn.report_incomplete(&app_data_start) {
                     return Err(ClientError::HttpFail);
                 }
@@ -340,9 +331,9 @@ pub fn connect(
 
         // Create a new application protocol session once the QUIC connection is
         // established.
-        if (conn.is_established() || conn.is_in_early_data()) &&
-            (!args.perform_migration || migrated) &&
-            !app_proto_selected
+        if (conn.is_established() || conn.is_in_early_data())
+            && (!args.perform_migration || migrated)
+            && !app_proto_selected
         {
             // At this stage the ALPN negotiation succeeded and selected a
             // single application protocol name. We'll use this to construct
@@ -354,50 +345,37 @@ pub fn connect(
 
             let app_proto = conn.application_proto();
 
-            if alpns::HTTP_09.contains(&app_proto) {
-                http_conn = Some(Http09Conn::with_urls(
-                    &args.urls,
-                    args.reqs_cardinal,
-                    Rc::clone(&output_sink),
-                ));
-
+            if alpns::MMPQUIC.contains(&app_proto) {
+                app_conn = Some(AdaptedMcMPQUICConnClient::new());
                 app_proto_selected = true;
-            } else if alpns::HTTP_3.contains(&app_proto) {
-                let dgram_sender = if conn_args.dgrams_enabled {
-                    Some(Http3DgramSender::new(
-                        conn_args.dgram_count,
-                        conn_args.dgram_data.clone(),
-                        0,
-                    ))
-                } else {
-                    None
-                };
+                info!("proto selected");
+            } else {
+                error!("App protocol not mcMPQUIC !");
+                match conn.close(true, 0, b"APLN not mMPQUIC".as_slice()) {
+                    // Already closed.
+                    Ok(_) | Err(quiche::Error::Done) => (),
 
-                http_conn = Some(Http3Conn::with_urls(
-                    &mut conn,
-                    &args.urls,
-                    args.reqs_cardinal,
-                    &args.req_headers,
-                    &args.body,
-                    &args.method,
-                    args.send_priority_update,
-                    conn_args.max_field_section_size,
-                    conn_args.qpack_max_table_capacity,
-                    conn_args.qpack_blocked_streams,
-                    args.dump_json,
-                    dgram_sender,
-                    Rc::clone(&output_sink),
-                ));
-
-                app_proto_selected = true;
+                    Err(e) => panic!("error closing conn: {:?}", e),
+                }
             }
         }
 
         // If we have an HTTP connection, first issue the requests then
         // process received data.
-        if let Some(h_conn) = http_conn.as_mut() {
-            h_conn.send_requests(&mut conn, &args.dump_response_path);
-            h_conn.handle_responses(&mut conn, &mut buf, &app_data_start);
+        if let Some(h_conn) = app_conn.as_mut() {
+            if h_conn.recv(&mut conn, &mut buf) {
+                info!(
+                    "receieved in {:?} app_conn: {:?}",
+                    app_data_start.elapsed(),
+                    h_conn
+                );
+                match conn.close(true, 0, b"") {
+                    // Already closed.
+                    Ok(_) | Err(quiche::Error::Done) => (),
+
+                    Err(e) => panic!("error closing conn: {:?}", e),
+                }
+            }
         }
 
         // Handle path events.
@@ -465,19 +443,23 @@ pub fn connect(
             scid_sent = true;
         }
 
-        if conn_args.multipath &&
-            probed_paths < addrs.len() &&
-            conn.available_dcids() > 0 &&
-            conn.probe_path(addrs[probed_paths], peer_addr).is_ok()
+        if common_args.multipath
+            && probed_paths < addrs.len()
+            && conn.available_dcids() > 0
         {
-            probed_paths += 1;
+            let addr_to_probe = addrs[probed_paths];
+            let token = src_addr_to_token.get(&addr_to_probe).unwrap();
+            let peer_addr_to_probe = token_to_peer_addr.get(&token).unwrap();
+            if conn.probe_path(addrs[probed_paths], *peer_addr_to_probe).is_ok() {
+                probed_paths += 1;
+            }
         }
 
-        if !conn_args.multipath &&
-            args.perform_migration &&
-            !new_path_probed &&
-            scid_sent &&
-            conn.available_dcids() > 0
+        if !common_args.multipath
+            && args.perform_migration
+            && !new_path_probed
+            && scid_sent
+            && conn.available_dcids() > 0
         {
             let additional_local_addr = sockets[1].local_addr().unwrap();
             conn.probe_path(additional_local_addr, peer_addr).unwrap();
@@ -514,7 +496,7 @@ pub fn connect(
         }
 
         // Determine in which order we are going to iterate over paths.
-        let scheduled_tuples = lowest_latency_scheduler(&conn);
+        let scheduled_tuples = largest_cwnd_scheduler(&conn);
 
         // Generate outgoing QUIC packets and send them on the UDP socket, until
         // quiche reports that there are no more packets to be sent.
@@ -587,7 +569,7 @@ pub fn connect(
                 }
             }
 
-            if let Some(h_conn) = http_conn {
+            if let Some(h_conn) = app_conn {
                 if h_conn.report_incomplete(&app_data_start) {
                     return Err(ClientError::HttpFail);
                 }
@@ -601,27 +583,57 @@ pub fn connect(
 }
 
 fn create_sockets(
-    poll: &mut mio::Poll, peer_addr: &std::net::SocketAddr, args: &ClientArgs,
+    poll: &mut mio::Poll, connect_to_addr: &std::net::SocketAddr, args: &ClientArgs, common_args: &CommonArgs
 ) -> (
     Slab<mio::net::UdpSocket>,
     HashMap<std::net::SocketAddr, usize>,
     std::net::SocketAddr,
+    HashMap<usize, std::net::SocketAddr>,
 ) {
     let mut sockets = Slab::with_capacity(std::cmp::max(args.addrs.len(), 1));
     let mut src_addrs = HashMap::new();
     let mut first_local_addr = None;
+    let mut local_addrs = vec![];
+    let mut peer_addrs = vec![connect_to_addr.clone()];
+    let mut peer_addrs_map = HashMap::new();
 
-    // Create UDP sockets backing the QUIC connection, and register them with
-    // the event loop. Check first user-provided addresses and keep the ones
-    // compatible with the address family of the peer.
+    if args.addrs.len() != common_args.server_addresses.len() + 1 { // Removing the --connect-to address
+        info!("client addresses: {:?}", args.addrs.len());
+        info!("server addresses: {:?} + connect-to address: {:?}", common_args.server_addresses, connect_to_addr);
+        panic!("The client addresses don't much the server's addresses.");
+    }
+
     for src_addr in args.addrs.iter().filter(|sa| {
-        (sa.is_ipv4() && peer_addr.is_ipv4()) ||
-            (sa.is_ipv6() && peer_addr.is_ipv6())
+        (sa.is_ipv4() && connect_to_addr.is_ipv4())
+            || (sa.is_ipv6() && connect_to_addr.is_ipv6())
     }) {
+        local_addrs.push(src_addr.clone());
+        if first_local_addr.is_none() {
+            first_local_addr = Some(*src_addr);
+        }
+    }
+
+    let local_addr = &local_addrs[0]; // There must be a local address for our testbed
+
+    for dst_addr in common_args
+        .server_addresses
+        .iter().filter(|sa| {
+            (sa.is_ipv4() && local_addr.is_ipv4())
+                || (sa.is_ipv6() && local_addr.is_ipv6()) })
+    {
+        if dst_addr == connect_to_addr{
+            continue;
+        }
+        peer_addrs.push(dst_addr.clone());
+    }
+
+    for (i, src_addr) in local_addrs.iter().enumerate() {
         let socket = mio::net::UdpSocket::bind(*src_addr).unwrap();
         let local_addr = socket.local_addr().unwrap();
         let token = sockets.insert(socket);
         src_addrs.insert(local_addr, token);
+        let peer_addr = peer_addrs[i];
+        peer_addrs_map.insert(token, peer_addr);
         poll.registry()
             .register(
                 &mut sockets[token],
@@ -634,41 +646,15 @@ fn create_sockets(
         }
     }
 
-    // If there is no such address, rely on the default INADDR_IN or IN6ADDR_ANY
-    // depending on the IP family of the server address. This is needed on macOS
-    // and BSD variants that don't support binding to IN6ADDR_ANY for both v4
-    // and v6.
-    if first_local_addr.is_none() {
-        let bind_addr = match peer_addr {
-            std::net::SocketAddr::V4(_) => "0.0.0.0:0",
-            std::net::SocketAddr::V6(_) => "[::]:0",
-        };
-        let bind_addr = bind_addr.parse().unwrap();
-        let socket = mio::net::UdpSocket::bind(bind_addr).unwrap();
-        let local_addr = socket.local_addr().unwrap();
-        let token = sockets.insert(socket);
-        src_addrs.insert(local_addr, token);
-        poll.registry()
-            .register(
-                &mut sockets[token],
-                mio::Token(token),
-                mio::Interest::READABLE,
-            )
-            .unwrap();
-        first_local_addr = Some(local_addr)
-    }
-
-    (sockets, src_addrs, first_local_addr.unwrap())
+    (sockets, src_addrs, first_local_addr.unwrap(), peer_addrs_map)
 }
 
-/// Generate a ordered list of 4-tuples on which the host should send packets,
-/// following a lowest-latency scheduling.
-fn lowest_latency_scheduler(
+fn largest_cwnd_scheduler(
     conn: &quiche::Connection,
 ) -> impl Iterator<Item = (std::net::SocketAddr, std::net::SocketAddr)> {
     use itertools::Itertools;
     conn.path_stats()
         .filter(|p| !matches!(p.state, quiche::PathState::Closed(_, _)))
-        .sorted_by_key(|p| p.cwnd_available)
+        .sorted_by_key(|p| p.rtt)
         .map(|p| (p.local_addr, p.peer_addr))
 }

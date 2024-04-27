@@ -26,6 +26,7 @@
 
 use std::net::SocketAddr;
 use std::str::FromStr;
+use std::time::Duration;
 
 use super::common::alpns;
 
@@ -110,9 +111,7 @@ impl Args for CommonArgs {
 
             ("all", "none") => {
                 let mut aplns_to_return = Vec::new();
-                if args.get_bool("--multicore") {
-                    aplns_to_return.push(alpns::MMPQUIC.as_slice());
-                }
+                aplns_to_return.push(alpns::MMPQUIC.as_slice());
                 aplns_to_return.push(alpns::HTTP_3.as_slice());
                 aplns_to_return.push(&alpns::HTTP_09);
                 (
@@ -253,10 +252,10 @@ impl Default for CommonArgs {
     fn default() -> Self {
         CommonArgs {
             alpns: alpns::HTTP_3.to_vec(),
-            max_data: 10000000,
-            max_window: 25165824,
-            max_stream_data: 1000000,
-            max_stream_window: 16777216,
+            max_data: 1_000_000_000,
+            max_window: 1_000_000_000,
+            max_stream_data: 1_000_000_000,
+            max_stream_window: 1_000_000_000,
             max_streams_bidi: 100,
             max_streams_uni: 100,
             idle_timeout: 30000,
@@ -283,16 +282,16 @@ impl Default for CommonArgs {
 }
 
 pub const CLIENT_USAGE: &str = "Usage:
-  quiche-client [options] URL...
+  quiche-client [options] 
   quiche-client -h | --help
 
 Options:
   --method METHOD          Use the given HTTP request method [default: GET].
   --body FILE              Send the given file as request body.
-  --max-data BYTES         Connection-wide flow control limit [default: 10000000].
-  --max-window BYTES       Connection-wide max receiver window [default: 25165824].
-  --max-stream-data BYTES  Per-stream flow control limit [default: 1000000].
-  --max-stream-window BYTES   Per-stream max receiver window [default: 16777216].
+  --max-data BYTES         Connection-wide flow control limit [default: 1000000000].
+  --max-window BYTES       Connection-wide max receiver window [default: 1000000000].
+  --max-stream-data BYTES  Per-stream flow control limit [default: 1000000000].
+  --max-stream-window BYTES   Per-stream max receiver window [default: 1000000000].
   --max-streams-bidi STREAMS  Number of allowed concurrent streams [default: 100].
   --max-streams-uni STREAMS   Number of allowed concurrent streams [default: 100].
   --idle-timeout TIMEOUT   Idle timeout in milliseconds [default: 30000].
@@ -541,10 +540,10 @@ Options:
   --root <dir>                Root directory [default: src/bin/root/]
   --index <name>              The file that will be used as index [default: index.html].
   --name <str>                Name of the server [default: quic.tech]
-  --max-data BYTES            Connection-wide flow control limit [default: 10000000].
-  --max-window BYTES          Connection-wide max receiver window [default: 25165824].
-  --max-stream-data BYTES     Per-stream flow control limit [default: 1000000].
-  --max-stream-window BYTES   Per-stream max receiver window [default: 16777216].
+  --max-data BYTES            Connection-wide flow control limit [default: 1000000000].
+  --max-window BYTES          Connection-wide max receiver window [default: 1000000000].
+  --max-stream-data BYTES     Per-stream flow control limit [default: 1000000000].
+  --max-stream-window BYTES   Per-stream max receiver window [default: 1000000000].
   --max-streams-bidi STREAMS  Number of allowed concurrent streams [default: 100].
   --max-streams-uni STREAMS   Number of allowed concurrent streams [default: 100].
   --idle-timeout TIMEOUT      Idle timeout in milliseconds [default: 30000].
@@ -569,8 +568,9 @@ Options:
   --multipath                 Enable multipath support.
   --multicore                 Enable multicore support. [Under development]
   --cpu-affinity              CPU affinity. [Under development]
-  --server-address ADDR ...    Specify the server addresses.
-  --multicore-transfer BYTES  The bytes to send. [Under development]
+  --server-address ADDR ...   Specify the server addresses.
+  --transfer-size BYTES       The bytes to send. [Under development]
+  --transfer-time NUM         The transfer time in seconds. [Under development]
   -h --help                   Show this screen.
 ";
 
@@ -585,13 +585,13 @@ pub struct ServerArgs {
     pub key: String,
     pub disable_gso: bool,
     pub disable_pacing: bool,
-    pub multicore_transfer: usize,
+    pub transfer_size: Option<usize>,
+    pub transfer_time: Option<Duration>
 }
 
 impl Args for ServerArgs {
     fn with_docopt(docopt: &docopt::Docopt) -> Self {
         let args = docopt.parse().unwrap_or_else(|e| e.exit());
-
         let listen = args.get_str("--listen").to_string();
         let no_retry = args.get_bool("--no-retry");
         let root = args.get_str("--root").to_string();
@@ -600,23 +600,29 @@ impl Args for ServerArgs {
         let key = args.get_str("--key").to_string();
         let disable_gso = args.get_bool("--disable-gso");
         let disable_pacing = args.get_bool("--disable-pacing");
-        let multicore_transfer;
-        if args.get_bool("--multicore"){
-            multicore_transfer = args.get_str("--multicore-transfer").parse::<usize>().unwrap();
+        let transfer_size = if !args.get_str("--transfer-size").is_empty() {
+            Some(args.get_str("--transfer-size").parse::<usize>().unwrap())
         } else {
-            multicore_transfer = 0;
-        }
+            None
+        };
+        let transfer_time = if !args.get_str("--transfer-time").is_empty() {
+            let seconds = args.get_str("--transfer-time").parse::<u64>().unwrap();
+            Some(Duration::from_secs(seconds))
+        } else {
+            None
+        };
 
         ServerArgs {
             listen,
-            no_retry,
             root,
+            no_retry,
             index,
             cert,
             key,
             disable_gso,
             disable_pacing,
-            multicore_transfer
+            transfer_size, 
+            transfer_time
         }
     }
 }

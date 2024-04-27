@@ -27,7 +27,6 @@
 use crate::args::*;
 use crate::common::*;
 
-use std::net::ToSocketAddrs;
 use std::sync::Arc;
 use std::sync::RwLock;
 use std::thread;
@@ -56,7 +55,7 @@ fn multicore_initiate_connection(
     let (write, send_info) = path
         .send_on_path(conn_guard, out)
         .expect("initial send failed");
-    
+
     while let Err(e) = socket.send_to(&out[..write], send_info.to) {
         if e.kind() == std::io::ErrorKind::WouldBlock {
             trace!(
@@ -203,6 +202,7 @@ fn client_thread(
     let mut nb_active_paths = nb_initiated_paths;
     let mut can_close_conn = false;
     let mut requested_conn_close = false;
+    let mut mmpquic_conn = McMPQUICConnClient::new();
 
     'main: loop {
         // TODO multicore timeout
@@ -245,33 +245,25 @@ fn client_thread(
             path.on_timeout(&conn_guard);
         }
 
-        for s in path.readable() {
-            while let Ok((read, fin)) = path.stream_recv(&conn_guard, s, &mut buf)
-            {
-                trace!("received {} bytes", read);
-                let stream_buf = &buf[..read];
-                trace!(
-                    "stream {} has {} bytes (fin? {})",
-                    s,
-                    stream_buf.len(),
-                    fin
+        if !can_close_conn {
+            if mmpquic_conn.recv(&mut path, &conn_guard, &mut buf) {
+                info!(
+                    "path {:?} <-> {:?} received in {:?}",
+                    local_addr,
+                    peer_addr,
+                    app_data_start.elapsed()
                 );
-
-                if fin {
-                    info!(
-                        "path {:?} <-> {:?} received in {:?}",
-                        local_addr,
-                        peer_addr,
-                        app_data_start.elapsed()
-                    );
-                    can_close_conn = true;
-                    if signal_path_done(
-                        &mut path,
-                        MulticoreStatus::Success,
-                        tx_finish_channel.as_mut(),
-                    ) {
-                        break 'main;
-                    }
+                info!(
+                    "path {:?} <-> {:?} app_conn: {:?}",
+                    local_addr, peer_addr, mmpquic_conn
+                );
+                can_close_conn = true;
+                if signal_path_done(
+                    &mut path,
+                    MulticoreStatus::Success,
+                    tx_finish_channel.as_mut(),
+                ) {
+                    break 'main;
                 }
             }
         }
@@ -283,7 +275,10 @@ fn client_thread(
             // TODO multicore retired scid
             while path.source_cids_left(&conn_guard) > 0 {
                 let (scid, reset_token) = generate_cid_and_reset_token(&rng);
-                if path.new_source_cid(&conn_guard, &scid, reset_token, false).is_err() {
+                if path
+                    .new_source_cid(&conn_guard, &scid, reset_token, false)
+                    .is_err()
+                {
                     break;
                 }
                 scid_sent = true;
@@ -331,13 +326,12 @@ pub fn multicore_connect(
     _output_sink: impl FnMut(String) + 'static,
 ) -> Result<(), ClientError> {
     // We'll only connect to the first server provided in URL list.
-    let connect_url = &args.urls[0];
 
     // Resolve server address.
     let peer_addr = if let Some(addr) = &args.connect_to {
         addr.parse().expect("--connect-to is expected to be a string containing an IPv4 or IPv6 address with a port. E.g. 192.0.2.0:443")
     } else {
-        connect_url.to_socket_addrs().unwrap().next().unwrap()
+        return Err(ClientError::Other("Can't find the address to connect to".into()));
     };
 
     let (sockets_addrs, local_addr) =
@@ -440,7 +434,7 @@ pub fn multicore_connect(
 
     // Create a QUIC connection and initiate handshake.
     let (mut conn, mut init_path) = quiche::multicore_connect(
-        connect_url.domain(),
+        Some("quic.tech"),
         &scid,
         local_addr,
         peer_addr,
@@ -516,41 +510,48 @@ pub fn multicore_connect(
 }
 
 fn multicore_prepare_addresses(
-    peer_addr: &std::net::SocketAddr, args: &ClientArgs, common_args: &CommonArgs
+    connect_to_addr: &std::net::SocketAddr, args: &ClientArgs, common_args: &CommonArgs,
 ) -> (
     Vec<(std::net::SocketAddr, std::net::SocketAddr)>,
     std::net::SocketAddr,
 ) {
     use std::str::FromStr;
-    let mut local_tuples = vec![];
     let mut first_local_addr: Option<std::net::SocketAddr> = None;
+    let mut local_addrs = vec![];
     let mut peer_tuples = vec![];
+    peer_tuples.push(connect_to_addr.clone());
 
     info!("server addresses: {:?}", common_args.server_addresses);
 
-    if args.addrs.len() != common_args.server_addresses.len() {
+    if args.addrs.len() != common_args.server_addresses.len()+1{
         panic!("Clients addrs are not equal to server addresses");
     }
 
     for src_addr in args.addrs.iter().filter(|sa| {
-        sa.is_ipv4() || sa.is_ipv6()
+        (sa.is_ipv4() && connect_to_addr.is_ipv4())
+            || (sa.is_ipv6() && connect_to_addr.is_ipv6())
     }) {
-        local_tuples.push(src_addr.clone());
+        local_addrs.push(src_addr.clone());
         if first_local_addr.is_none() {
             first_local_addr = Some(*src_addr);
         }
     }
 
-    for dst_addr in common_args.server_addresses.iter().filter(|a| {
-        a.is_ipv4() || a.is_ipv6()
-    }) {
+    let local_addr = &local_addrs[0];
+
+    for dst_addr in common_args
+        .server_addresses
+        .iter().filter(|sa| {
+            (sa.is_ipv4() && local_addr.is_ipv4())
+                || (sa.is_ipv6() && local_addr.is_ipv6()) })
+    {
         peer_tuples.push(dst_addr.clone());
     }
 
     let mut tuples = vec![];
 
-    for i in 0..local_tuples.len(){
-        tuples.push((local_tuples[i], peer_tuples[i]));
+    for i in 0..local_addrs.len() {
+        tuples.push((local_addrs[i], peer_tuples[i]));
     }
 
     // If there is no such address, rely on the default INADDR_IN or IN6ADDR_ANY
@@ -558,7 +559,7 @@ fn multicore_prepare_addresses(
     // and BSD variants that don't support binding to IN6ADDR_ANY for both v4
     // and v6.
     if first_local_addr.is_none() {
-        let sock_addr = match peer_addr {
+        let sock_addr = match connect_to_addr {
             std::net::SocketAddr::V4(_) => std::net::SocketAddr::new(
                 std::net::IpAddr::V4(
                     std::net::Ipv4Addr::from_str("0.0.0.0").ok().unwrap(),

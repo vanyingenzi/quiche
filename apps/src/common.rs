@@ -29,6 +29,7 @@
 //! This module provides some utility functions that are common to quiche
 //! applications.
 
+use std::collections::HashSet;
 use std::convert::TryInto;
 use std::io::prelude::*;
 
@@ -45,9 +46,11 @@ use std::sync::mpsc::Sender;
 use std::sync::mpsc::TryRecvError;
 use std::sync::Arc;
 use std::sync::RwLock;
+use std::time::Instant;
 
 use quiche::MulticoreConnection;
 use quiche::MulticorePath;
+use rand::Rng;
 use ring::rand::SecureRandom;
 
 use quiche::ConnectionId;
@@ -67,7 +70,7 @@ const H3_MESSAGE_ERROR: u64 = 0x10E;
 pub mod alpns {
     pub const HTTP_09: [&[u8]; 2] = [b"hq-interop", b"http/0.9"];
     pub const HTTP_3: [&[u8]; 1] = [b"h3"];
-    pub const MMPQUIC: [&[u8]; 1] = [b"mMPQUIC"];
+    pub const MMPQUIC: [&[u8]; 1] = [b"mcMPQUIC"];
 }
 
 pub struct PartialRequest {
@@ -116,69 +119,6 @@ pub struct Client {
 pub type ClientIdMap = HashMap<ConnectionId<'static>, ClientId>;
 pub type ClientMap = HashMap<ClientId, Client>;
 
-pub struct MulticoreClient {
-    /// The QUIC connection
-    pub conn: Arc<RwLock<MulticoreConnection>>,
-    /// The stream ids
-    pub next_stream_id: Arc<RwLock<u64>>
-}
-
-#[derive(Debug)]
-pub enum MulticoreStatus {
-    Success,
-    Error,
-/*     Timeout,
-    Closed, */
-}
-
-#[derive(Debug)]
-pub struct MulticorePathDoneInfo {
-    pub local: std::net::SocketAddr,
-    pub peer: std::net::SocketAddr,
-    pub status: MulticoreStatus,
-}
-
-pub fn handle_done_paths(
-    rx_finish_channel: Option<&mut Receiver<MulticorePathDoneInfo>>,
-    nb_active_paths: &mut usize,
-) -> Result<(), ClientError> {
-    if let Some(rx) = rx_finish_channel {
-        match rx.try_recv() {
-            Ok(v) => {
-                info!("received message {:?}", v);
-                *nb_active_paths -= 1;
-            },
-            Err(TryRecvError::Empty) => {},
-            Err(TryRecvError::Disconnected) => {
-                *nb_active_paths = 1;
-            }
-        }
-    }
-    Ok(())
-}
-
-pub fn signal_path_done(
-    path: &mut MulticorePath, status: MulticoreStatus,
-    tx_finish_channel: Option<&mut Sender<MulticorePathDoneInfo>>,
-) -> bool {
-    if let Some(tx) = tx_finish_channel {
-        tx.send(MulticorePathDoneInfo {
-            local: path.local_addr(),
-            peer: path.peer_addr(),
-            status,
-        })
-        .unwrap();
-        true
-    } else {
-        false
-    }
-}
-
-pub fn increment_port(socket_addr: std::net::SocketAddr) -> std::net::SocketAddr {
-    let (ip, port) = (socket_addr.ip(), socket_addr.port());
-    let new_port = port + 1;
-    std::net::SocketAddr::new(ip, new_port)
-}
 
 /// Makes a buffered writer for a resource with a target URL.
 ///
@@ -1717,5 +1657,486 @@ impl HttpConn for Http3Conn {
         if resp.written == resp.body.len() {
             partial_responses.remove(&stream_id);
         }
+    }
+}
+
+pub struct AdaptedClient {
+    pub conn: quiche::Connection,
+    pub http_conn: Option<AdaptedMcMPQUICConnServer>,
+    pub app_conn_done: bool,
+    pub client_id: ClientId,
+    pub app_proto_selected: bool,
+    pub loss_rate: f64,
+    pub max_datagram_size: usize,
+    pub max_send_burst: usize,
+    pub next_stream_id: u64, 
+    pub path_scheduler_round_robin: usize
+}
+
+pub type AdaptedClientIdMap = HashMap<ConnectionId<'static>, ClientId>;
+pub type AdaptedClientMap = HashMap<ClientId, AdaptedClient>;
+
+pub struct MulticoreClient {
+    /// The QUIC connection
+    pub conn: Arc<RwLock<MulticoreConnection>>,
+    /// The stream ids
+    pub next_stream_id: Arc<RwLock<u64>>
+}
+
+#[derive(Debug)]
+pub enum MulticoreStatus {
+    Success,
+    Error,
+/*     Timeout,
+    Closed, */
+}
+
+#[derive(Debug)]
+pub struct MulticorePathDoneInfo {
+    pub local: std::net::SocketAddr,
+    pub peer: std::net::SocketAddr,
+    pub status: MulticoreStatus,
+}
+
+pub fn handle_done_paths(
+    rx_finish_channel: Option<&mut Receiver<MulticorePathDoneInfo>>,
+    nb_active_paths: &mut usize,
+) -> Result<(), ClientError> {
+    if let Some(rx) = rx_finish_channel {
+        match rx.try_recv() {
+            Ok(v) => {
+                info!("received message {:?}", v);
+                *nb_active_paths -= 1;
+            },
+            Err(TryRecvError::Empty) => {},
+            Err(TryRecvError::Disconnected) => {
+                *nb_active_paths = 1;
+            }
+        }
+    }
+    Ok(())
+}
+
+pub fn signal_path_done(
+    path: &mut MulticorePath, status: MulticoreStatus,
+    tx_finish_channel: Option<&mut Sender<MulticorePathDoneInfo>>,
+) -> bool {
+    if let Some(tx) = tx_finish_channel {
+        tx.send(MulticorePathDoneInfo {
+            local: path.local_addr(),
+            peer: path.peer_addr(),
+            status,
+        })
+        .unwrap();
+        true
+    } else {
+        false
+    }
+}
+
+pub fn increment_port(socket_addr: std::net::SocketAddr) -> std::net::SocketAddr {
+    let (ip, port) = (socket_addr.ip(), socket_addr.port());
+    let new_port = port + 1;
+    std::net::SocketAddr::new(ip, new_port)
+}
+
+use rand;
+
+#[derive(Debug)]
+pub struct AdaptedMcMPQUICConnServer {
+    to_send: Option<usize>,
+    sent: usize,
+    stream_ids: HashSet<u64>,
+    sent_fin_ids: HashSet<u64>,
+    /// End time for the transfer
+    end_time: Option<Instant>
+}
+
+
+impl AdaptedMcMPQUICConnServer {
+    pub fn new(
+        conn: &mut quiche::Connection,
+        stream_id: u64, 
+        to_send: Option<usize>,
+        transfer_time: Option<std::time::Duration>
+    ) -> Self {
+        let mut stream_ids = HashSet::new();
+        stream_ids.insert(stream_id);
+        match conn.stream_send(
+            stream_id,
+            &[0u8;0],
+            false,
+        ) {
+            Ok(v) => v,
+            Err(quiche::Error::Done) => {
+                error!("creating stream id {} returned done", stream_id);
+                0
+            },
+            Err(e) => {
+                error!(
+                    "An error occured creating stream id {:?}: {:?}",
+                    stream_id, e
+                );
+                0
+            },
+        };
+        let end_time = if let Some(t) = transfer_time {
+            Some(std::time::Instant::now() + t)
+        } else {
+            None
+        };
+        let to_return = AdaptedMcMPQUICConnServer{
+            to_send,
+            sent: 0,
+            stream_ids,
+            end_time, 
+            sent_fin_ids: HashSet::new()
+        };
+        to_return
+    }
+
+    pub fn add_stream(
+        &mut self, 
+        conn: &mut quiche::Connection,
+        stream_id: u64,
+    ) {
+        if self.stream_ids.contains(&stream_id) {
+            return
+        }
+        self.stream_ids.insert(stream_id);
+        match conn.stream_send(
+            stream_id,
+            &[0u8;0],
+            false,
+        ) {
+            Ok(v) => v,
+            Err(quiche::Error::Done) => {
+                error!("creating stream id {} returned done", stream_id);
+                0
+            },
+            Err(e) => {
+                error!(
+                    "An error occured creating stream id {:?}: {:?}",
+                    stream_id, e
+                );
+                0
+            },
+        };
+    }
+
+    fn is_fin(&self) -> bool {
+        if self.to_send.is_some(){
+            let to_send = self.to_send.as_ref().unwrap();
+            self.sent >= *to_send
+        } else if self.end_time.is_some() {
+            let end = self.end_time.as_ref().unwrap();
+            *end <= std::time::Instant::now()
+        } else {
+            panic!("Can't tell fin")
+        }
+    }
+
+    pub fn send(
+        &mut self, 
+        conn: &mut quiche::Connection,
+        buf: &mut [u8],
+    ) -> bool {
+        let fin = self.is_fin();
+        for stream_id in conn.writable() {
+            if !self.stream_ids.contains(&stream_id) && self.sent_fin_ids.contains(&stream_id){
+                continue;
+            }
+            if fin {
+                match conn.stream_send(
+                    stream_id,
+                    &[0u8;0],
+                    fin,
+                ) {
+                    Ok(v) => {
+                        self.sent_fin_ids.insert(stream_id);
+                        v
+                    },
+                    Err(quiche::Error::Done) => {
+                        0
+                    },
+                    Err(e) => {
+                        error!(
+                            "An error occured on stream id {:?}: {:?}",
+                            stream_id, e
+                        );
+                        0
+                    },
+                };
+            } else {
+                let mut rng = rand::thread_rng();
+                let up_limit = if let Some(s) = self.to_send {
+                    std::cmp::min(s - self.sent, buf.len())
+                } else {
+                    buf.len()
+                };
+                rng.fill(&mut buf[..up_limit]);
+                let written = match conn.stream_send(
+                    stream_id,
+                    &mut buf[..up_limit],
+                    false,
+                ) {
+                    Ok(v) => v,
+                    Err(quiche::Error::Done) => {
+                        0
+                    },
+                    Err(e) => {
+                        error!(
+                            "An error occured on stream id {:?}: {:?}",
+                            stream_id, e
+                        );
+                        0
+                    },
+                };
+                trace!("written {} to stream id {}", written, stream_id);
+                self.sent += written;
+            }
+        }
+        self.sent_fin_ids.len() == self.stream_ids.len() && fin
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct AdaptedMcMPQUICConnClient {
+    received: usize,
+    stream_ids: HashSet<u64>,
+    recv_fin_ids: HashSet<u64>,
+    expected_streams: usize
+}
+
+impl AdaptedMcMPQUICConnClient{
+    pub fn new(
+    ) -> Self {
+        AdaptedMcMPQUICConnClient{
+            expected_streams: 2,
+            ..Default::default()
+        }
+    }
+
+    pub fn recv(
+        &mut self, 
+        conn: &mut quiche::Connection, 
+        buf: &mut [u8]
+    ) -> bool {
+        for s in conn.readable() {
+            while let Ok((read, fin)) = conn.stream_recv( s,  buf)
+            {
+                trace!("received {} bytes", read);
+                let stream_buf = &buf[..read];
+                trace!(
+                    "stream {} has {} bytes (fin? {})",
+                    s,
+                    stream_buf.len(),
+                    fin
+                );
+                self.received += read;
+                self.stream_ids.insert(s);
+                if fin {
+                    self.recv_fin_ids.insert(s);
+                }
+            }
+        }
+        self.expected_streams == self.recv_fin_ids.len()
+    }
+
+    pub fn report_incomplete(&self, start: &std::time::Instant) -> bool {
+        if self.recv_fin_ids.len() != self.expected_streams {
+            info!(
+                "app conn {:?}",
+                self
+            );
+            error!(
+                "connection timed out after {:?} and only completed {}/{} requests",
+                start.elapsed(),
+                self.recv_fin_ids.len(),
+                self.expected_streams
+            );
+
+            return true;
+        }
+        false
+    }
+}
+
+#[derive(Debug)]
+pub struct McMPQUICConnServer {
+    to_send: Option<usize>,
+    sent: usize,
+    stream_ids: HashSet<u64>,
+    sent_fin_ids: HashSet<u64>,
+    /// End time for the transfer
+    end_time: Option<Instant>
+}
+
+#[derive(Debug, Default)]
+pub struct McMPQUICConnClient {
+    received: usize,
+    stream_ids: HashSet<u64>,
+    recv_fin_ids: HashSet<u64>,
+    expected_streams: usize
+}
+
+impl McMPQUICConnServer {
+    pub fn new(
+        path: &mut MulticorePath, 
+        conn_guard: &Arc<RwLock<MulticoreConnection>>,
+        stream_id: u64, 
+        to_send: Option<usize>,
+        transfer_time: Option<std::time::Duration>
+    ) -> Self {
+        let mut stream_ids = HashSet::new();
+        stream_ids.insert(stream_id);
+        match path.stream_send(
+            conn_guard,
+            stream_id,
+            &[0u8;0],
+            false,
+        ) {
+            Ok(v) => v,
+            Err(quiche::Error::Done) => {
+                error!("creating stream id {} returned done", stream_id);
+                0
+            },
+            Err(e) => {
+                error!(
+                    "An error occured creating stream id {:?}: {:?}",
+                    stream_id, e
+                );
+                0
+            },
+        };
+        let end_time = if let Some(t) = transfer_time {
+            Some(std::time::Instant::now() + t)
+        } else {
+            None
+        };
+        McMPQUICConnServer{
+            to_send,
+            sent: 0,
+            stream_ids,
+            end_time, 
+            sent_fin_ids: HashSet::new()
+        }
+    }
+
+    fn is_fin(&self) -> bool {
+        if self.to_send.is_some(){
+            let to_send = self.to_send.as_ref().unwrap();
+            self.sent >= *to_send
+        } else if self.end_time.is_some() {
+            let end = self.end_time.as_ref().unwrap();
+            *end <= std::time::Instant::now()
+        } else {
+            panic!("Can't tell fin")
+        }
+    }
+
+    pub fn send(
+        &mut self, 
+        path: &mut MulticorePath, 
+        conn_guard: &Arc<RwLock<MulticoreConnection>>,
+        buf: &mut [u8],
+    ) -> bool {
+        let fin = self.is_fin();
+        for stream_id in path.writable() {
+            if !self.stream_ids.contains(&stream_id) && self.sent_fin_ids.contains(&stream_id){
+                continue;
+            }
+            if fin {
+                match path.stream_send(
+                    conn_guard,
+                    stream_id,
+                    &[0u8;0],
+                    fin,
+                ) {
+                    Ok(v) => {
+                        self.sent_fin_ids.insert(stream_id);
+                        v
+                    },
+                    Err(quiche::Error::Done) => {
+                        error!("stream id {} returned done", stream_id);
+                        0
+                    },
+                    Err(e) => {
+                        error!(
+                            "An error occured on stream id {:?}: {:?}",
+                            stream_id, e
+                        );
+                        0
+                    },
+                };
+            } else {
+                let mut rng = rand::thread_rng();
+                let up_limit = if let Some(s) = self.to_send {
+                    std::cmp::min(s - self.sent, buf.len())
+                } else {
+                    buf.len()
+                };
+                rng.fill(&mut buf[..up_limit]);
+                let written = match path.stream_send(
+                    conn_guard,
+                    stream_id,
+                    &mut buf[..up_limit],
+                    false,
+                ) {
+                    Ok(v) => v,
+                    Err(quiche::Error::Done) => {
+                        0
+                    },
+                    Err(e) => {
+                        error!(
+                            "An error occured on stream id {:?}: {:?}",
+                            stream_id, e
+                        );
+                        0
+                    },
+                };
+                trace!("Written {} to stream id {}", written, stream_id);
+                self.sent += written;
+            }
+        }
+        self.sent_fin_ids.len() == self.stream_ids.len() && fin
+    }
+}
+
+impl McMPQUICConnClient {
+
+    pub fn new(
+    ) -> Self {
+        McMPQUICConnClient{
+            expected_streams: 1,
+            ..Default::default()
+        }
+    }
+
+    pub fn recv(
+        &mut self,
+        path: &mut MulticorePath, 
+        conn_guard: &Arc<RwLock<MulticoreConnection>>,
+        buf: &mut [u8],
+    ) -> bool {
+        for s in path.readable() {
+            while let Ok((read, fin)) = path.stream_recv(&conn_guard, s,  buf)
+            {
+                trace!("received {} bytes", read);
+                let stream_buf = &buf[..read];
+                trace!(
+                    "stream {} has {} bytes (fin? {})",
+                    s,
+                    stream_buf.len(),
+                    fin
+                );
+                self.received += read;
+                self.stream_ids.insert(s);
+                if fin {
+                    self.recv_fin_ids.insert(s);
+                }
+            }
+        }
+        self.expected_streams == self.recv_fin_ids.len()
     }
 }

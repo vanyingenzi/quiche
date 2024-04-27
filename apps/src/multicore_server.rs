@@ -51,19 +51,22 @@ fn server_thread(
     let max_datagram_size = MAX_DATAGRAM_SIZE;
     let mut max_send_burst = MAX_BUF_SIZE;
 
-    let mut create_send_stream = false;
+    let mut created_app_conn = false;
     let mut is_established = false;
     let mut is_in_early_data = false;
 
-    let to_send = args.multicore_transfer / nb_initiated_paths;
-    let mut stream_id = None;
-    let body: Vec<u8> = std::iter::repeat(255).take(to_send).collect();
-    let mut sent = 0;
+    let mut mmpquic_conn = None;
     let mut nb_active_paths = nb_initiated_paths;
     let mut can_close_conn = false;
     let mut scid_sent = false;
     let mut has_set_peer_addr = rx_finish_channel.is_some();
     let rng = SystemRandom::new();
+
+    let path_transfer_size = if let Some(s) = args.transfer_size {
+        Some(s / nb_initiated_paths)
+    } else {
+        None
+    };
 
     loop {
         let timeout = match continue_write {
@@ -112,7 +115,7 @@ fn server_thread(
                 from,
             };
 
-            if !has_set_peer_addr{
+            if !has_set_peer_addr {
                 path.set_peer_addr(from).unwrap();
                 has_set_peer_addr = true;
             }
@@ -146,7 +149,7 @@ fn server_thread(
             }
         }
 
-        if !create_send_stream {
+        if !created_app_conn {
             if (is_in_early_data || is_established) && path.is_active() {
                 let app_proto;
                 {
@@ -156,27 +159,22 @@ fn server_thread(
 
                 #[allow(clippy::box_default)]
                 if alpns::MMPQUIC.contains(&app_proto.as_slice()) {
-                    create_send_stream = true;
+                    let stream_id;
                     {
                         let mut next_stream_id =
                             client.next_stream_id.write().unwrap();
-                        stream_id = Some(next_stream_id.clone());
+                        stream_id = next_stream_id.clone();
                         *next_stream_id += 4; // We are using server unidirectional streams
-                                              // Create the stream
                     }
-                    match path.stream_send(
-                        &client.conn,
-                        stream_id.unwrap(),
-                        &[0u8; 0],
-                        false,
-                    ) {
-                        Ok(..) => {
-                            info!("initiated stream {}", stream_id.unwrap());
-                        },
-                        Err(e) => {
-                            error!("stream id {} stream init send created an error {}", stream_id.unwrap(), e);
-                        },
-                    };
+                    mmpquic_conn =
+                        Some(McMPQUICConnServer::new(
+                            &mut path,
+                            &client.conn,
+                            stream_id, 
+                            path_transfer_size,
+                            args.transfer_time
+                        ));
+                    created_app_conn = true;
                 } else {
                     error!("APLN not mMPQUIC");
                     path.close_connection(
@@ -194,36 +192,13 @@ fn server_thread(
             }
         }
 
-        if stream_id.is_some() && create_send_stream && !can_close_conn {
-            for stream_id in path.writable() {
-                let fin = path.tx_cap() >= to_send - sent;
-                let written = match path.stream_send(
-                    &client.conn,
-                    stream_id,
-                    &body[sent..],
-                    fin,
-                ) {
-                    Ok(v) => v,
-                    Err(quiche::Error::Done) => {
-                        error!("stream id {} returned done", stream_id);
-                        0
-                    },
-                    Err(e) => {
-                        error!(
-                            "An error occured on stream id {:?}: {:?}",
-                            stream_id, e
-                        );
-                        0
-                    },
-                };
-                let fin = written == to_send - sent;
-                trace!("Written {} to stream id {}", written, stream_id);
-                sent += written;
-
+        if created_app_conn && !can_close_conn {
+            if let Some(app_conn) = mmpquic_conn.as_mut() {
+                let fin = app_conn.send(&mut path, &client.conn, &mut buf);
                 if fin {
                     info!(
-                        "path {:?} <-> {:?} done sending",
-                        local_addr, peer_addr
+                        "path {:?} <-> {:?} done sending: app_conn: {:?}",
+                        local_addr, peer_addr, app_conn
                     );
                     can_close_conn = true;
                 }
@@ -488,12 +463,8 @@ pub fn multicore_start_server(args: ServerArgs, common_args: CommonArgs) {
             if *local == local_addr {
                 continue;
             }
-            let additional_path = MulticorePath::default(
-                &config,
-                true,
-                *local,
-                peer_addr,
-            );
+            let additional_path =
+                MulticorePath::default(&config, true, *local, peer_addr);
             let copied_args = args.clone();
             let cloned_client = client.clone();
             let tx_clone = tx.clone();

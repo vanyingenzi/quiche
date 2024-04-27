@@ -202,7 +202,7 @@ impl MulticoreStreamMap {
         c.remove();
     }
 
-     /// Adds the stream ID to the flushable streams set.
+    /// Adds the stream ID to the flushable streams set.
     ///
     /// If the stream was already in the list, this does nothing.
     pub fn insert_flushable(&mut self, priority_key: &Arc<StreamPriorityKey>) {

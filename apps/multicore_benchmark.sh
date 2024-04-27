@@ -2,13 +2,12 @@
 
 RUST_PLATFORM="x86_64-unknown-linux-gnu"
 FILE_SIZE=2
-NB_RUNS=5
+NB_RUNS=10
 
 RED='\033[0;31m'
 RESET='\033[0m'
 
 ROOT_DIR="$(pwd)/www"
-FILENAME="${FILE_SIZE}GB_file"
 FILESIZE_BYTES=$((FILE_SIZE * 1024 * 1024 * 1024))
 MCPQUIC_AVERAGE_EXEC_TIME=100000000000 # MAX
 
@@ -37,11 +36,6 @@ setup_rust() {
     fi
 }
 
-setup_environment() {
-    mkdir -p "${ROOT_DIR}"
-    fallocate -l "${FILE_SIZE}G" "${ROOT_DIR}/${FILENAME}"
-}
-
 mcmpquic_iteration_loop() {
     RUSTFLAGS='-C target-cpu=native' cargo build --release || exit 1
     local server_pid server_port client_port_1 client_port_2 error_code
@@ -54,23 +48,23 @@ mcmpquic_iteration_loop() {
         # Run server
         sudo pkill quiche-server
         sudo fuser -k 4433/udp
+        sudo fuser -k 3344/udp
 
         ../target/release/quiche-server \
-            --root "${ROOT_DIR}" \
             --key "$(pwd)/src/bin/cert.key" \
             --cert "$(pwd)/src/bin/cert.crt" \
+            --listen 127.0.0.1:4433 \
             --server-address 127.0.0.2:3344 \
-            --multicore-transfer ${FILESIZE_BYTES} \
+            --transfer-size ${FILESIZE_BYTES} \
             --multipath --multicore 1>/dev/null 2>&1 &
         server_pid=$!
 
         # Run client
         start=$(date +%s.%N)
         ../target/release/quiche-client \
-            "https://127.0.0.1:4433" \
             -A 127.0.0.1:${client_port_1} \
             -A 127.0.0.1:${client_port_2} \
-            --server-address 127.0.0.1:4433 \
+            --connect-to 127.0.0.1:4433 \
             --server-address 127.0.0.2:3344 \
             --multipath --multicore --no-verify --wire-version 1 1>/dev/null 2>&1
         error_code=$?
@@ -100,20 +94,24 @@ mpquic_iteration_loop() {
         # Run server
         sudo pkill quiche-server
         sudo fuser -k 4433/udp
+        sudo fuser -k 3344/udp
         
         ../target/release/quiche-server \
-            --root "${ROOT_DIR}" \
             --key "$(pwd)/src/bin/cert.key" \
             --cert "$(pwd)/src/bin/cert.crt" \
-            --multipath >/dev/null 2>&1 &
+            --listen 127.0.0.1:4433 \
+            --server-address 127.0.0.2:3344 \
+            --transfer-size ${FILESIZE_BYTES} \
+            --multipath 1>/dev/null 2>&1 &
         server_pid=$!
 
         # Run client
         start=$(date +%s.%N)
         ../target/release/quiche-client \
-            "https://127.0.0.1:4433/${FILENAME}" \
             -A 127.0.0.1:${client_port_1} \
             -A 127.0.0.1:${client_port_2} \
+            --connect-to 127.0.0.1:4433 \
+            --server-address 127.0.0.2:3344 \
             --multipath --no-verify --wire-version 1 1>/dev/null 2>&1
         error_code=$?
         end=$(date +%s.%N)
@@ -142,8 +140,6 @@ main() {
     # Version
     setup_rust
     [ $? -ne 0 ] && { echo_red "Error setting up rust"; exit 1; }
-    setup_environment
-    [ $? -ne 0 ] && { echo_red "Error setting up environment"; exit 1; }
     mcmpquic_iteration_loop
     [ $? -ne 0 ] && { echo_red "Error running mcMPQUIC iteration loop"; exit 1; }
     return_code=$(mpquic_iteration_loop)
