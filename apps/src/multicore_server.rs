@@ -444,11 +444,18 @@ pub fn multicore_start_server(args: ServerArgs, common_args: CommonArgs) {
         let (tx, rx) = channel();
         let nb_initiated_paths = 2; // Hard coded
         let clone_client_arc = client.clone();
-
+        let core_ids = core_affinity::get_core_ids().unwrap();
+        let set_core_affinity = common_args.cpu_affinity;
         let peer_addr = init_path.peer_addr();
 
         let mut joins = Vec::new();
+        let core_id = core_ids[0];
         joins.push(thread::spawn(move || {
+            if set_core_affinity{
+                if core_affinity::set_for_current(core_id) {
+                    debug!("set core affinity for {:?}", thread::current().id());
+                }
+            }
             server_thread(
                 clone_client_arc,
                 init_path,
@@ -458,6 +465,7 @@ pub fn multicore_start_server(args: ServerArgs, common_args: CommonArgs) {
                 Some(rx),
             )
         }));
+        let mut current_core_id = 1;
 
         for local in common_args.server_addresses.iter() {
             if *local == local_addr {
@@ -468,8 +476,14 @@ pub fn multicore_start_server(args: ServerArgs, common_args: CommonArgs) {
             let copied_args = args.clone();
             let cloned_client = client.clone();
             let tx_clone = tx.clone();
-
+            let core_id = core_ids[current_core_id];
+            current_core_id = current_core_id + 1 % core_ids.len();
             joins.push(thread::spawn(move || {
+                if set_core_affinity {
+                    if core_affinity::set_for_current(core_id) {
+                        debug!("set core affinity for {:?}", thread::current().id());
+                    }
+                }
                 server_thread(
                     cloned_client,
                     additional_path,

@@ -27,6 +27,7 @@
 use crate::args::*;
 use crate::common::*;
 
+use core_affinity;
 use std::sync::Arc;
 use std::sync::RwLock;
 use std::thread;
@@ -289,7 +290,7 @@ fn client_thread(
             let available_dcids = path.available_dcids(&conn_guard) > 0;
             if available_dcids && path.probe_path(&conn_guard).is_ok() {
                 probed_my_path = true;
-                info!("probed my path: {} <-> {}", local_addr, peer_addr);
+                debug!("probed my path: {} <-> {}", local_addr, peer_addr);
             }
         }
 
@@ -331,7 +332,9 @@ pub fn multicore_connect(
     let peer_addr = if let Some(addr) = &args.connect_to {
         addr.parse().expect("--connect-to is expected to be a string containing an IPv4 or IPv6 address with a port. E.g. 192.0.2.0:443")
     } else {
-        return Err(ClientError::Other("Can't find the address to connect to".into()));
+        return Err(ClientError::Other(
+            "Can't find the address to connect to".into(),
+        ));
     };
 
     let (sockets_addrs, local_addr) =
@@ -463,7 +466,16 @@ pub fn multicore_connect(
     let multipath_requested = common_args.multipath;
     let (tx, rx) = channel();
     let active_threads = sockets_addrs.len();
+    let core_ids = core_affinity::get_core_ids().unwrap();
+    let set_core_affinity = common_args.cpu_affinity;
+    let core_id = core_ids[0];
     threads_join.push(thread::spawn(move || {
+        if set_core_affinity {
+            if core_affinity::set_for_current(core_id) {
+                debug!("set core affinity for {:?}", thread::current().id());
+            }
+        }
+
         client_thread(
             cloned_conn_guard,
             init_path,
@@ -474,6 +486,7 @@ pub fn multicore_connect(
             Some(rx),
         )
     }));
+    let mut current_core_id = 1;
 
     for (local, peer) in sockets_addrs.clone() {
         if local == local_addr {
@@ -483,7 +496,15 @@ pub fn multicore_connect(
         let cloned_conn_guard = conn_guard.clone();
         let initiate_conn = local == local_addr;
         let tx_clone = tx.clone();
+        let core_id = core_ids[current_core_id];
+        current_core_id = current_core_id + 1 % core_ids.len();
         threads_join.push(thread::spawn(move || {
+            if set_core_affinity {
+                if core_affinity::set_for_current(core_id) {
+                    info!("set core affinity for {:?}", thread::current().id());
+                }
+            }
+
             client_thread(
                 cloned_conn_guard,
                 path,
@@ -510,7 +531,8 @@ pub fn multicore_connect(
 }
 
 fn multicore_prepare_addresses(
-    connect_to_addr: &std::net::SocketAddr, args: &ClientArgs, common_args: &CommonArgs,
+    connect_to_addr: &std::net::SocketAddr, args: &ClientArgs,
+    common_args: &CommonArgs,
 ) -> (
     Vec<(std::net::SocketAddr, std::net::SocketAddr)>,
     std::net::SocketAddr,
@@ -523,7 +545,7 @@ fn multicore_prepare_addresses(
 
     info!("server addresses: {:?}", common_args.server_addresses);
 
-    if args.addrs.len() != common_args.server_addresses.len()+1{
+    if args.addrs.len() != common_args.server_addresses.len() + 1 {
         panic!("Clients addrs are not equal to server addresses");
     }
 
@@ -539,12 +561,10 @@ fn multicore_prepare_addresses(
 
     let local_addr = &local_addrs[0];
 
-    for dst_addr in common_args
-        .server_addresses
-        .iter().filter(|sa| {
-            (sa.is_ipv4() && local_addr.is_ipv4())
-                || (sa.is_ipv6() && local_addr.is_ipv6()) })
-    {
+    for dst_addr in common_args.server_addresses.iter().filter(|sa| {
+        (sa.is_ipv4() && local_addr.is_ipv4())
+            || (sa.is_ipv6() && local_addr.is_ipv6())
+    }) {
         peer_tuples.push(dst_addr.clone());
     }
 
