@@ -46,11 +46,11 @@ mcmpquic_iteration_loop() {
         client_port_2=$(get_unused_port)
 
         # Run server
-        sudo pkill quiche-server
-        sudo fuser -k 4433/udp
-        sudo fuser -k 3344/udp
-        sudo fuser -k ${client_port_1}/udp
-        sudo fuser -k ${client_port_2}/udp
+        sudo pkill quiche-server 1>/dev/null 2>&1
+        sudo fuser -k 4433/udp 1>/dev/null 2>&1
+        sudo fuser -k 3344/udp 1>/dev/null 2>&1
+        sudo fuser -k ${client_port_1}/udp 1>/dev/null 2>&1
+        sudo fuser -k ${client_port_2}/udp 1>/dev/null 2>&1
 
         ../target/release/quiche-server \
             --key "$(pwd)/src/bin/cert.key" \
@@ -94,12 +94,12 @@ mpquic_iteration_loop() {
         client_port_2=$(get_unused_port)
 
         # Run server
-        sudo pkill quiche-server
-        sudo fuser -k 4433/udp
-        sudo fuser -k 3344/udp
-        sudo fuser -k ${client_port_1}/udp
-        sudo fuser -k ${client_port_2}/udp
-        
+        sudo pkill quiche-server 1>/dev/null 2>&1
+        sudo fuser -k 4433/udp 1>/dev/null 2>&1
+        sudo fuser -k 3344/udp 1>/dev/null 2>&1
+        sudo fuser -k ${client_port_1}/udp 1>/dev/null 2>&1
+        sudo fuser -k ${client_port_2}/udp 1>/dev/null 2>&1
+                
         ../target/release/quiche-server \
             --key "$(pwd)/src/bin/cert.key" \
             --cert "$(pwd)/src/bin/cert.crt" \
