@@ -12,7 +12,7 @@ FILESIZE_BYTES=$((FILE_SIZE * 1024 * 1024 * 1024))
 MCPQUIC_AVERAGE_EXEC_TIME=100000000000 # MAX
 
 echo_red() {
-    echo -e "${RED}$1${RESET}"
+    echo -e "${RED}$1${RESET}" >&2
 }
 
 get_unused_port(){
@@ -79,7 +79,7 @@ mcmpquic_iteration_loop() {
     done
     average_runtime=$(echo "scale=9; $total_runtime / $NB_RUNS" | bc)
     MCPQUIC_AVERAGE_EXEC_TIME=$average_runtime
-    echo "Average Runtime: $average_runtime seconds"
+    echo "Average Runtime: $average_runtime seconds" >&2
 }
 
 mpquic_iteration_loop() {
