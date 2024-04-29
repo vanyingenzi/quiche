@@ -42,8 +42,8 @@ mcmpquic_iteration_loop() {
     local total_runtime=0
     for iter in $(seq 1 ${NB_RUNS}); do
         echo "Benchmarking multicore Multi-Path QUIC [mcMPQUIC] - Iteration $iter"
-        client_port_1=$(get_unused_port)
-        client_port_2=$(get_unused_port)
+        client_port_1=6788
+        client_port_2=6789
 
         # Run server
         sudo pkill quiche-server 1>/dev/null 2>&1
@@ -90,8 +90,8 @@ mpquic_iteration_loop() {
     local total_runtime=0
     for iter in $(seq 1 ${NB_RUNS}); do
         echo "Benchmarking Multi-Path QUIC [MPQUIC] - Iteration $iter" >&2
-        client_port_1=$(get_unused_port)
-        client_port_2=$(get_unused_port)
+        client_port_1=6788
+        client_port_2=6789
 
         # Run server
         sudo pkill quiche-server 1>/dev/null 2>&1
@@ -99,7 +99,7 @@ mpquic_iteration_loop() {
         sudo fuser -k 3344/udp 1>/dev/null 2>&1
         sudo fuser -k ${client_port_1}/udp 1>/dev/null 2>&1
         sudo fuser -k ${client_port_2}/udp 1>/dev/null 2>&1
-                
+
         ../target/release/quiche-server \
             --key "$(pwd)/src/bin/cert.key" \
             --cert "$(pwd)/src/bin/cert.crt" \
