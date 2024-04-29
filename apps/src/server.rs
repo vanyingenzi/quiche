@@ -429,6 +429,16 @@ pub fn start_server(args: ServerArgs, conn_args: CommonArgs) {
                         client.conn.max_send_udp_payload_size();
                 }
 
+                if client.http_conn.is_some() && !client.app_conn_done {
+                    let conn = &mut client.conn;
+                    let app_conn = client.http_conn.as_mut().unwrap();
+    
+                    if app_conn.send(conn, &mut buf) {
+                        info!("app protocol done sending: {:?}", app_conn);
+                        client.app_conn_done = true;
+                    }
+                }
+
                 handle_path_events(client);
 
                 // See whether source Connection IDs have been retired.
@@ -449,18 +459,6 @@ pub fn start_server(args: ServerArgs, conn_args: CommonArgs) {
                     }
 
                     clients_ids.insert(scid, client.client_id);
-                }
-            }
-        }
-
-        for (_, client) in clients.iter_mut() {
-            if client.http_conn.is_some() && !client.app_conn_done {
-                let conn = &mut client.conn;
-                let app_conn = client.http_conn.as_mut().unwrap();
-
-                if app_conn.send(conn, &mut buf) {
-                    info!("app protocol done sending: {:?}", app_conn);
-                    client.app_conn_done = true;
                 }
             }
         }

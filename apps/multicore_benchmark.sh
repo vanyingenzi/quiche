@@ -49,6 +49,8 @@ mcmpquic_iteration_loop() {
         sudo pkill quiche-server
         sudo fuser -k 4433/udp
         sudo fuser -k 3344/udp
+        sudo fuser -k ${client_port_1}/udp
+        sudo fuser -k ${client_port_2}/udp
 
         ../target/release/quiche-server \
             --key "$(pwd)/src/bin/cert.key" \
@@ -95,6 +97,8 @@ mpquic_iteration_loop() {
         sudo pkill quiche-server
         sudo fuser -k 4433/udp
         sudo fuser -k 3344/udp
+        sudo fuser -k ${client_port_1}/udp
+        sudo fuser -k ${client_port_2}/udp
         
         ../target/release/quiche-server \
             --key "$(pwd)/src/bin/cert.key" \
