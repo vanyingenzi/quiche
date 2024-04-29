@@ -233,7 +233,7 @@ pub fn start_server(args: ServerArgs, conn_args: CommonArgs) {
                         if let Err(e) = socket.send_to(out, from) {
                             if e.kind() == std::io::ErrorKind::WouldBlock {
                                 trace!("send() would block");
-                                break;
+                                break 'read;
                             }
 
                             panic!("send() failed: {:?}", e);
@@ -272,7 +272,7 @@ pub fn start_server(args: ServerArgs, conn_args: CommonArgs) {
                             if let Err(e) = socket.send_to(out, from) {
                                 if e.kind() == std::io::ErrorKind::WouldBlock {
                                     trace!("send() would block");
-                                    break;
+                                    break 'read;
                                 }
 
                                 panic!("send() failed: {:?}", e);
@@ -286,7 +286,7 @@ pub fn start_server(args: ServerArgs, conn_args: CommonArgs) {
                         // drop the packet.
                         if odcid.is_none() {
                             error!("Invalid address validation token");
-                            continue;
+                            continue 'read;
                         }
 
                         if scid.len() != hdr.dcid.len() {
@@ -429,16 +429,6 @@ pub fn start_server(args: ServerArgs, conn_args: CommonArgs) {
                         client.conn.max_send_udp_payload_size();
                 }
 
-                if client.http_conn.is_some() && !client.app_conn_done {
-                    let conn = &mut client.conn;
-                    let app_conn = client.http_conn.as_mut().unwrap();
-    
-                    if app_conn.send(conn, &mut buf) {
-                        info!("app protocol done sending: {:?}", app_conn);
-                        client.app_conn_done = true;
-                    }
-                }
-
                 handle_path_events(client);
 
                 // See whether source Connection IDs have been retired.
@@ -462,6 +452,19 @@ pub fn start_server(args: ServerArgs, conn_args: CommonArgs) {
                 }
             }
         }
+
+        for client in clients.values_mut() {
+            if client.http_conn.is_some() && !client.app_conn_done {
+                let conn = &mut client.conn;
+                let app_conn = client.http_conn.as_mut().unwrap();
+
+                if app_conn.send(conn, &mut buf) {
+                    info!("app protocol done sending: {:?}", app_conn);
+                    client.app_conn_done = true;
+                }
+            }
+        }
+        
 
         // Generate outgoing QUIC packets for all active connections and send
         // them on the UDP socket, until quiche reports that there are no more

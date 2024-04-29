@@ -252,10 +252,10 @@ impl Default for CommonArgs {
     fn default() -> Self {
         CommonArgs {
             alpns: alpns::HTTP_3.to_vec(),
-            max_data: 1_000_000_000,
-            max_window: 1_000_000_000,
-            max_stream_data: 1_000_000_000,
-            max_stream_window: 1_000_000_000,
+            max_data: 10000000,
+            max_window: 25165824,
+            max_stream_data: 1000000,
+            max_stream_window: 16777216,
             max_streams_bidi: 100,
             max_streams_uni: 100,
             idle_timeout: 30000,
@@ -288,10 +288,10 @@ pub const CLIENT_USAGE: &str = "Usage:
 Options:
   --method METHOD          Use the given HTTP request method [default: GET].
   --body FILE              Send the given file as request body.
-  --max-data BYTES         Connection-wide flow control limit [default: 1000000000].
-  --max-window BYTES       Connection-wide max receiver window [default: 1000000000].
-  --max-stream-data BYTES  Per-stream flow control limit [default: 1000000000].
-  --max-stream-window BYTES   Per-stream max receiver window [default: 1000000000].
+  --max-data BYTES         Connection-wide flow control limit [default: 10000000].
+  --max-window BYTES       Connection-wide max receiver window [default: 25165824].
+  --max-stream-data BYTES  Per-stream flow control limit [default: 1000000].
+  --max-stream-window BYTES   Per-stream max receiver window [default: 16777216].
   --max-streams-bidi STREAMS  Number of allowed concurrent streams [default: 100].
   --max-streams-uni STREAMS   Number of allowed concurrent streams [default: 100].
   --idle-timeout TIMEOUT   Idle timeout in milliseconds [default: 30000].
@@ -540,10 +540,10 @@ Options:
   --root <dir>                Root directory [default: src/bin/root/]
   --index <name>              The file that will be used as index [default: index.html].
   --name <str>                Name of the server [default: quic.tech]
-  --max-data BYTES            Connection-wide flow control limit [default: 1000000000].
-  --max-window BYTES          Connection-wide max receiver window [default: 1000000000].
-  --max-stream-data BYTES     Per-stream flow control limit [default: 1000000000].
-  --max-stream-window BYTES   Per-stream max receiver window [default: 1000000000].
+  --max-data BYTES            Connection-wide flow control limit [default: 10000000].
+  --max-window BYTES          Connection-wide max receiver window [default: 25165824].
+  --max-stream-data BYTES     Per-stream flow control limit [default: 1000000].
+  --max-stream-window BYTES   Per-stream max receiver window [default: 16777216].
   --max-streams-bidi STREAMS  Number of allowed concurrent streams [default: 100].
   --max-streams-uni STREAMS   Number of allowed concurrent streams [default: 100].
   --idle-timeout TIMEOUT      Idle timeout in milliseconds [default: 30000].
