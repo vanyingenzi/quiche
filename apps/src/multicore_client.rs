@@ -473,7 +473,8 @@ pub fn multicore_connect(
     let multipath_requested = common_args.multipath;
     let (tx, rx) = channel();
     let active_threads = sockets_addrs.len();
-    let core_ids = core_affinity::get_core_ids().unwrap();
+    let mut core_ids = core_affinity::get_core_ids().unwrap();
+    core_ids.reverse();
     let set_core_affinity = common_args.cpu_affinity;
     let core_id = core_ids[0];
     threads_join.push(thread::spawn(move || {

@@ -308,8 +308,9 @@ fn server_thread(
             ) {
                 if e.kind() == std::io::ErrorKind::WouldBlock {
                     trace!("send() would block");
+                } else {
+                    panic!("send_to() failed: {:?}", e);
                 }
-                panic!("send_to() failed: {:?}", e);
             }
 
             trace!("written {} bytes", total_write);
@@ -444,7 +445,8 @@ pub fn multicore_start_server(args: ServerArgs, common_args: CommonArgs) {
         let (tx, rx) = channel();
         let nb_initiated_paths = 2; // Hard coded
         let clone_client_arc = client.clone();
-        let core_ids = core_affinity::get_core_ids().unwrap();
+        let mut core_ids = core_affinity::get_core_ids().unwrap();
+        core_ids.reverse();
         let set_core_affinity = common_args.cpu_affinity;
         let peer_addr = init_path.peer_addr();
 
