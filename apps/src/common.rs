@@ -31,6 +31,7 @@
 
 use std::collections::HashSet;
 use std::convert::TryInto;
+use std::io;
 use std::io::prelude::*;
 
 use std::collections::HashMap;
@@ -50,7 +51,6 @@ use std::time::Instant;
 
 use quiche::MulticoreConnection;
 use quiche::MulticorePath;
-use rand::Rng;
 use ring::rand::SecureRandom;
 
 use quiche::ConnectionId;
@@ -1740,8 +1740,6 @@ pub fn increment_port(socket_addr: std::net::SocketAddr) -> std::net::SocketAddr
     std::net::SocketAddr::new(ip, new_port)
 }
 
-use rand;
-
 #[derive(Debug)]
 pub struct AdaptedMcMPQUICConnServer {
     to_send: Option<usize>,
@@ -1868,13 +1866,12 @@ impl AdaptedMcMPQUICConnServer {
                     },
                 };
             } else {
-                let mut rng = rand::thread_rng();
                 let up_limit = if let Some(s) = self.to_send {
                     std::cmp::min(s - self.sent, buf.len())
                 } else {
                     buf.len()
                 };
-                rng.fill(&mut buf[..up_limit]);
+                io::repeat(1).read_exact(&mut buf[..up_limit]).unwrap();
                 let written = match conn.stream_send(
                     stream_id,
                     &mut buf[..up_limit],
@@ -2070,13 +2067,12 @@ impl McMPQUICConnServer {
                     },
                 };
             } else {
-                let mut rng = rand::thread_rng();
                 let up_limit = if let Some(s) = self.to_send {
                     std::cmp::min(s - self.sent, buf.len())
                 } else {
                     buf.len()
                 };
-                rng.fill(&mut buf[..up_limit]);
+                io::repeat(1).read_exact(&mut buf[..up_limit]).unwrap();
                 let written = match path.stream_send(
                     conn_guard,
                     stream_id,

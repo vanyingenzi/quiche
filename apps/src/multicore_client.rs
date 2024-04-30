@@ -28,6 +28,7 @@ use crate::args::*;
 use crate::common::*;
 
 use core_affinity;
+use quiche::Error;
 use std::sync::Arc;
 use std::sync::RwLock;
 use std::thread;
@@ -315,7 +316,13 @@ fn client_thread(
             }
         } else if nb_active_paths == 1 && can_close_conn && !requested_conn_close
         {
-            path.close_connection(&conn_guard, true, 0, b"").unwrap();
+            match path.close_connection(&conn_guard, true, 0, b"") {
+                Ok(..) | Err(Error::Done) => {}, 
+                Err(e) => {
+                    error!("An error occured when closing the connection : {:?}", e);
+                    return Err(ClientError::Other(e.to_string()))
+                }
+            }
             requested_conn_close = true;
         }
     }

@@ -11278,6 +11278,7 @@ impl MulticorePath {
             left = cmp::min(out.len(), self.reduced_max_send_udp_payload_size());
         } else {
             let mut conn = conn_guard.write().unwrap();
+            conn.get_multicore_pending_event(self);
             if conn.is_closed() || conn.is_draining() {
                 return Err(Error::Done);
             }
@@ -11342,6 +11343,7 @@ impl MulticorePath {
         } else {
             while left > 0 {
                 let mut conn = conn_guard.write().unwrap();
+                conn.get_multicore_pending_event(self);
     
                 let (ty, written) = match self.send_single(
                     &mut conn, 
@@ -11381,14 +11383,6 @@ impl MulticorePath {
         if done == 0 {
             self.last_tx_data = self.tx_data;
             return Err(Error::Done);
-        }
-
-        {
-            let mut conn = conn_guard.write().unwrap();
-            conn.get_multicore_pending_event(self);
-            if let Some(path_id) = self.path_id {
-                conn.paths_stats.insert(path_id, self.get_inner_path().unwrap().stats());
-            }
         }
 
         // Pad UDP datagram if it contains a QUIC Initial packet.
@@ -11575,6 +11569,8 @@ impl MulticorePath {
                 // frame, it should be fine.
                 let stream = {
                     let mut conn = conn_guard.write().unwrap();
+                    conn.get_multicore_pending_event(self);
+
                     match self.get_or_create_stream(&mut conn, stream_id, false) {
                         Ok(v) => v,
 
@@ -11624,6 +11620,7 @@ impl MulticorePath {
                 // frame, it should be fine.
                 let stream = {
                     let mut conn = conn_guard.write().unwrap();
+                    conn.get_multicore_pending_event(self);
                     match self.get_or_create_stream(&mut conn, stream_id, false) {
                         Ok(v) => v,
 
@@ -11755,6 +11752,8 @@ impl MulticorePath {
                 // frame, it should be fine.
                 let stream = {
                     let mut conn = conn_guard.write().unwrap();
+                    conn.get_multicore_pending_event(self);
+
                     match self.get_or_create_stream(&mut conn, stream_id, false) {
                         Ok(v) => v,
 
@@ -11790,6 +11789,7 @@ impl MulticorePath {
                 }
 
                 let mut conn = conn_guard.write().unwrap();
+                conn.get_multicore_pending_event(self);
                 conn.stream_ids.update_peer_max_streams_bidi(max);
             },
 
@@ -11799,6 +11799,7 @@ impl MulticorePath {
                 }
 
                 let mut conn = conn_guard.write().unwrap();
+                conn.get_multicore_pending_event(self);
                 conn.stream_ids.update_peer_max_streams_uni(max);
             },
 
@@ -11823,6 +11824,7 @@ impl MulticorePath {
                 reset_token,
             } => {
                 let mut conn = conn_guard.write().unwrap();
+                conn.get_multicore_pending_event(self);
                 if conn.ids.zero_length_dcid() {
                     return Err(Error::InvalidState);
                 }
@@ -11867,6 +11869,7 @@ impl MulticorePath {
                 error_code, reason, ..
             } => {
                 let mut conn = conn_guard.write().unwrap();
+                conn.get_multicore_pending_event(self);
                 conn.peer_error = Some(ConnectionError {
                     is_app: false,
                     error_code,
@@ -11895,6 +11898,7 @@ impl MulticorePath {
 
             frame::Frame::ApplicationClose { error_code, reason } => {
                 let mut conn = conn_guard.write().unwrap();
+                conn.get_multicore_pending_event(self);
                 conn.peer_error = Some(ConnectionError {
                     is_app: true,
                     error_code,
@@ -11920,6 +11924,7 @@ impl MulticorePath {
 
             frame::Frame::HandshakeDone => {
                 let mut conn = conn_guard.write().unwrap();
+                conn.get_multicore_pending_event(self);
                 if self.is_server {
                     return Err(Error::InvalidPacket);
                 }
@@ -11933,7 +11938,9 @@ impl MulticorePath {
             }
 
             frame::Frame::Datagram { data } => {
-                let conn = conn_guard.write().unwrap();
+                let mut conn = conn_guard.write().unwrap();
+                conn.get_multicore_pending_event(self);
+
                 // Close the connection if DATAGRAMs are not enabled.
                 // quiche always advertises support for 64K sized DATAGRAM
                 // frames, as recommended by the standard, so we don't need a
@@ -11982,7 +11989,7 @@ impl MulticorePath {
                 // error.
                 if let Ok(e) = reduced_conn.ids.get_dcid(space_identifier) {
                     if let Some(path_id) = e.path_id {
-                        if path_id == self.path_id.unwrap(){
+                        if path_id == self.path_id.unwrap(){ // For Multicore MPQUIC we don't send ack on a different path than the it's own
                             let is_app_limited = self.delivery_rate_check_if_app_limited();
                             let p = self.inner_path.as_mut().unwrap();
                             if is_app_limited {
@@ -11998,21 +12005,6 @@ impl MulticorePath {
                                 &reduced_conn.trace_id,
                                 &mut Vec::new(),
                             )?;
-                        } else {
-                            let mut conn = conn_guard.write().unwrap();
-                            // TODO multipath 
-                            conn.per_path_unprocessed_events.get_mut(&path_id).unwrap().push_back(
-                                MulticorePathPendingEvent::PacketOnACKReceived(
-                                    path_id,
-                                    0,
-                                    ranges.clone(), 
-                                    ack_delay,
-                                    epoch, 
-                                    reduced_conn.handshake_status,
-                                    now, 
-                                    reduced_conn.trace_id.clone(), 
-                                )
-                            );
                         }
                     }
                 }
@@ -12040,7 +12032,8 @@ impl MulticorePath {
                 dcid_seq_num,
                 seq_num,
             } => {
-                let conn = conn_guard.write().unwrap();
+                let mut conn = conn_guard.write().unwrap();
+                conn.get_multicore_pending_event(self);
                 if !conn.use_path_pkt_num_space(epoch) {
                     return Err(Error::MultiPathViolation);
                 }
@@ -13850,6 +13843,7 @@ impl MulticorePath {
                     
                     Err(Error::Done) => {
                         let mut conn = conn_guard.write().unwrap();
+                        conn.get_multicore_pending_event(self);
                         // If the packet can't be processed or decrypted, check if
                         // it's a stateless reset.
                         debug!("path_recv_single return done");
@@ -13894,6 +13888,7 @@ impl MulticorePath {
                     
                     Err(Error::Done) => {
                         let mut conn = conn_guard.write().unwrap();
+                        conn.get_multicore_pending_event(self);
                         // If the packet can't be processed or decrypted, check if
                         // it's a stateless reset.
                         debug!("recv_single return done");
@@ -13993,6 +13988,7 @@ impl MulticorePath {
             Some(_) => {},
             None => {
                 let mut conn = conn_guard.write().unwrap();
+                conn.get_multicore_pending_event(self);
                 conn.create_path_on_client(self)?;
             },
         };
@@ -14056,6 +14052,7 @@ impl MulticorePath {
             true => Ok(self.streams.get_mut(id).unwrap()), 
             false => {
                 let mut conn = conn_guard.write().unwrap();
+                conn.get_multicore_pending_event(self);
                 conn.stream_ids.create_stream(
                     &mut self.streams,
                     id,
@@ -14327,6 +14324,7 @@ impl MulticorePath {
                 // anymore.
                 if stream.is_complete() {
                     let mut conn = conn_guard.write().unwrap();
+                    conn.get_multicore_pending_event(self);
                     conn.stream_ids.collect(&mut self.streams, stream_id, local);
                 }
 
@@ -14351,6 +14349,7 @@ impl MulticorePath {
 
         if complete {
             let mut conn = conn_guard.write().unwrap();
+            conn.get_multicore_pending_event(self);
             conn.stream_ids.collect(&mut self.streams, stream_id, local);
         }
 
@@ -14423,6 +14422,7 @@ impl MulticorePath {
         }
         let now = time::Instant::now();
         let mut conn = conn_guard.write().unwrap();
+        conn.get_multicore_pending_event(self);
         
         // TODO multicore do better timeout handling
 
@@ -14537,6 +14537,8 @@ impl MulticorePath {
     /// Closes the connection with the given error and reason.
     pub fn close_connection(&mut self, conn_guard: &Arc<RwLock<MulticoreConnection>>, app: bool, err: u64, reason: &[u8]) -> Result<()> {
         let mut conn = conn_guard.write().unwrap();
+        conn.get_multicore_pending_event(self);
+
         let returned_by_conn = match conn.close(app, err, reason) {
             Ok(e) => Ok(e), 
             Err(Error::Done) => Err(Error::Done), 
