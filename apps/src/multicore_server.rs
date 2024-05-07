@@ -31,7 +31,7 @@ fn server_thread(
     let mut events = mio::Events::with_capacity(1024);
 
     let local_addr = path.local_addr();
-    let peer_addr = path.peer_addr();
+    let mut peer_addr = path.peer_addr();
     let (socket, pacing, enable_gso) = multicore_create_socket(
         &local_addr,
         &mut poll,
@@ -39,7 +39,7 @@ fn server_thread(
         args.disable_gso,
     );
 
-    info!(
+    debug!(
         "[Server Thread] Thread ID : {:?} Started with path {:?}",
         thread::current().id(),
         local_addr
@@ -119,6 +119,7 @@ fn server_thread(
             if !has_set_peer_addr {
                 path.set_peer_addr(from).unwrap();
                 has_set_peer_addr = true;
+                peer_addr = path.peer_addr();
             }
 
             // Process potentially coalesced packets.
@@ -270,6 +271,26 @@ fn server_thread(
                         path.local_addr(),
                         path.peer_addr()
                     );
+                    break;
+                },
+
+                Err(quiche::Error::MulticoreDrainingConn) => {
+                    if signal_path_done(
+                        &mut path,
+                        if can_close_conn {
+                            MulticoreStatus::Success
+                        } else {
+                            MulticoreStatus::Error
+                        },
+                        tx_finish_channel.as_mut(),
+                    ) {
+                        debug!(
+                            "path {:?} <-> {:?} finished, send connection draining",
+                            local_addr, peer_addr
+                        );
+                        return;
+                    }
+                    can_close_conn = true;
                     break;
                 },
 

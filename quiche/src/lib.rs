@@ -574,7 +574,10 @@ pub enum Error {
     MultiPathViolation,
 
     /// Just for multicore support checking
-    MulticoreNotDone,
+    MulticoreNotImplemented,
+
+    /// When a connection is draining
+    MulticoreDrainingConn,
 }
 
 impl Error {
@@ -9573,6 +9576,14 @@ impl MulticorePath {
                             self.draining_timer = Some(now + (pto * 3));
                             conn.draining = true;
 
+                            for (pid, q) in conn.per_path_unprocessed_events.iter_mut() {
+                                if *pid != path_id {
+                                    q.push_back(MulticorePathPendingEvent::LocalError(
+                                        conn_err.clone()
+                                    ))
+                                }
+                            }
+
                             ack_eliciting = true;
                             in_flight = true;
                         }
@@ -9589,6 +9600,13 @@ impl MulticorePath {
                         let pto = path.recovery.pto();
                         self.draining_timer = Some(now + (pto * 3));
                         conn.draining = true;
+                        for (pid, q) in conn.per_path_unprocessed_events.iter_mut() {
+                            if *pid != path_id {
+                                q.push_back(MulticorePathPendingEvent::LocalError(
+                                    conn_err.clone()
+                                ))
+                            }
+                        }
 
                         ack_eliciting = true;
                         in_flight = true;
@@ -10756,6 +10774,13 @@ impl MulticorePath {
                             self.draining_timer = Some(now + (pto * 3));
                             let mut conn = conn_guard.write().unwrap();
                             conn.draining = true;
+                            for (pid, q) in conn.per_path_unprocessed_events.iter_mut() {
+                                if *pid != path_id {
+                                    q.push_back(MulticorePathPendingEvent::LocalError(
+                                        conn_err.clone()
+                                    ))
+                                }
+                            }
 
                             ack_eliciting = true;
                             in_flight = true;
@@ -10774,6 +10799,13 @@ impl MulticorePath {
                         self.draining_timer = Some(now + (pto * 3));
                         let mut conn = conn_guard.write().unwrap();
                         conn.draining = true;
+                        for (pid, q) in conn.per_path_unprocessed_events.iter_mut() {
+                            if *pid != path_id {
+                                q.push_back(MulticorePathPendingEvent::LocalError(
+                                    conn_err.clone()
+                                ))
+                            }
+                        }
 
                         ack_eliciting = true;
                         in_flight = true;
@@ -11235,7 +11267,7 @@ impl MulticorePath {
     /// Sets expected peer addr
     pub fn set_peer_addr(&mut self, peer_addr: SocketAddr) -> Result<()> {
         if self.inner_path.is_some(){
-            return Err(Error::MulticoreNotDone); // This is too late to do do
+            return Err(Error::MulticoreNotImplemented); // This is too late to do do
         }
         self.peer_addr = peer_addr;
         Ok(())
@@ -11273,7 +11305,7 @@ impl MulticorePath {
         if self.completed_multipath_handshake {
             let reduced_conn = self.reduced_connection.as_ref().unwrap();
             if reduced_conn.closed || self.draining_timer.is_some(){
-                return Err(Error::Done);
+                return Err(Error::MulticoreDrainingConn);
             }
             left = cmp::min(out.len(), self.reduced_max_send_udp_payload_size());
         } else {
@@ -11839,13 +11871,13 @@ impl MulticorePath {
                 for (_, _) in retired_path_ids {
                     // TODO multicore
                     info!("There some retired path ids to handle");
-                    return Err(Error::MulticoreNotDone);
+                    return Err(Error::MulticoreNotImplemented);
                 }
             },
 
             frame::Frame::RetireConnectionId { .. } => {
                 info!("There some retired connection ids to handle");
-                return Err(Error::MulticoreNotDone);
+                return Err(Error::MulticoreNotImplemented);
             },
 
             frame::Frame::PathChallenge { data } => {
@@ -11870,18 +11902,27 @@ impl MulticorePath {
             } => {
                 let mut conn = conn_guard.write().unwrap();
                 conn.get_multicore_pending_event(self);
-                conn.peer_error = Some(ConnectionError {
+                let conn_error = ConnectionError {
                     is_app: false,
                     error_code,
                     reason: reason.clone(),
-                });
+                };
 
+                
                 conn.recv_connection_close = true;
-
                 
                 let path = self.inner_path.as_mut().unwrap();
                 self.draining_timer = Some(now + (path.recovery.pto() * 3));
                 conn.draining = true;
+                
+                let path_id = self.get_path_id();
+                for (pid, q) in conn.per_path_unprocessed_events.iter_mut() {
+                    if *pid != path_id {
+                        q.push_back(MulticorePathPendingEvent::PeerError(
+                            conn_error.clone()
+                        ))
+                    }
+                }
 
                 let reduced_conn = self.reduced_connection.as_mut().unwrap();
                 reduced_conn.peer_error = Some(
@@ -11891,6 +11932,7 @@ impl MulticorePath {
                         reason,
                     }
                 );
+                conn.peer_error = Some(conn_error);
 
                 // TODO multicore notify other threads
 
@@ -11899,25 +11941,36 @@ impl MulticorePath {
             frame::Frame::ApplicationClose { error_code, reason } => {
                 let mut conn = conn_guard.write().unwrap();
                 conn.get_multicore_pending_event(self);
-                conn.peer_error = Some(ConnectionError {
+
+                let conn_error = ConnectionError {
                     is_app: true,
                     error_code,
                     reason: reason.clone(),
-                });
+                };
                 conn.recv_application_close = true;
 
                 let path = self.get_inner_path_mut().unwrap();
                 self.draining_timer = Some(now + (path.recovery.pto() * 3));
                 conn.draining = true;
 
+                let path_id = self.get_path_id();
+                for (pid, q) in conn.per_path_unprocessed_events.iter_mut() {
+                    if *pid != path_id {
+                        q.push_back(MulticorePathPendingEvent::PeerError(
+                            conn_error.clone()
+                        ))
+                    }
+                }
+
                 let reduced_conn = self.reduced_connection.as_mut().unwrap();
                 reduced_conn.peer_error = Some(
                     ConnectionError {
-                        is_app: false,
+                        is_app: true,
                         error_code,
                         reason,
                     }
                 );
+                conn.peer_error = Some(conn_error);
 
                 // TODO multicore notify other threads
             },
@@ -12017,7 +12070,7 @@ impl MulticorePath {
             } => {
                 // TODO multipath
                 info!("There's a path abandon");
-                return Err(Error::MulticoreNotDone); 
+                return Err(Error::MulticoreNotImplemented); 
             },
 
             frame::Frame::PathStandby {
@@ -12025,7 +12078,7 @@ impl MulticorePath {
             } => {
                 // TODO multipath
                 info!("There's a path standby");
-                return Err(Error::MulticoreNotDone);
+                return Err(Error::MulticoreNotImplemented);
             }, 
 
             frame::Frame::PathAvailable {
@@ -12445,13 +12498,13 @@ impl MulticorePath {
                 for (_, _) in retired_path_ids {
                     // TODO multicore
                     info!("There some retired path ids to handle");
-                    return Err(Error::MulticoreNotDone);
+                    return Err(Error::MulticoreNotImplemented);
                 }
             },
 
             frame::Frame::RetireConnectionId { .. } => {
                 info!("There some retired connection ids to handle");
-                return Err(Error::MulticoreNotDone);
+                return Err(Error::MulticoreNotImplemented);
             },
 
             frame::Frame::PathChallenge { data } => {
@@ -12620,7 +12673,7 @@ impl MulticorePath {
             } => {
                 // TODO multipath
                 info!("There's a path abandon");
-                return Err(Error::MulticoreNotDone); 
+                return Err(Error::MulticoreNotImplemented); 
                 // if !conn.use_path_pkt_num_space(epoch) {
                 //     return Err(Error::MultiPathViolation);
                 // }
@@ -12645,7 +12698,7 @@ impl MulticorePath {
             } => {
                 // TODO multipath
                 info!("There's a path standby");
-                return Err(Error::MulticoreNotDone);
+                return Err(Error::MulticoreNotImplemented);
                 // if !self.use_path_pkt_num_space(epoch) {
                 //     return Err(Error::MultiPathViolation);
                 // }
@@ -12976,7 +13029,7 @@ impl MulticorePath {
         let mut conn = conn_guard.write().unwrap();
         // Select AEAD context used to open incoming packet.
         let aead = if hdr.ty == packet::Type::ZeroRTT {
-            return Err(Error::MulticoreNotDone);
+            return Err(Error::MulticoreNotImplemented);
             // Not supported yet for multicore
         } else {
             // Otherwise use the packet number space's main key.
@@ -13351,7 +13404,7 @@ impl MulticorePath {
         if conn.dcid_seq_to_abandon.len() > 0 {
             // TODO multicore
             error!("Handle path abandon on draining");
-            return Err(Error::MulticoreNotDone);
+            return Err(Error::MulticoreNotImplemented);
         }
 
         // Now that we processed all the frames, if there is a path that has no
@@ -13487,7 +13540,7 @@ impl MulticorePath {
         // Select packet number space epoch based on the received packet's type.
         let epoch = hdr.ty.to_epoch()?;
         let aead = if hdr.ty == packet::Type::ZeroRTT {
-            return Err(Error::MulticoreNotDone);
+            return Err(Error::MulticoreNotImplemented);
             // Not supported yet for multicore
         } else {
             // Otherwise use the packet number space's main key.
@@ -13499,7 +13552,7 @@ impl MulticorePath {
             Some(v) => v,
 
             None => {
-                return Err(Error::MulticoreNotDone);
+                return Err(Error::MulticoreNotImplemented);
             },
         };
 
@@ -13724,7 +13777,7 @@ impl MulticorePath {
                     conn.dcid_seq_to_abandon.push_back(dcid_seq_num);
 
                     error!("Handle path abandon on draining");
-                    return Err(Error::MulticoreNotDone);
+                    return Err(Error::MulticoreNotImplemented);
                 },
 
                 _ => (),
@@ -13764,7 +13817,7 @@ impl MulticorePath {
                 pkt_num_space.largest_rx_non_probing_pkt_num == pn
             {
                 // TODO multicore
-                return Err(Error::MulticoreNotDone);
+                return Err(Error::MulticoreNotImplemented);
                 // conn.on_peer_migrated(recv_pid, conn.disable_dcid_reuse, now)?;
             }
         }
@@ -13969,9 +14022,13 @@ impl MulticorePath {
                     p.recovery.on_pkt_num_space_discarded(*epoch, *handshake_status, *now)
                 }, 
                 MulticorePathPendingEvent::LocalError(conn_err) => {
+                    let now = std::time::Instant::now();
+                    self.draining_timer = Some(now + (p.recovery.pto() * 3));
                     self.reduced_connection.as_mut().unwrap().local_error = Some(conn_err.clone());
                 }, 
                 MulticorePathPendingEvent::PeerError(conn_err) => {
+                    let now = std::time::Instant::now();
+                    self.draining_timer = Some(now + (p.recovery.pto() * 3));
                     self.reduced_connection.as_mut().unwrap().peer_error = Some(conn_err.clone());
                 },
             }
@@ -14029,7 +14086,7 @@ impl MulticorePath {
         path.set_state(requested_state)?;
 
         if path.is_closing(){
-            return Err(Error::MulticoreNotDone);
+            return Err(Error::MulticoreNotImplemented);
         }
 
         // After any path state change, check for the transmission rate.
@@ -14442,7 +14499,7 @@ impl MulticorePath {
             return;
         }
 
-        if let Some(timer) = conn.idle_timer {
+        if let Some(timer) = self.idle_timer {
             if timer <= now {
                 trace!("{} idle timeout expired", conn.trace_id);
 

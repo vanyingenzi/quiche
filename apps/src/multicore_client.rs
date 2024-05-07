@@ -78,7 +78,9 @@ fn multicore_initiate_connection(
 fn write_packets_on_socket(
     conn_guard: &Arc<RwLock<MulticoreConnection>>, path: &mut MulticorePath,
     buf: &mut [u8], socket: &UdpSocket,
-) -> Result<(), ClientError> {
+    tx_finish_channel: Option<&mut Sender<MulticorePathDoneInfo>>,
+    can_close_conn: &mut bool,
+) -> Result<bool, ClientError> {
     let local_addr = path.local_addr();
     let peer_addr = path.peer_addr();
     loop {
@@ -87,6 +89,26 @@ fn write_packets_on_socket(
 
             Err(quiche::Error::Done) => {
                 //trace!("{} -> {}: done writing", local_addr, peer_addr);
+                break;
+            },
+
+            Err(quiche::Error::MulticoreDrainingConn) => {
+                if signal_path_done(
+                    path,
+                    if *can_close_conn {
+                        MulticoreStatus::Success
+                    } else {
+                        MulticoreStatus::Error
+                    },
+                    tx_finish_channel,
+                ) {
+                    debug!(
+                        "path {:?} <-> {:?} finished, send connection draining",
+                        local_addr, peer_addr
+                    );
+                    return Ok(true);
+                }
+                *can_close_conn = true;
                 break;
             },
 
@@ -111,7 +133,7 @@ fn write_packets_on_socket(
         trace!("{} -> {}: written {}", local_addr, send_info.to, write);
     }
     //trace!("[PARSE_EVENT] [topic: locking] [type: duration] [event: Conn + UDP Snd CS] [metadata: {:?}] [value: {:?}]", thread::current().id(), timestamp.elapsed().as_nanos());
-    Ok(())
+    Ok(false)
 }
 
 #[inline]
@@ -191,7 +213,7 @@ fn client_thread(
         .unwrap();
     }
 
-    info!(
+    debug!(
         "[Path Thread]: Thread {:?}, started with path {} <-> {}",
         thread::current().id(),
         local_addr,
@@ -294,7 +316,16 @@ fn client_thread(
         }
 
         if probed_my_path {
-            write_packets_on_socket(&conn_guard, &mut path, &mut out, &socket)?;
+            if write_packets_on_socket(
+                &conn_guard,
+                &mut path,
+                &mut out,
+                &socket,
+                tx_finish_channel.as_mut(),
+                &mut can_close_conn,
+            )? {
+                return Ok(()); // Path can return
+            }
         }
 
         if nb_active_paths == 1 && can_close_conn && requested_conn_close {
@@ -315,11 +346,14 @@ fn client_thread(
         } else if nb_active_paths == 1 && can_close_conn && !requested_conn_close
         {
             match path.close_connection(&conn_guard, true, 0, b"") {
-                Ok(..) | Err(Error::Done) => {}, 
+                Ok(..) | Err(Error::Done) => {},
                 Err(e) => {
-                    error!("An error occured when closing the connection : {:?}", e);
-                    return Err(ClientError::Other(e.to_string()))
-                }
+                    error!(
+                        "An error occured when closing the connection : {:?}",
+                        e
+                    );
+                    return Err(ClientError::Other(e.to_string()));
+                },
             }
             requested_conn_close = true;
         }
