@@ -61,6 +61,7 @@ fn server_thread(
     let mut scid_sent = false;
     let mut has_set_peer_addr = rx_finish_channel.is_some();
     let rng = SystemRandom::new();
+    let mut probed_my_path = rx_finish_channel.is_some();
 
     let path_transfer_size = if let Some(s) = args.transfer_size {
         Some(s / nb_initiated_paths)
@@ -134,7 +135,6 @@ fn server_thread(
 
             if rx_finish_channel.is_some() && !scid_sent {
                 // TODO multicore retired scid
-
                 // Provides as many CIDs as possible.
                 while path.source_cids_left(&client.conn) > 0 {
                     let (scid, reset_token) = generate_cid_and_reset_token(&rng);
@@ -166,14 +166,13 @@ fn server_thread(
                         stream_id = next_stream_id.clone();
                         *next_stream_id += 4; // We are using server unidirectional streams
                     }
-                    mmpquic_conn =
-                        Some(McMPQUICConnServer::new(
-                            &mut path,
-                            &client.conn,
-                            stream_id, 
-                            path_transfer_size,
-                            args.transfer_time
-                        ));
+                    mmpquic_conn = Some(McMPQUICConnServer::new(
+                        &mut path,
+                        &client.conn,
+                        stream_id,
+                        path_transfer_size,
+                        args.transfer_time,
+                    ));
                     created_app_conn = true;
                 } else {
                     error!("APLN not mMPQUIC");
@@ -234,7 +233,7 @@ fn server_thread(
         }
 
         path.handle_pending_multicore_events().unwrap();
-        handle_path_events(&mut path, &client.conn);
+        handle_path_events(&mut path, &client.conn, &mut probed_my_path);
 
         continue_write = false;
         loss_rate = if path.has_inner_path() {
@@ -256,7 +255,7 @@ fn server_thread(
         let mut total_write = 0;
         let mut dst_info: Option<quiche::SendInfo> = None;
 
-        while total_write < max_send_burst {
+        while total_write < max_send_burst && probed_my_path {
             let res = path.send_on_path(
                 &client.conn,
                 &mut out[total_write..max_send_burst],
@@ -443,7 +442,7 @@ pub fn multicore_start_server(args: ServerArgs, common_args: CommonArgs) {
         let client = Arc::new(client);
         let copied_args = args.clone();
         let (tx, rx) = channel();
-        let nb_initiated_paths = 2; // Hard coded
+        let nb_initiated_paths = common_args.server_addresses.len() + 1;
         let clone_client_arc = client.clone();
         let mut core_ids = core_affinity::get_core_ids().unwrap();
         core_ids.reverse();
@@ -453,7 +452,7 @@ pub fn multicore_start_server(args: ServerArgs, common_args: CommonArgs) {
         let mut joins = Vec::new();
         let core_id = core_ids[0];
         joins.push(thread::spawn(move || {
-            if set_core_affinity{
+            if set_core_affinity {
                 if core_affinity::set_for_current(core_id) {
                     debug!("set core affinity for {:?}", thread::current().id());
                 }
@@ -483,7 +482,10 @@ pub fn multicore_start_server(args: ServerArgs, common_args: CommonArgs) {
             joins.push(thread::spawn(move || {
                 if set_core_affinity {
                     if core_affinity::set_for_current(core_id) {
-                        debug!("set core affinity for {:?}", thread::current().id());
+                        debug!(
+                            "set core affinity for {:?}",
+                            thread::current().id()
+                        );
                     }
                 }
                 server_thread(
@@ -829,15 +831,19 @@ fn set_txtime_sockopt(sock: &mio::net::UdpSocket) -> io::Result<()> {
 
 fn handle_path_events(
     path: &mut MulticorePath, conn_guard: &Arc<RwLock<MulticoreConnection>>,
+    probed_my_path: &mut bool,
 ) {
     while let Some(qe) = path.path_event_next() {
         match qe {
             quiche::PathEvent::New(local_addr, peer_addr) => {
                 info!("Seen new path ({}, {})", local_addr, peer_addr);
                 // Directly probe the new path.
-                path.probe_path(conn_guard)
-                    .map_err(|e| error!("cannot probe: {}", e))
-                    .ok();
+                match path.probe_path(conn_guard) {
+                    Ok(..) => *probed_my_path = true,
+                    Err(e) => {
+                        error!("cannot probe: {}", e)
+                    },
+                }
             },
 
             quiche::PathEvent::Validated(local_addr, peer_addr) => {

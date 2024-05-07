@@ -1907,9 +1907,10 @@ pub struct AdaptedMcMPQUICConnClient {
 
 impl AdaptedMcMPQUICConnClient{
     pub fn new(
+        expected_streams: usize
     ) -> Self {
         AdaptedMcMPQUICConnClient{
-            expected_streams: 2,
+            expected_streams,
             ..Default::default()
         }
     }

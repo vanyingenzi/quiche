@@ -399,17 +399,22 @@ pub fn start_server(args: ServerArgs, conn_args: CommonArgs) {
 
                     #[allow(clippy::box_default)]
                     if alpns::MMPQUIC.contains(&app_proto) {
-                        let stream_id = client.next_stream_id;
                         let mut app_conn = AdaptedMcMPQUICConnServer::new(
                             &mut client.conn,
-                            stream_id,
+                            client.next_stream_id,
                             args.transfer_size,
                             args.transfer_time,
                         );
-                        app_conn.add_stream(&mut client.conn, stream_id + 4);
-                        client.next_stream_id += 8; // We are using server unidirectional streams
+                        client.next_stream_id += 4; // We are using server unidirectional streams
+                        let mut created_streams = 1;
+                        while created_streams < sockets.len() {
+                            app_conn.add_stream(&mut client.conn, client.next_stream_id);
+                            client.next_stream_id += 4; // We are using server unidirectional streams
+                            created_streams += 1;
+                        }
                         client.http_conn = Some(app_conn);
                         client.app_proto_selected = true;
+
                     } else {
                         error!("APLN not mMPQUIC");
                         match client.conn.close(

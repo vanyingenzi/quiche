@@ -346,7 +346,7 @@ pub fn connect(
             let app_proto = conn.application_proto();
 
             if alpns::MMPQUIC.contains(&app_proto) {
-                app_conn = Some(AdaptedMcMPQUICConnClient::new());
+                app_conn = Some(AdaptedMcMPQUICConnClient::new(sockets.len()));
                 app_proto_selected = true;
                 info!("proto selected");
             } else {
@@ -434,12 +434,12 @@ pub fn connect(
 
         // Provides as many CIDs as possible.
         while conn.source_cids_left() > 0 {
+            info!("before source cids left : {:?}", conn.source_cids_left());
             let (scid, reset_token) = generate_cid_and_reset_token(&rng);
 
             if conn.new_source_cid(&scid, reset_token, false).is_err() {
                 break;
             }
-
             scid_sent = true;
         }
 

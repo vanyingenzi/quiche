@@ -198,7 +198,6 @@ fn client_thread(
         peer_addr
     );
 
-    let mut scid_sent = false;
     let mut probed_my_path = initiate_connection;
     let app_data_start = std::time::Instant::now();
     let mut nb_active_paths = nb_initiated_paths;
@@ -273,7 +272,7 @@ fn client_thread(
         path.handle_pending_multicore_events().unwrap();
         handle_path_events(&mut path);
 
-        if initiate_connection && !scid_sent {
+        if initiate_connection {
             // TODO multicore retired scid
             while path.source_cids_left(&conn_guard) > 0 {
                 let (scid, reset_token) = generate_cid_and_reset_token(&rng);
@@ -283,7 +282,6 @@ fn client_thread(
                 {
                     break;
                 }
-                scid_sent = true;
             }
         }
 
