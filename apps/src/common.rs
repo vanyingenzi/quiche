@@ -1902,7 +1902,8 @@ pub struct AdaptedMcMPQUICConnClient {
     received: usize,
     stream_ids: HashSet<u64>,
     recv_fin_ids: HashSet<u64>,
-    expected_streams: usize
+    expected_streams: usize, 
+    ending: bool // received fin on one stream
 }
 
 impl AdaptedMcMPQUICConnClient{
@@ -1935,6 +1936,16 @@ impl AdaptedMcMPQUICConnClient{
                 self.stream_ids.insert(s);
                 if fin {
                     self.recv_fin_ids.insert(s);
+                    self.ending = true;
+                }
+            }
+        }
+        if self.ending {
+            for s in self.stream_ids.iter(){
+                if !self.recv_fin_ids.contains(s) {
+                    if conn.streams.is_collected(*s){
+                        self.recv_fin_ids.insert(*s);
+                    }
                 }
             }
         }

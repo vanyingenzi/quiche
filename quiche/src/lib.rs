@@ -1349,7 +1349,7 @@ pub struct Connection {
     /// Streams map, indexed by stream ID.
     // ! stream IDs have to be controlled by the Connection but the rest of the logic to the path
     // ! In other words this structure has to be decoupled too.
-    streams: stream::StreamMap,
+    pub streams: stream::StreamMap,
 
     /// Peer's original destination connection ID. Used by the client to
     /// validate the server's transport parameter.
