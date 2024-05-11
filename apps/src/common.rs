@@ -1943,7 +1943,7 @@ impl AdaptedMcMPQUICConnClient{
         if self.ending {
             for s in self.stream_ids.iter(){
                 if !self.recv_fin_ids.contains(s) {
-                    if conn.streams.is_collected(*s){
+                    if conn.stream_finished(*s){
                         self.recv_fin_ids.insert(*s);
                     }
                 }

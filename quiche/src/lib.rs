@@ -7501,6 +7501,10 @@ impl Connection {
                     return Err(Error::InvalidStreamState(stream_id));
                 }
 
+                if data.fin() {
+                    info!("Received fin for stream id {:?}", stream_id);
+                }
+
                 let max_rx_data_left = self.max_rx_data() - self.rx_data;
 
                 // Get existing stream or create a new one, but if the stream
