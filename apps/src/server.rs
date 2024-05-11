@@ -140,7 +140,7 @@ pub fn start_server(args: ServerArgs, conn_args: CommonArgs) {
         let timeout = match continue_write {
             true => Some(std::time::Duration::from_secs(0)),
 
-            false => clients.values().filter_map(|c| c.conn.timeout()).min(),
+            false => Some(std::time::Duration::from_millis(10)), // clients.values().filter_map(|c| c.conn.timeout()).min(),
         };
 
         poll.poll(&mut events, timeout).unwrap();

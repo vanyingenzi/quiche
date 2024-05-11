@@ -228,7 +228,7 @@ pub fn connect(
 
     loop {
         if !conn.is_in_early_data() || app_proto_selected {
-            poll.poll(&mut events, conn.timeout()).unwrap();
+            poll.poll(&mut events, Some(std::time::Duration::from_millis(10))).unwrap();
         }
 
         // If the event loop reported no events, it means that the timeout
