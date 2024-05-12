@@ -103,7 +103,7 @@ fn write_packets_on_socket(
                     tx_finish_channel,
                 ) {
                     info!(
-                        "path {:?} <-> {:?} finished, send connection draining",
+                        "path {:?} <-> {:?} finished, connection draining",
                         local_addr, peer_addr
                     );
                     return Ok(true);

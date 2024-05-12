@@ -81,14 +81,6 @@ fn server_thread(
             if events.is_empty() && !continue_write {
                 trace!("timed out");
 
-                if rx_finish_channel.is_some() {
-                    handle_done_paths(
-                        rx_finish_channel.as_mut(),
-                        &mut nb_active_paths,
-                    )
-                    .unwrap();
-                }
-
                 // TODO multicore timeout
                 path.on_timeout(&client.conn);
                 break 'read;
@@ -150,6 +142,14 @@ fn server_thread(
             }
         }
 
+        if rx_finish_channel.is_some() {
+            handle_done_paths(
+                rx_finish_channel.as_mut(),
+                &mut nb_active_paths,
+            )
+            .unwrap();
+        }
+
         if !created_app_conn {
             if (is_in_early_data || is_established) && path.is_active() {
                 let app_proto;
@@ -175,6 +175,7 @@ fn server_thread(
                         args.transfer_time,
                     ));
                     created_app_conn = true;
+                    info!("{:?} <-> {:?} created app conn", path.local_addr(), path.peer_addr());
                 } else {
                     error!("APLN not mMPQUIC");
                     path.close_connection(
@@ -879,7 +880,7 @@ fn handle_path_events(
             },
 
             quiche::PathEvent::FailedValidation(local_addr, peer_addr) => {
-                info!("Path ({}, {}) failed validation", local_addr, peer_addr);
+                error!("Path ({}, {}) failed validation", local_addr, peer_addr);
             },
 
             quiche::PathEvent::Closed(local_addr, peer_addr, err, reason) => {
