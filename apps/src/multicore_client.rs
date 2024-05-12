@@ -102,7 +102,7 @@ fn write_packets_on_socket(
                     },
                     tx_finish_channel,
                 ) {
-                    debug!(
+                    info!(
                         "path {:?} <-> {:?} finished, send connection draining",
                         local_addr, peer_addr
                     );
@@ -259,14 +259,13 @@ fn client_thread(
                 },
             }
         } else {
-            if rx_finish_channel.is_some() {
-                handle_done_paths(
-                    rx_finish_channel.as_mut(),
-                    &mut nb_active_paths,
-                )?;
-            }
             path.on_timeout(&conn_guard);
         }
+
+        handle_done_paths(
+            rx_finish_channel.as_mut(),
+            &mut nb_active_paths,
+        )?;
 
         if !can_close_conn {
             if mmpquic_conn.recv(&mut path, &conn_guard, &mut buf) {
@@ -541,7 +540,7 @@ pub fn multicore_connect(
         threads_join.push(thread::spawn(move || {
             if set_core_affinity {
                 if core_affinity::set_for_current(core_id) {
-                    info!("set core affinity for {:?}", thread::current().id());
+                    debug!("set core affinity for {:?}", thread::current().id());
                 }
             }
 
@@ -582,8 +581,6 @@ fn multicore_prepare_addresses(
     let mut local_addrs = vec![];
     let mut peer_tuples = vec![];
     peer_tuples.push(connect_to_addr.clone());
-
-    info!("server addresses: {:?}", common_args.server_addresses);
 
     if args.addrs.len() != common_args.server_addresses.len() + 1 {
         panic!("Clients addrs are not equal to server addresses");

@@ -1501,9 +1501,6 @@ pub struct MulticoreConnection {
 
     /// List of supported application protocols.
     application_protos: Vec<Vec<u8>>, //* Clonable, 
-
-    /// Idle timeout expiration time.
-    idle_timer: Option<time::Instant>,
     
     /// Peer's original destination connection ID. Used by the client to
     /// validate the server's transport parameter.
@@ -10117,7 +10114,7 @@ impl MulticorePath {
         // packet since last receiving a packet.
         if ack_eliciting && !conn.ack_eliciting_sent {
             if let Some(idle_timeout) = self.idle_timeout() {
-                conn.idle_timer = Some(now + idle_timeout);
+                self.idle_timer = Some(now + idle_timeout);
             }
         }
 
@@ -13467,7 +13464,7 @@ impl MulticorePath {
         }
 
         if let Some(idle_timeout) = self.idle_timeout() {
-            conn.idle_timer = Some(now + idle_timeout);
+            self.idle_timer = Some(now + idle_timeout);
         }
 
         // Update send capacity.
@@ -14517,25 +14514,6 @@ impl MulticorePath {
             }
         }
 
-        if let Some(timer) = conn
-            .pkt_num_spaces
-            .crypto
-            .get(packet::Epoch::Application)
-            .key_update
-            .as_ref()
-            .map(|key_update| key_update.timer)
-        {
-            if timer <= now {
-                // Discard previous key once key update timer expired.
-                let _ = conn
-                    .pkt_num_spaces
-                    .crypto
-                    .get_mut(packet::Epoch::Application)
-                    .key_update
-                    .take();
-            }
-        }
-
         let handshake_status = conn.handshake_status();
         let p = self.inner_path.as_mut().unwrap();
         if let Some(timer) = p.closing_timer() {
@@ -14792,7 +14770,6 @@ impl MulticoreConnection {
             handshake_confirmed: false,
 
             key_phase: false,
-            idle_timer: None,
 
             closed: false,
 
