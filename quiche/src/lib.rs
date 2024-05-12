@@ -4669,6 +4669,9 @@ impl Connection {
                     ack_eliciting = true;
                     in_flight = true;
                     has_data = true;
+                    if fin {
+                        info!("sent fin for stream id {:?}", stream_id);
+                    }
                 }
 
                 let priority_key = Arc::clone(&stream.priority_key);

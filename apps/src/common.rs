@@ -1841,7 +1841,7 @@ impl AdaptedMcMPQUICConnServer {
     ) -> bool {
         let fin = self.is_fin();
         for stream_id in conn.writable() {
-            if !self.stream_ids.contains(&stream_id) && self.sent_fin_ids.contains(&stream_id){
+            if !self.stream_ids.contains(&stream_id) || self.sent_fin_ids.contains(&stream_id){
                 continue;
             }
             if fin {
@@ -2052,7 +2052,7 @@ impl McMPQUICConnServer {
     ) -> bool {
         let fin = self.is_fin();
         for stream_id in path.writable() {
-            if !self.stream_ids.contains(&stream_id) && self.sent_fin_ids.contains(&stream_id){
+            if !self.stream_ids.contains(&stream_id) || self.sent_fin_ids.contains(&stream_id){
                 continue;
             }
             if fin {
