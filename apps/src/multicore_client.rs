@@ -225,7 +225,7 @@ fn client_thread(
     let mut nb_active_paths = nb_initiated_paths;
     let mut can_close_conn = false;
     let mut requested_conn_close = false;
-    let mut mmpquic_conn = McMPQUICConnClient::new();
+    let mut app_conn = McMPQUICConnClient::new();
 
     'main: loop {
         // TODO multicore timeout
@@ -266,9 +266,10 @@ fn client_thread(
             rx_finish_channel.as_mut(),
             &mut nb_active_paths,
         )?;
+        path.handle_pending_multicore_events().unwrap();
 
         if !can_close_conn {
-            if mmpquic_conn.recv(&mut path, &conn_guard, &mut buf) {
+            if app_conn.recv(&mut path, &conn_guard, &mut buf) {
                 info!(
                     "path {:?} <-> {:?} received in {:?}",
                     local_addr,
@@ -277,7 +278,7 @@ fn client_thread(
                 );
                 info!(
                     "path {:?} <-> {:?} app_conn: {:?}",
-                    local_addr, peer_addr, mmpquic_conn
+                    local_addr, peer_addr, app_conn
                 );
                 can_close_conn = true;
                 if signal_path_done(
@@ -290,7 +291,6 @@ fn client_thread(
             }
         }
 
-        path.handle_pending_multicore_events().unwrap();
         handle_path_events(&mut path);
 
         if initiate_connection {
@@ -364,8 +364,6 @@ pub fn multicore_connect(
     args: ClientArgs, common_args: CommonArgs,
     _output_sink: impl FnMut(String) + 'static,
 ) -> Result<(), ClientError> {
-    // We'll only connect to the first server provided in URL list.
-
     // Resolve server address.
     let peer_addr = if let Some(addr) = &args.connect_to {
         addr.parse().expect("--connect-to is expected to be a string containing an IPv4 or IPv6 address with a port. E.g. 192.0.2.0:443")

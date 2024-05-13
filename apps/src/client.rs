@@ -348,7 +348,7 @@ pub fn connect(
             if alpns::MMPQUIC.contains(&app_proto) {
                 app_conn = Some(AdaptedMcMPQUICConnClient::new(sockets.len()));
                 app_proto_selected = true;
-                info!("proto selected");
+                debug!("proto selected");
             } else {
                 error!("App protocol not mcMPQUIC !");
                 match conn.close(true, 0, b"APLN not mMPQUIC".as_slice()) {

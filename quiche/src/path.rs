@@ -519,7 +519,6 @@ impl Path {
         }
 
         self.state = state;
-        info!("{:?} <-> {:?} state set to : {:?}", self.local_addr, self.peer_addr, self.state);
         Ok(())
     }
 

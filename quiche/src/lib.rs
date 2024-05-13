@@ -8776,7 +8776,9 @@ impl MulticorePath {
                 continue;
             }
 
-            if conn.pkt_num_spaces.is_ready(epoch, self.get_inner_path_mut().unwrap().active_dcid_seq) {
+            if  conn.pkt_num_spaces.is_ready(epoch, self.get_inner_path_mut().unwrap().active_dcid_seq) || 
+                conn.pkt_num_spaces.is_ready(epoch, self.get_inner_path_mut().unwrap().active_scid_seq) 
+            {
                 return Ok(packet::Type::from_epoch(epoch));
             }
 
@@ -10134,7 +10136,6 @@ impl MulticorePath {
             .as_ref()
             .map_or(false, |conn_err| !conn_err.is_app)
         {
-            // TODO multicore
             let conn = conn_guard.read().unwrap();
             let epoch = match conn.handshake.write_level() {
                 crypto::Level::Initial => unreachable!(),
@@ -10154,7 +10155,8 @@ impl MulticorePath {
                 continue;
             }
 
-            if self.reduced_connection.as_ref().unwrap().pkt_num_spaces.is_ready(epoch, self.inner_path.as_mut().unwrap().active_dcid_seq) {
+            if  self.reduced_connection.as_ref().unwrap().pkt_num_spaces.is_ready(epoch, self.inner_path.as_mut().unwrap().active_dcid_seq) || 
+                self.reduced_connection.as_ref().unwrap().pkt_num_spaces.is_ready(epoch, self.inner_path.as_mut().unwrap().active_scid_seq) { // added by Vany because when receving an ack-eliciting we mark the ack_elicited_here
                 return Ok(packet::Type::from_epoch(epoch));
             }
 
@@ -10201,7 +10203,6 @@ impl MulticorePath {
             if !self.is_server && conn.is_in_early_data() {
                 return Ok(packet::Type::ZeroRTT);
             }
-
             return Ok(packet::Type::Short);
         }
         Err(Error::Done)
@@ -11451,7 +11452,9 @@ impl MulticorePath {
                 conn.got_peer_conn_id &&
                 conn.multipath &&
                 !self.get_inner_path().is_none() && 
-                self.get_inner_path().unwrap().validated()
+                self.get_inner_path().unwrap().validated() && 
+                self.get_inner_path().unwrap().active_dcid_seq.is_some() &&
+                self.get_inner_path().unwrap().active_scid_seq.is_some()
             {
                 self.completed_multipath_handshake = true;
                 self.reduced_connection = Some(
@@ -13975,13 +13978,15 @@ impl MulticorePath {
             if !self.completed_multipath_handshake{
                 let conn = conn_guard.read().unwrap();
                 if conn.handshake_completed && 
-                   conn.handshake_confirmed && 
-                    conn.multipath &&  
-                   conn.peer_verified_initial_address &&
-                   (!self.is_server || conn.handshake_done_acked) &&
-                   conn.got_peer_conn_id &&
-                   !self.get_inner_path().is_none() && 
-                   self.get_inner_path().unwrap().validated()
+                    conn.handshake_confirmed && 
+                    conn.peer_verified_initial_address &&
+                    (!self.is_server || conn.handshake_done_acked) &&
+                    conn.got_peer_conn_id &&
+                    conn.multipath &&
+                    !self.get_inner_path().is_none() && 
+                    self.get_inner_path().unwrap().validated() && 
+                    self.get_inner_path().unwrap().active_dcid_seq.is_some() &&
+                    self.get_inner_path().unwrap().active_scid_seq.is_some()
                 {
                     self.completed_multipath_handshake = true;
                     self.reduced_connection = Some(
