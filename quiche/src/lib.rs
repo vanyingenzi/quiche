@@ -7206,7 +7206,7 @@ impl Connection {
                 continue;
             }
 
-            if self.pkt_num_spaces.is_ready(epoch, send_path.active_dcid_seq) {
+            if self.pkt_num_spaces.is_ready(epoch, send_path.active_dcid_seq) || self.pkt_num_spaces.is_ready(epoch, send_path.active_scid_seq) {
                 return Ok(packet::Type::from_epoch(epoch));
             }
 

@@ -104,6 +104,7 @@ mpquic_iteration_loop() {
             --key "$(pwd)/src/bin/cert.key" \
             --cert "$(pwd)/src/bin/cert.crt" \
             --listen 127.0.0.1:4433 \
+            --server-address 127.0.0.2:3344 \
             --transfer-size ${FILESIZE_BYTES} \
             --multipath 1>/dev/null 2>&1 &
         server_pid=$!
@@ -112,8 +113,10 @@ mpquic_iteration_loop() {
         start=$(date +%s.%N)
         ../target/release/quiche-client \
             -A 127.0.0.1:${client_port_1} \
+            -A 127.0.0.1:${client_port_2} \
             --connect-to 127.0.0.1:4433 \
-            --multipath --no-verify --wire-version 1 1>/dev/null 2>&1
+            --server-address 127.0.0.2:3344 \
+            --multipath --no-verify --wire-version 1 1>/dev/null
         error_code=$?
         end=$(date +%s.%N)
         if [ $error_code -ne 0 ]; then

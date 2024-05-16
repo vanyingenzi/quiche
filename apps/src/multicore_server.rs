@@ -75,16 +75,7 @@ fn server_thread(
             false => Some(Duration::from_millis(10)), // TODO multicore timeout
         };
 
-        match poll.poll(&mut events, timeout){
-            Ok(..) => {}, 
-            Err(e) => {
-                if e.kind() == std::io::ErrorKind::Interrupted{ // when using strace
-                    trace!("poll interrupted");
-                } else {
-                    panic!("[Path Thread] error when polling");
-                }
-            }
-        }
+        poll.poll(&mut events, timeout).unwrap();
 
         'read: loop {
             if events.is_empty() && !continue_write {

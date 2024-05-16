@@ -230,16 +230,8 @@ fn client_thread(
     'main: loop {
         // TODO multicore timeout
 
-        match poll.poll(&mut events, Some(Duration::from_millis(10))) {
-            Ok(..) => {}, 
-            Err(e) => {
-                if e.kind() == std::io::ErrorKind::Interrupted { // when using strace
-                    trace!("poll interrupted");
-                } else {
-                    panic!("[Path Thread] error when polling");
-                }
-            }
-        }
+        poll.poll(&mut events, Some(Duration::from_millis(10)))
+            .unwrap();
 
         if !events.is_empty() {
             match read_packets_on_socket(
