@@ -24,9 +24,13 @@
 // NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
 // SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::str::FromStr;
 use std::time::Duration;
+
+use core_affinity::CoreId;
+use itertools::Itertools;
 
 use super::common::alpns;
 
@@ -61,7 +65,7 @@ pub struct CommonArgs {
     pub initial_cwnd_packets: u64,
     pub multipath: bool,
     pub multicore: bool, // ! [Under development]
-    pub cpu_affinity: bool, // ! [Under development]
+    pub cpu_aff_cores: Option<Vec<CoreId>>, // ! [Under development]
     pub server_addresses: Vec<SocketAddr>,
 }
 
@@ -210,7 +214,29 @@ impl Args for CommonArgs {
 
         let multipath = args.get_bool("--multipath");
         let multicore = args.get_bool("--multicore");
-        let cpu_affinity = args.get_bool("--cpu-affinity");
+        let cpu_aff_cores;
+        if args.get_bool("--cpu-affinity") { 
+            let affinity: Vec<_> = args.get_str("--cpu-affinity").split(',').collect();
+            let mut all_cores: HashSet<usize> = HashSet::new();
+            for range in affinity {
+                if range.contains("-") {
+                    let mut parts = range.split('-');
+                    let start = parts.next().ok_or(()).unwrap().parse::<usize>().expect("Invalid range");
+                    let end = parts.next().ok_or(()).unwrap().parse::<usize>().expect("Invalid range");
+                    for i in start..=end {
+                        all_cores.insert(i);
+                    }
+                } else {
+                    all_cores.insert(range.parse::<usize>().expect("Invalid core id"));
+                }
+            }
+            let ordered_cores: Vec<usize> = all_cores.into_iter().sorted_unstable_by(|a, b| a.cmp(b)).collect();
+            cpu_aff_cores = Some(ordered_cores.iter().map(|c| CoreId {id: *c}).collect_vec());
+        } else {
+            cpu_aff_cores = None;
+        }
+
+
         let server_addresses = args
             .get_vec("--server-address")
             .into_iter()
@@ -242,7 +268,7 @@ impl Args for CommonArgs {
             initial_cwnd_packets,
             multipath,
             multicore,
-            cpu_affinity,
+            cpu_aff_cores,
             server_addresses
         }
     }
@@ -275,7 +301,7 @@ impl Default for CommonArgs {
             initial_cwnd_packets: 10,
             multipath: false,
             multicore: false,
-            cpu_affinity: false, 
+            cpu_aff_cores: None, 
             server_addresses: vec![]
         }
     }
@@ -316,7 +342,7 @@ Options:
   --perform-migration      Perform connection migration on another source port.
   --multipath              Enable multipath support.
   --multicore              Enable multicore support. [Under development]
-  --cpu-affinity           CPU affinity. [Under development]
+  --cpu-affinity RANGES    CPU cores to consider in order to set affinity. [Under development]
   --server-address ADDR ...    Specify the server addresses.
   -A --address ADDR ...    Specify addresses to be used instead of the unspecified address. Non-routable addresses will lead to connectivity issues.
   -R --rm-addr TIMEADDR ...   Specify addresses to stop using after the provided time (format time,addr).
@@ -567,7 +593,7 @@ Options:
   --initial-cwnd-packets PACKETS      The initial congestion window size in terms of packet count [default: 10].
   --multipath                 Enable multipath support.
   --multicore                 Enable multicore support. [Under development]
-  --cpu-affinity              CPU affinity. [Under development]
+  --cpu-affinity RANGES       CPU cores to consider in order to set affinity. [Under development]
   --server-address ADDR ...   Specify the server addresses.
   --transfer-size BYTES       The bytes to send. [Under development]
   --transfer-time NUM         The transfer time in seconds. [Under development]

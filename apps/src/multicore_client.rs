@@ -502,14 +502,13 @@ pub fn multicore_connect(
     let multipath_requested = common_args.multipath;
     let (tx, rx) = channel();
     let active_threads = sockets_addrs.len();
-    let mut core_ids = core_affinity::get_core_ids().unwrap();
-    core_ids.reverse();
-    let set_core_affinity = common_args.cpu_affinity;
-    let core_id = core_ids[0];
+    let core_ids = common_args.cpu_aff_cores.clone().unwrap_or(Vec::new());
+    let set_core_affinity = common_args.cpu_aff_cores.is_some();
+    let core_id = if set_core_affinity { Some(core_ids[0]) } else { None };
     threads_join.push(thread::spawn(move || {
         if set_core_affinity {
-            if core_affinity::set_for_current(core_id) {
-                debug!("set core affinity for {:?}", thread::current().id());
+            if core_affinity::set_for_current(core_id.unwrap()) {
+                debug!("set core affinity to {:?} for {:?}", core_id.unwrap(), thread::current().id());
             }
         }
 
@@ -538,7 +537,7 @@ pub fn multicore_connect(
         threads_join.push(thread::spawn(move || {
             if set_core_affinity {
                 if core_affinity::set_for_current(core_id) {
-                    debug!("set core affinity for {:?}", thread::current().id());
+                    debug!("set core affinity to {:?} for {:?}", core_id, thread::current().id());
                 }
             }
 
