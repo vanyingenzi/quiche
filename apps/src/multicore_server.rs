@@ -498,14 +498,14 @@ pub fn multicore_start_server(args: ServerArgs, common_args: CommonArgs) {
             let copied_args = args.clone();
             let cloned_client = client.clone();
             let tx_clone = tx.clone();
-            let core_id = core_ids[current_core_id];
-            current_core_id = current_core_id + 1 % core_ids.len();
+            let core_id = if set_core_affinity { Some(core_ids[current_core_id]) } else { None };
+            current_core_id = if set_core_affinity { current_core_id+1 } else { current_core_id };
             joins.push(thread::spawn(move || {
                 if set_core_affinity {
-                    if core_affinity::set_for_current(core_id) {
+                    if core_affinity::set_for_current(core_id.unwrap()) {
                         debug!(
                             "set core affinity to {:?} for {:?}",
-                            core_id,
+                            core_id.unwrap(),
                             thread::current().id()
                         );
                     }

@@ -505,6 +505,7 @@ pub fn multicore_connect(
     let core_ids = common_args.cpu_aff_cores.clone().unwrap_or(Vec::new());
     let set_core_affinity = common_args.cpu_aff_cores.is_some();
     let core_id = if set_core_affinity { Some(core_ids[0]) } else { None };
+    
     threads_join.push(thread::spawn(move || {
         if set_core_affinity {
             if core_affinity::set_for_current(core_id.unwrap()) {
@@ -522,6 +523,7 @@ pub fn multicore_connect(
             Some(rx),
         )
     }));
+    
     let mut current_core_id = 1;
 
     for (local, peer) in sockets_addrs.clone() {
@@ -532,12 +534,12 @@ pub fn multicore_connect(
         let cloned_conn_guard = conn_guard.clone();
         let initiate_conn = local == local_addr;
         let tx_clone = tx.clone();
-        let core_id = core_ids[current_core_id];
-        current_core_id = current_core_id + 1 % core_ids.len();
+        let core_id = if set_core_affinity { Some(core_ids[current_core_id]) } else { None };
+        current_core_id = if set_core_affinity { current_core_id+1 } else { current_core_id };
         threads_join.push(thread::spawn(move || {
             if set_core_affinity {
-                if core_affinity::set_for_current(core_id) {
-                    debug!("set core affinity to {:?} for {:?}", core_id, thread::current().id());
+                if core_affinity::set_for_current(core_id.unwrap()) {
+                    debug!("set core affinity to {:?} for {:?}", core_id.unwrap(), thread::current().id());
                 }
             }
 
