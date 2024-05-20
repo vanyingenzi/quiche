@@ -10,13 +10,13 @@ server
 RUST_LOG=info ../target/release/quiche-server --listen 127.0.0.1:4433 --multipath --multicore --transfer-size 1073741824 --server-address 127.0.0.2:3344
 ```
 
-client 
+client
 ```bash
 RUST_LOG=info ../target/release/quiche-client --no-verify -A 127.0.0.1:6788 -A 127.0.0.1:6789 --connect-to 127.0.0.1:4433 --server-address 127.0.0.2:3344 --multipath --multicore --wire-version 1 >/dev/null
 ```
 
 ```bash
-sudo perf record -e cycles -F 999 -g --call-graph lbr -- ../target/release/quiche-client https:127.0.0.1:4433/testfile --no-verify -A 127.0.0.1:6788 -A 127.0.0.1:6789 --multipath --multicore >/dev/null
+sudo perf record -e cycles -F 999 -g --call-graph lbr -- ../target/release/quiche-client --no-verify -A 127.0.0.1:6788 -A 127.0.0.1:6789 --connect-to 127.0.0.1:4433 --server-address 127.0.0.2:3344 --multipath --multicore --wire-version 1 >/dev/null
 ```
 
 ```bash
