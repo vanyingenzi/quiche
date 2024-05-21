@@ -346,7 +346,7 @@ pub fn connect(
             let app_proto = conn.application_proto();
 
             if alpns::MMPQUIC.contains(&app_proto) {
-                app_conn = Some(AdaptedMcMPQUICConnClient::new(sockets.len()));
+                app_conn = Some(AdaptedMcMPQUICConnClient::new(1));
                 app_proto_selected = true;
                 debug!("proto selected");
             } else {
