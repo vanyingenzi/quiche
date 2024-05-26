@@ -98,7 +98,7 @@ pub enum PathRequest {
 }
 
 impl PathRequest {
-    fn requested_state(self) -> PathState {
+    pub (crate) fn requested_state(self) -> PathState {
         match self {
             PathRequest::Unused => PathState::Unused,
             PathRequest::Active => PathState::Active,
@@ -192,7 +192,7 @@ pub struct Path {
     /// The current validation state of the path.
     validation_state: PathValidationState,
     /// The usage state of this path.
-    state: PathState,
+    pub(crate) state: PathState,
 
     /// Loss recovery and congestion control state.
     pub recovery: recovery::Recovery,
@@ -233,7 +233,7 @@ pub struct Path {
     pub stream_retrans_bytes: u64,
 
     /// The timeout of closing the path.
-    closing_timer: Option<std::time::Instant>,
+    pub(crate) closing_timer: Option<std::time::Instant>,
     /// Whether the peer abandoned this path.
     peer_abandoned: bool,
 
@@ -254,7 +254,7 @@ pub struct Path {
     challenge_requested: bool,
 
     /// Whether the failure of this path was notified.
-    failure_notified: bool,
+    pub(crate) failure_notified: bool,
 
     /// Whether the connection tries to migrate to this path, but it still needs
     /// to be validated.
@@ -264,7 +264,7 @@ pub struct Path {
     pub needs_ack_eliciting: bool,
 
     /// The expected sequence number of the PATH_STATUS to be received.
-    expected_path_status_seq_num: u64,
+    pub(crate) expected_path_status_seq_num: u64,
 }
 
 impl Path {
@@ -368,7 +368,7 @@ impl Path {
 
     /// Returns whether this path is closed.
     #[inline]
-    fn closed(&self) -> bool {
+    pub(crate) fn closed(&self) -> bool {
         matches!(self.state, PathState::Closed(_, _))
     }
 
@@ -388,7 +388,7 @@ impl Path {
 
     /// Returns whether this path failed its validation.
     #[inline]
-    fn validation_failed(&self) -> bool {
+    pub(crate) fn validation_failed(&self) -> bool {
         self.validation_state == PathValidationState::Failed
     }
 
@@ -513,7 +513,7 @@ impl Path {
 
     /// Sets the state of a path, returning an error if the transition is not
     /// valid.
-    fn set_state(&mut self, state: PathState) -> Result<()> {
+    pub(crate) fn set_state(&mut self, state: PathState) -> Result<()> {
         if !self.valid_state_transition(&state) {
             return Err(Error::InvalidState);
         }
@@ -607,6 +607,7 @@ impl Path {
             peer_addr: self.peer_addr,
             validation_state: self.validation_state,
             state: self.state.clone(),
+            status: self.status.clone(), 
             active: self.active(),
             recv: self.recv_count,
             sent: self.sent_count,
@@ -618,6 +619,7 @@ impl Path {
             rttvar: self.recovery.rttvar(),
             rtt_update: self.recovery.rtt_update_count,
             cwnd: self.recovery.cwnd(),
+            cwnd_available: self.recovery.cwnd_available(),
             sent_bytes: self.sent_bytes,
             recv_bytes: self.recv_bytes,
             lost_bytes: self.recovery.bytes_lost,
@@ -1211,6 +1213,9 @@ pub struct PathStats {
     /// The size of the connection's congestion window in bytes.
     pub cwnd: usize,
 
+    /// The congestion window available on the path
+    pub cwnd_available: usize,
+
     /// The number of sent bytes.
     pub sent_bytes: u64,
 
@@ -1225,6 +1230,9 @@ pub struct PathStats {
 
     /// The current PMTU for the connection.
     pub pmtu: usize,
+
+    /// The current path status of the path
+    pub status: PathStatus,
 
     /// The most recent data delivery rate estimate in bytes/s.
     ///

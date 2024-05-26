@@ -33,6 +33,9 @@ libc = "0.2"
 nix = { version = "0.27", features = ["net", "socket", "uio"] }
 slab = "0.4"
 itertools = "0.10"
+gearhash = "0.1.0"
+rand = "0.8"
+core_affinity = "0.8.1"
 
 [lib]
 crate-type = ["lib"]

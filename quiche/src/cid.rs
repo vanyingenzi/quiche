@@ -33,7 +33,7 @@ use crate::packet::ConnectionId;
 use std::collections::VecDeque;
 
 /// A structure holding a `ConnectionId` and all its related metadata.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct ConnectionIdEntry {
     /// The Connection ID.
     pub cid: ConnectionId<'static>,
@@ -48,7 +48,7 @@ pub struct ConnectionIdEntry {
     pub path_id: Option<usize>,
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct BoundedNonEmptyConnectionIdVecDeque {
     /// The inner `VecDeque`.
     inner: VecDeque<ConnectionIdEntry>,
@@ -212,7 +212,7 @@ impl ExactSizeIterator for ConnectionIdIter {
     }
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct ConnectionIdentifiers {
     /// All the Destination Connection IDs provided by our peer.
     dcids: BoundedNonEmptyConnectionIdVecDeque,
@@ -399,7 +399,6 @@ impl ConnectionIdentifiers {
             }
             return Ok(e.seq);
         }
-
         self.scids.insert(ConnectionIdEntry {
             cid,
             seq,
@@ -441,6 +440,7 @@ impl ConnectionIdentifiers {
         &mut self, cid: ConnectionId<'static>, seq: u64, reset_token: u128,
         retire_prior_to: u64,
     ) -> Result<Vec<(u64, usize)>> {
+        
         if self.zero_length_dcid {
             return Err(Error::InvalidState);
         }

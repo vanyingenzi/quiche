@@ -452,6 +452,12 @@ impl Recovery {
         self.pacer.send(sent_bytes, now);
     }
 
+    pub fn packets_in_flight(
+        &self
+    ) -> bool {
+        self.sent.len() != 0
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn on_ack_received(
         &mut self, space_id: SpaceId, ranges: &ranges::RangeSet, ack_delay: u64,
@@ -1385,7 +1391,7 @@ pub struct Acked {
     pub lost: u64,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HandshakeStatus {
     pub has_handshake_keys: bool,
 

@@ -83,6 +83,584 @@ type BuildStreamIdHasher = std::hash::BuildHasherDefault<StreamIdHasher>;
 pub type StreamIdHashMap<V> = HashMap<u64, V, BuildStreamIdHasher>;
 pub type StreamIdHashSet = HashSet<u64, BuildStreamIdHasher>;
 
+/// Contains a Map of Stream and the related fields for i/o this structure is to maintained per path
+#[derive(Default)]
+
+pub struct MulticoreStreamMap {
+    /// Map of streams indexed by stream ID.
+    streams: StreamIdHashMap<Stream>,
+    /// Queue of stream IDs corresponding to streams that have buffered data
+    /// ready to be sent to the peer. This also implies that the stream has
+    /// enough flow control credits to send at least some of that data.
+    flushable: RBTree<StreamFlushablePriorityAdapter>,
+    /// Set of stream IDs corresponding to streams that have outstanding data
+    /// to read. This is used to generate a `StreamIter` of streams without
+    /// having to iterate over the full list of streams.
+    pub readable: RBTree<StreamReadablePriorityAdapter>,
+
+    /// Set of stream IDs corresponding to streams that have enough flow control
+    /// capacity to be written to, and is not finished. This is used to generate
+    /// a `StreamIter` of streams without having to iterate over the full list
+    /// of streams.
+    pub writable: RBTree<StreamWritablePriorityAdapter>,
+
+    /// Set of stream IDs corresponding to streams that are almost out of flow
+    /// control credit and need to send MAX_STREAM_DATA. This is used to
+    /// generate a `StreamIter` of streams without having to iterate over the
+    /// full list of streams.
+    almost_full: StreamIdHashSet,
+
+    /// Set of stream IDs corresponding to streams that are blocked. The value
+    /// of the map elements represents the offset of the stream at which the
+    /// blocking occurred.
+    blocked: StreamIdHashMap<u64>,
+
+    /// Set of stream IDs corresponding to streams that are reset. The value
+    /// of the map elements is a tuple of the error code and final size values
+    /// to include in the RESET_STREAM frame.
+    reset: StreamIdHashMap<(u64, u64)>,
+
+    /// Set of stream IDs corresponding to streams that are shutdown on the
+    /// receive side, and need to send a STOP_SENDING frame. The value of the
+    /// map elements is the error code to include in the STOP_SENDING frame.
+    stopped: StreamIdHashMap<u64>,
+
+    /// The maximum size of a stream window.
+    max_stream_window: u64,
+}
+
+impl MulticoreStreamMap {
+    pub fn new(
+        max_stream_window: u64,
+    ) -> MulticoreStreamMap {
+        MulticoreStreamMap {
+            max_stream_window,
+
+            ..MulticoreStreamMap::default()
+        }
+    }
+
+    /// Returns the stream with the given ID if it exists.
+    pub fn get(&self, id: u64) -> Option<&Stream> {
+        self.streams.get(&id)
+    }
+
+    /// Returns the mutable stream with the given ID if it exists.
+    pub fn get_mut(&mut self, id: u64) -> Option<&mut Stream> {
+        self.streams.get_mut(&id)
+    }
+
+    /// Adds the stream ID to the readable streams set.
+    ///
+    /// If the stream was already in the list, this does nothing.
+    pub fn insert_readable(&mut self, priority_key: &Arc<StreamPriorityKey>) {
+        if !priority_key.readable.is_linked() {
+            self.readable.insert(Arc::clone(priority_key));
+        }
+    }
+
+    /// Removes the stream ID from the readable streams set.
+    pub fn remove_readable(&mut self, priority_key: &Arc<StreamPriorityKey>) {
+        if !priority_key.readable.is_linked() {
+            return;
+        }
+
+        let mut c = {
+            let ptr = Arc::as_ptr(priority_key);
+            unsafe { self.readable.cursor_mut_from_ptr(ptr) }
+        };
+
+        c.remove();
+    }
+
+    /// Adds the stream ID to the writable streams set.
+    ///
+    /// This should also be called anytime a new stream is created, in addition
+    /// to when an existing stream becomes writable.
+    ///
+    /// If the stream was already in the list, this does nothing.
+    pub fn insert_writable(&mut self, priority_key: &Arc<StreamPriorityKey>) {
+        if !priority_key.writable.is_linked() {
+            self.writable.insert(Arc::clone(priority_key));
+        }
+    }
+
+    /// Removes the stream ID from the writable streams set.
+    ///
+    /// This should also be called anytime an existing stream stops being
+    /// writable.
+    pub fn remove_writable(&mut self, priority_key: &Arc<StreamPriorityKey>) {
+        if !priority_key.writable.is_linked() {
+            return;
+        }
+
+        let mut c = {
+            let ptr = Arc::as_ptr(priority_key);
+            unsafe { self.writable.cursor_mut_from_ptr(ptr) }
+        };
+
+        c.remove();
+    }
+
+    /// Adds the stream ID to the flushable streams set.
+    ///
+    /// If the stream was already in the list, this does nothing.
+    pub fn insert_flushable(&mut self, priority_key: &Arc<StreamPriorityKey>) {
+        if !priority_key.flushable.is_linked() {
+            self.flushable.insert(Arc::clone(priority_key));
+        }
+    }
+
+    /// Removes the stream ID from the flushable streams set.
+    pub fn remove_flushable(&mut self, priority_key: &Arc<StreamPriorityKey>) {
+        if !priority_key.flushable.is_linked() {
+            return;
+        }
+
+        let mut c = {
+            let ptr = Arc::as_ptr(priority_key);
+            unsafe { self.flushable.cursor_mut_from_ptr(ptr) }
+        };
+
+        c.remove();
+    }
+
+    pub fn peek_flushable(&self) -> Option<Arc<StreamPriorityKey>> {
+        self.flushable.front().clone_pointer()
+    }
+
+    /// Updates the priorities of a stream.
+    #[allow(dead_code)]
+    fn update_priority(
+        &mut self, old: &Arc<StreamPriorityKey>, new: &Arc<StreamPriorityKey>,
+    ) {
+        if old.readable.is_linked() {
+            self.remove_readable(old);
+            self.readable.insert(Arc::clone(new));
+        }
+
+        if old.writable.is_linked() {
+            self.remove_writable(old);
+            self.writable.insert(Arc::clone(new));
+        }
+
+        if old.flushable.is_linked() {
+            self.remove_flushable(old);
+            self.flushable.insert(Arc::clone(new));
+        }
+    }
+
+    /// Adds the stream ID to the almost full streams set.
+    ///
+    /// If the stream was already in the list, this does nothing.
+    pub fn insert_almost_full(&mut self, stream_id: u64) {
+        self.almost_full.insert(stream_id);
+    }
+
+    /// Removes the stream ID from the almost full streams set.
+    pub fn remove_almost_full(&mut self, stream_id: u64) {
+        self.almost_full.remove(&stream_id);
+    }
+
+    /// Adds the stream ID to the blocked streams set with the
+    /// given offset value.
+    ///
+    /// If the stream was already in the list, this does nothing.
+    pub fn insert_blocked(&mut self, stream_id: u64, off: u64) {
+        self.blocked.insert(stream_id, off);
+    }
+
+    /// Removes the stream ID from the blocked streams set.
+    pub fn remove_blocked(&mut self, stream_id: u64) {
+        self.blocked.remove(&stream_id);
+    }
+
+    /// Adds the stream ID to the reset streams set with the
+    /// given error code and final size values.
+    ///
+    /// If the stream was already in the list, this does nothing.
+    pub fn insert_reset(
+        &mut self, stream_id: u64, error_code: u64, final_size: u64,
+    ) {
+        self.reset.insert(stream_id, (error_code, final_size));
+    }
+
+    /// Removes the stream ID from the reset streams set.
+    pub fn remove_reset(&mut self, stream_id: u64) {
+        self.reset.remove(&stream_id);
+    }
+
+    /// Removes the stream ID from the stopped streams set.
+    pub fn remove_stopped(&mut self, stream_id: u64) {
+        self.stopped.remove(&stream_id);
+    }
+
+    /// Creates an iterator over streams that have outstanding data to read.
+    pub fn readable(&self) -> StreamIter {
+        StreamIter {
+            streams: self.readable.iter().map(|s| s.id).collect(),
+            index: 0,
+        }
+    }
+
+    /// Creates an iterator over streams that can be written to.
+    pub fn writable(&self) -> StreamIter {
+        StreamIter {
+            streams: self.writable.iter().map(|s| s.id).collect(),
+            index: 0,
+        }
+    }
+
+    /// Creates an iterator over streams that need to send MAX_STREAM_DATA.
+    pub fn almost_full(&self) -> StreamIter {
+        StreamIter::from(&self.almost_full)
+    }
+
+    /// Creates an iterator over streams that need to send STREAM_DATA_BLOCKED.
+    pub fn blocked(&self) -> hash_map::Iter<u64, u64> {
+        self.blocked.iter()
+    }
+
+    /// Creates an iterator over streams that need to send RESET_STREAM.
+    pub fn reset(&self) -> hash_map::Iter<u64, (u64, u64)> {
+        self.reset.iter()
+    }
+
+    /// Creates an iterator over streams that need to send STOP_SENDING.
+    pub fn stopped(&self) -> hash_map::Iter<u64, u64> {
+        self.stopped.iter()
+    }
+
+    /// Returns true if there are any streams that have data to write.
+    pub fn has_flushable(&self) -> bool {
+        !self.flushable.is_empty()
+    }
+
+    /// Returns true if there are any streams that have data to read.
+    #[allow(dead_code)]
+    pub fn has_readable(&self) -> bool {
+        !self.readable.is_empty()
+    }
+
+    /// Returns true if there are any streams that need to update the local
+    /// flow control limit.
+    pub fn has_almost_full(&self) -> bool {
+        !self.almost_full.is_empty()
+    }
+
+    /// Returns true if there are any streams that are blocked.
+    pub fn has_blocked(&self) -> bool {
+        !self.blocked.is_empty()
+    }
+
+    /// Returns true if there are any streams that are reset.
+    pub fn has_reset(&self) -> bool {
+        !self.reset.is_empty()
+    }
+
+    /// Returns true if there are any streams that need to send STOP_SENDING.
+    pub fn has_stopped(&self) -> bool {
+        !self.stopped.is_empty()
+    }
+
+    /// All streams are fin
+    pub fn all_streams_fin(&self) -> bool {
+        self.streams.iter().any(|(_, s)| !s.send.is_fin() || !s.recv.is_fin())
+    }
+
+    /// Returns the number of active streams in the map.
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub fn len(&self) -> usize {
+        self.streams.len()
+    }
+}
+
+/// Contains ids of stream and needs to be maintained by the overall connection
+#[derive(Default)]
+pub struct MulticoreStreamIds{
+    /// The set of streams that have been create but not yet (complete or garbage collection)
+    created: StreamIdHashSet, 
+
+    /// Set of streams that were completed and garbage collected.
+    ///
+    /// Instead of keeping the full stream state forever, we collect completed
+    /// streams to save memory, but we still need to keep track of previously
+    /// created streams, to prevent peers from re-creating them.
+    collected: StreamIdHashSet,
+
+    /// Peer's maximum bidirectional stream count limit.
+    peer_max_streams_bidi: u64,
+
+    /// Peer's maximum unidirectional stream count limit.
+    peer_max_streams_uni: u64,
+
+    /// The total number of bidirectional streams opened by the peer.
+    peer_opened_streams_bidi: u64,
+
+    /// The total number of unidirectional streams opened by the peer.
+    peer_opened_streams_uni: u64,
+
+    /// Local maximum bidirectional stream count limit.
+    local_max_streams_bidi: u64,
+    local_max_streams_bidi_next: u64,
+
+    /// Local maximum unidirectional stream count limit.
+    local_max_streams_uni: u64,
+    local_max_streams_uni_next: u64,
+
+    /// The total number of bidirectional streams opened by the local endpoint.
+    local_opened_streams_bidi: u64,
+
+    /// The total number of unidirectional streams opened by the local endpoint.
+    local_opened_streams_uni: u64,
+}
+
+impl MulticoreStreamIds{
+    pub fn new(
+        max_streams_bidi: u64, max_streams_uni: u64
+    ) -> MulticoreStreamIds {
+        MulticoreStreamIds {
+            local_max_streams_bidi: max_streams_bidi,
+            local_max_streams_bidi_next: max_streams_bidi,
+
+            local_max_streams_uni: max_streams_uni,
+            local_max_streams_uni_next: max_streams_uni,
+
+            ..MulticoreStreamIds::default()
+        }
+    }
+
+    /// Creates a stream
+    pub(crate) fn create_stream(
+        &mut self, stream_map: &mut MulticoreStreamMap,
+        id: u64, local_params: &crate::TransportParams,
+        peer_params: &crate::TransportParams, 
+        local: bool, is_server: bool
+    ) -> Result<()>{
+        // A stream with stream ID already exist
+        if self.created.contains(&id) {
+            return Ok(());
+        }
+
+        match stream_map.streams.entry(id) {
+            hash_map::Entry::Vacant(v) => {
+                // Stream has already been closed and garbage collected.
+                if self.collected.contains(&id){
+                    return Err(Error::Done);
+                }
+        
+                if local != is_local(id, is_server) {
+                    return Err(Error::InvalidStreamState(id));
+                }
+        
+                let (max_rx_data, max_tx_data) = match (local, is_bidi(id)) {
+                    // Locally-initiated bidirectional stream.
+                    (true, true) => (
+                        local_params.initial_max_stream_data_bidi_local,
+                        peer_params.initial_max_stream_data_bidi_remote,
+                    ),
+        
+                    // Locally-initiated unidirectional stream.
+                    (true, false) => (0, peer_params.initial_max_stream_data_uni),
+        
+                    // Remotely-initiated bidirectional stream.
+                    (false, true) => (
+                        local_params.initial_max_stream_data_bidi_remote,
+                        peer_params.initial_max_stream_data_bidi_local,
+                    ),
+        
+                    // Remotely-initiated unidirectional stream.
+                    (false, false) =>
+                        (local_params.initial_max_stream_data_uni, 0),
+                };
+        
+                // The two least significant bits from a stream id identify the
+                // type of stream. Truncate those bits to get the sequence for
+                // that stream type.
+                let stream_sequence = id >> 2;
+        
+                // Enforce stream count limits.
+                match (is_local(id, is_server), is_bidi(id)) {
+                    (true, true) => {
+                        let n = std::cmp::max(
+                            self.local_opened_streams_bidi,
+                            stream_sequence + 1,
+                        );
+        
+                        if n > self.peer_max_streams_bidi {
+                            return Err(Error::StreamLimit);
+                        }
+        
+                        self.local_opened_streams_bidi = n;
+                    },
+        
+                    (true, false) => {
+                        let n = std::cmp::max(
+                            self.local_opened_streams_uni,
+                            stream_sequence + 1,
+                        );
+                        
+                        if n > self.peer_max_streams_uni {
+                            return Err(Error::StreamLimit);
+                        }
+        
+                        self.local_opened_streams_uni = n;
+                    },
+        
+                    (false, true) => {
+                        let n = std::cmp::max(
+                            self.peer_opened_streams_bidi,
+                            stream_sequence + 1,
+                        );
+        
+                        if n > self.local_max_streams_bidi {
+                            return Err(Error::StreamLimit);
+                        }
+        
+                        self.peer_opened_streams_bidi = n;
+                    },
+        
+                    (false, false) => {
+                        let n = std::cmp::max(
+                            self.peer_opened_streams_uni,
+                            stream_sequence + 1,
+                        );
+        
+                        if n > self.local_max_streams_uni {
+                            return Err(Error::StreamLimit);
+                        }
+        
+                        self.peer_opened_streams_uni = n;
+                    },
+                };
+        
+                let s = Stream::new(
+                    id,
+                    max_rx_data,
+                    max_tx_data,
+                    is_bidi(id),
+                    local,
+                    stream_map.max_stream_window,
+                );
+                let is_writable = s.is_writable();
+                let stream = v.insert(s);
+
+                // Newly created stream might already be writable due to initial flow
+                // control limits.
+                if is_writable {
+                    stream_map.writable.insert(Arc::clone(&stream.priority_key));
+                }
+            }, 
+            hash_map::Entry::Occupied(..) => {
+                return Ok(());
+            }
+        };
+
+        Ok(())
+    }
+
+    /// Updates the peer's maximum bidirectional stream count limit.
+    pub fn update_peer_max_streams_bidi(&mut self, v: u64) {
+        self.peer_max_streams_bidi = cmp::max(self.peer_max_streams_bidi, v);
+    }
+
+    /// Updates the peer's maximum unidirectional stream count limit.
+    pub fn update_peer_max_streams_uni(&mut self, v: u64) {
+        self.peer_max_streams_uni = cmp::max(self.peer_max_streams_uni, v);
+    }
+
+    /// Commits the new max_streams_bidi limit.
+    pub fn update_max_streams_bidi(&mut self) {
+        self.local_max_streams_bidi = self.local_max_streams_bidi_next;
+    }
+
+    /// Returns the current max_streams_bidi limit.
+    #[allow(dead_code)]
+    pub fn max_streams_bidi(&self) -> u64 {
+        self.local_max_streams_bidi
+    }
+
+    /// Returns the new max_streams_bidi limit.
+    pub fn max_streams_bidi_next(&mut self) -> u64 {
+        self.local_max_streams_bidi_next
+    }
+
+    /// Commits the new max_streams_uni limit.
+    pub fn update_max_streams_uni(&mut self) {
+        self.local_max_streams_uni = self.local_max_streams_uni_next;
+    }
+
+    /// Returns the new max_streams_uni limit.
+    pub fn max_streams_uni_next(&mut self) -> u64 {
+        self.local_max_streams_uni_next
+    }
+
+    /// Returns the number of bidirectional streams that can be created
+    /// before the peer's stream count limit is reached.
+    #[allow(dead_code)]
+    pub fn peer_streams_left_bidi(&self) -> u64 {
+        self.peer_max_streams_bidi - self.local_opened_streams_bidi
+    }
+
+    /// Returns the number of unidirectional streams that can be created
+    /// before the peer's stream count limit is reached.
+    #[allow(dead_code)]
+    pub fn peer_streams_left_uni(&self) -> u64 {
+        self.peer_max_streams_uni - self.local_opened_streams_uni
+    }
+
+    /// Drops completed stream.
+    ///
+    /// This should only be called when Stream::is_complete() returns true for
+    /// the given stream.
+    pub fn collect(&mut self, stream_map: &mut MulticoreStreamMap, stream_id: u64, local: bool) {
+        if !local {
+            // If the stream was created by the peer, give back a max streams
+            // credit.
+            if is_bidi(stream_id) {
+                self.local_max_streams_bidi_next =
+                    self.local_max_streams_bidi_next.saturating_add(1);
+            } else {
+                self.local_max_streams_uni_next =
+                    self.local_max_streams_uni_next.saturating_add(1);
+            }
+        }
+
+        let s = stream_map.streams.remove(&stream_id).unwrap();
+
+        stream_map.remove_readable(&s.priority_key);
+
+        stream_map.remove_writable(&s.priority_key);
+
+        stream_map.remove_flushable(&s.priority_key);
+
+        self.collected.insert(stream_id);
+    }
+
+    /// Returns true if the stream has been collected.
+    #[allow(dead_code)]
+    pub fn is_collected(&self, stream_id: u64) -> bool {
+        self.collected.contains(&stream_id)
+    }
+
+    /// Returns true if the max bidirectional streams count needs to be updated
+    /// by sending a MAX_STREAMS frame to the peer.
+    pub fn should_update_max_streams_bidi(&self) -> bool {
+        self.local_max_streams_bidi_next != self.local_max_streams_bidi &&
+            self.local_max_streams_bidi_next / 2 >
+                self.local_max_streams_bidi - self.peer_opened_streams_bidi
+    }
+
+    /// Returns true if the max unidirectional streams count needs to be updated
+    /// by sending a MAX_STREAMS frame to the peer.
+    pub fn should_update_max_streams_uni(&self) -> bool {
+        self.local_max_streams_uni_next != self.local_max_streams_uni &&
+            self.local_max_streams_uni_next / 2 >
+                self.local_max_streams_uni - self.peer_opened_streams_uni
+    }
+}
+
 /// Keeps track of QUIC streams and enforces stream limits.
 #[derive(Default)]
 pub struct StreamMap {
@@ -2206,6 +2784,159 @@ mod tests {
             prioritized_writable.iter().map(|s| s.id).collect();
         assert_eq!(walk_2, vec![0, 0, 4, 4, 8, 8, 12, 12]);
     }
+}
+
+
+mod multicore_tests{
+    use super::*;
+
+    /// RFC9000 2.1: A stream ID that is used out of order results in all
+    /// streams of that type with lower-numbered stream IDs also being opened.
+    #[test]
+    fn stream_limit_auto_open() {
+        let local_tp = crate::TransportParams::default();
+        let peer_tp = crate::TransportParams::default();
+
+        let mut stream_map_1 = MulticoreStreamMap::new(5);
+        let mut stream_map_2 = MulticoreStreamMap::new(5);
+        let mut stream_ids = MulticoreStreamIds::new(5, 5);
+
+        let stream_id = 500;
+        assert!(!is_local(stream_id, true), "stream id is peer initiated");
+        assert!(is_bidi(stream_id), "stream id is bidirectional");
+        assert_eq!(
+            stream_ids
+                .create_stream(&mut stream_map_2, stream_id, &local_tp, &peer_tp, false, true)
+                .err(),
+            Some(Error::StreamLimit),
+            "stream limit should be exceeded"
+        );
+        assert_eq!(
+            stream_ids
+                .create_stream(&mut stream_map_1, stream_id, &local_tp, &peer_tp, false, true)
+                .err(),
+            Some(Error::StreamLimit),
+            "stream limit should be exceeded"
+        );
+    }
+
+    /// Stream limit should be satisfied regardless of what order we open
+    /// streams
+    #[test]
+    fn stream_create_out_of_order() {
+        let local_tp = crate::TransportParams::default();
+        let peer_tp = crate::TransportParams::default();
+
+        let mut stream_map_1 = MulticoreStreamMap::new(5);
+        let mut stream_map_2 = MulticoreStreamMap::new(5);
+        let mut stream_ids = MulticoreStreamIds::new(5, 5);
+
+        let stream_id = 8;
+        assert!(is_local(stream_id, false), "stream id is client initiated");
+        assert!(is_bidi(stream_id), "stream id is bidirectional");
+        assert!(stream_ids
+            .create_stream(&mut stream_map_1, stream_id, &local_tp, &peer_tp, false, true)
+            .is_ok());
+
+        let stream_id = 12;
+        assert!(is_local(stream_id, false), "stream id is client initiated");
+        assert!(is_bidi(stream_id), "stream id is bidirectional");
+        assert!(stream_ids
+            .create_stream(&mut stream_map_2, stream_id, &local_tp, &peer_tp, false, true)
+            .is_ok());
+
+        let stream_id = 4;
+        assert!(is_local(stream_id, false), "stream id is client initiated");
+        assert!(is_bidi(stream_id), "stream id is bidirectional");
+        assert!(stream_ids
+            .create_stream(&mut stream_map_1, stream_id, &local_tp, &peer_tp, false, true)
+            .is_ok());
+    }
+
+    /// Check stream limit boundary cases
+    #[test]
+    fn stream_limit_edge() {
+        let local_tp = crate::TransportParams::default();
+        let peer_tp = crate::TransportParams::default();
+
+        let mut stream_map_1 = MulticoreStreamMap::new(3);
+        let mut stream_map_2 = MulticoreStreamMap::new(3);
+        let mut stream_ids = MulticoreStreamIds::new(3, 3);
+
+        // Highest permitted
+        let stream_id = 8;
+        assert!(stream_ids
+            .create_stream(&mut stream_map_1, stream_id, &local_tp, &peer_tp, false, true)
+            .is_ok());
+
+        // One more than highest permitted
+        let stream_id = 12;
+        assert_eq!(
+            stream_ids
+                .create_stream(&mut stream_map_2, stream_id, &local_tp, &peer_tp, false, true)
+                .err(),
+            Some(Error::StreamLimit)
+        );
+    }
+
+    #[allow(dead_code)]
+    fn cycle_stream_priority(stream_id: u64, streams: &mut MulticoreStreamMap) {
+        let key = streams.get(stream_id).unwrap().priority_key.clone();
+        streams.update_priority(&key.clone(), &key);
+    }
+
+    #[test]
+    fn writable_prioritized_default_priority() {
+        let local_tp = crate::TransportParams::default();
+        let peer_tp = crate::TransportParams {
+            initial_max_stream_data_bidi_local: 100,
+            initial_max_stream_data_uni: 100,
+            ..Default::default()
+        };
+
+        let mut stream_map_1 = MulticoreStreamMap::new(100);
+        let mut stream_map_2 = MulticoreStreamMap::new(100);
+        let mut stream_ids = MulticoreStreamIds::new(100, 100);
+
+        assert!(stream_ids
+            .create_stream(&mut stream_map_1, 0, &local_tp, &peer_tp, false, true)
+            .is_ok());
+
+        assert!(stream_ids
+            .create_stream(&mut stream_map_1, 12, &local_tp, &peer_tp, false, true)
+            .is_ok());
+
+        assert!(stream_ids
+            .create_stream(&mut stream_map_2, 4, &local_tp, &peer_tp, false, true)
+            .is_ok());
+
+        assert!(stream_ids
+            .create_stream(&mut stream_map_2, 8, &local_tp, &peer_tp, false, true)
+            .is_ok());
+
+
+        let walk_1: Vec<u64> = stream_map_1.writable().collect();
+        cycle_stream_priority(*walk_1.first().unwrap(), &mut stream_map_1);
+        let walk_2: Vec<u64> = stream_map_1.writable().collect();
+        cycle_stream_priority(*walk_2.first().unwrap(), &mut stream_map_1);
+        let walk_3: Vec<u64> = stream_map_1.writable().collect();
+        cycle_stream_priority(*walk_3.first().unwrap(), &mut stream_map_1);
+        let walk_4: Vec<u64> = stream_map_2.writable().collect();
+        cycle_stream_priority(*walk_4.first().unwrap(), &mut stream_map_2);
+        let walk_5: Vec<u64> = stream_map_2.writable().collect();
+
+        // All streams are non-incremental and same urgency by default. Multiple
+        // visits shuffle their order.
+        assert_eq!(walk_1, vec![0, 12]);
+        assert_eq!(walk_2, vec![12, 0]);
+        assert_eq!(walk_3, vec![0, 12]);
+        assert_eq!(walk_4, vec![4, 8]);
+        assert_eq!(walk_5, vec![8, 4]);
+    }
+
+
+    // TODO add other tests with writable prioritized mixed urgencies
+ 
 }
 
 mod recv_buf;

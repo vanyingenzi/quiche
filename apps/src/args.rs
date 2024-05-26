@@ -24,8 +24,13 @@
 // NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
 // SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::str::FromStr;
+use std::time::Duration;
+
+use core_affinity::CoreId;
+use itertools::Itertools;
 
 use super::common::alpns;
 
@@ -34,6 +39,7 @@ pub trait Args {
 }
 
 /// Contains commons arguments for creating a quiche QUIC connection.
+#[derive(Debug)]
 pub struct CommonArgs {
     pub alpns: Vec<&'static [u8]>,
     pub max_data: u64,
@@ -58,6 +64,9 @@ pub struct CommonArgs {
     pub qpack_blocked_streams: Option<u64>,
     pub initial_cwnd_packets: u64,
     pub multipath: bool,
+    pub multicore: bool, // ! [Under development]
+    pub cpu_aff_cores: Option<Vec<CoreId>>, // ! [Under development]
+    pub server_addresses: Vec<SocketAddr>,
 }
 
 /// Creates a new `CommonArgs` structure using the provided [`Docopt`].
@@ -85,6 +94,7 @@ pub struct CommonArgs {
 /// --qpack-blocked-streams STREAMS  Limit of blocked streams while decoding.
 /// --initial-cwnd-packets      Size of initial congestion window, in packets.
 /// --multipath                 Enable multipath support.
+/// --multicore                 Enable multicore support. [Under development]
 ///
 /// [`Docopt`]: https://docs.rs/docopt/1.1.0/docopt/
 impl Args for CommonArgs {
@@ -103,12 +113,18 @@ impl Args for CommonArgs {
 
             ("HTTP/3", "oneway") => (alpns::HTTP_3.to_vec(), true),
 
-            ("all", "none") => (
-                [alpns::HTTP_3.as_slice(), &alpns::HTTP_09]
-                    .concat()
-                    .to_vec(),
-                false,
-            ),
+            ("all", "none") => {
+                let mut aplns_to_return = Vec::new();
+                aplns_to_return.push(alpns::MMPQUIC.as_slice());
+                aplns_to_return.push(alpns::HTTP_3.as_slice());
+                aplns_to_return.push(&alpns::HTTP_09);
+                (
+                    aplns_to_return
+                        .concat()
+                        .to_vec(),
+                    false
+                )
+            },
 
             (..) => panic!("Unsupported HTTP version and DATAGRAM protocol."),
         };
@@ -197,6 +213,35 @@ impl Args for CommonArgs {
             .unwrap();
 
         let multipath = args.get_bool("--multipath");
+        let multicore = args.get_bool("--multicore");
+        let cpu_aff_cores;
+        if args.get_bool("--cpu-affinity") { 
+            let affinity: Vec<_> = args.get_str("--cpu-affinity").split(',').collect();
+            let mut all_cores: HashSet<usize> = HashSet::new();
+            for range in affinity {
+                if range.contains("-") {
+                    let mut parts = range.split('-');
+                    let start = parts.next().ok_or(()).unwrap().parse::<usize>().expect("Invalid range");
+                    let end = parts.next().ok_or(()).unwrap().parse::<usize>().expect("Invalid range");
+                    for i in start..=end {
+                        all_cores.insert(i);
+                    }
+                } else {
+                    all_cores.insert(range.parse::<usize>().expect("Invalid core id"));
+                }
+            }
+            let ordered_cores: Vec<usize> = all_cores.into_iter().sorted_unstable_by(|a, b| a.cmp(b)).collect();
+            cpu_aff_cores = Some(ordered_cores.iter().map(|c| CoreId {id: *c}).collect_vec());
+        } else {
+            cpu_aff_cores = None;
+        }
+
+
+        let server_addresses = args
+            .get_vec("--server-address")
+            .into_iter()
+            .filter_map(|a| a.parse().ok())
+            .collect();
 
         CommonArgs {
             alpns,
@@ -222,6 +267,9 @@ impl Args for CommonArgs {
             qpack_blocked_streams,
             initial_cwnd_packets,
             multipath,
+            multicore,
+            cpu_aff_cores,
+            server_addresses
         }
     }
 }
@@ -252,12 +300,15 @@ impl Default for CommonArgs {
             qpack_blocked_streams: None,
             initial_cwnd_packets: 10,
             multipath: false,
+            multicore: false,
+            cpu_aff_cores: None, 
+            server_addresses: vec![]
         }
     }
 }
 
 pub const CLIENT_USAGE: &str = "Usage:
-  quiche-client [options] URL...
+  quiche-client [options] 
   quiche-client -h | --help
 
 Options:
@@ -290,6 +341,9 @@ Options:
   --enable-active-migration   Enable active connection migration.
   --perform-migration      Perform connection migration on another source port.
   --multipath              Enable multipath support.
+  --multicore              Enable multicore support. [Under development]
+  --cpu-affinity RANGES    CPU cores to consider in order to set affinity. [Under development]
+  --server-address ADDR ...    Specify the server addresses.
   -A --address ADDR ...    Specify addresses to be used instead of the unspecified address. Non-routable addresses will lead to connectivity issues.
   -R --rm-addr TIMEADDR ...   Specify addresses to stop using after the provided time (format time,addr).
   -S --status TIMEADDRSTAT ...   Specify availability status to advertise to the peer after the provided time (format time,addr,available).
@@ -350,7 +404,7 @@ impl Args for ClientArgs {
         };
 
         // URLs (can be multiple).
-        let urls: Vec<url::Url> = args
+        let urls = args
             .get_vec("URL")
             .into_iter()
             .map(|x| url::Url::parse(x).unwrap())
@@ -538,10 +592,16 @@ Options:
   --disable-pacing            Disable pacing (linux only).
   --initial-cwnd-packets PACKETS      The initial congestion window size in terms of packet count [default: 10].
   --multipath                 Enable multipath support.
+  --multicore                 Enable multicore support. [Under development]
+  --cpu-affinity RANGES       CPU cores to consider in order to set affinity. [Under development]
+  --server-address ADDR ...   Specify the server addresses.
+  --transfer-size BYTES       The bytes to send. [Under development]
+  --transfer-time NUM         The transfer time in seconds. [Under development]
   -h --help                   Show this screen.
 ";
 
 // Application-specific arguments that compliment the `CommonArgs`.
+#[derive(Debug, Clone)]
 pub struct ServerArgs {
     pub listen: String,
     pub no_retry: bool,
@@ -551,12 +611,13 @@ pub struct ServerArgs {
     pub key: String,
     pub disable_gso: bool,
     pub disable_pacing: bool,
+    pub transfer_size: Option<usize>,
+    pub transfer_time: Option<Duration>
 }
 
 impl Args for ServerArgs {
     fn with_docopt(docopt: &docopt::Docopt) -> Self {
         let args = docopt.parse().unwrap_or_else(|e| e.exit());
-
         let listen = args.get_str("--listen").to_string();
         let no_retry = args.get_bool("--no-retry");
         let root = args.get_str("--root").to_string();
@@ -565,16 +626,29 @@ impl Args for ServerArgs {
         let key = args.get_str("--key").to_string();
         let disable_gso = args.get_bool("--disable-gso");
         let disable_pacing = args.get_bool("--disable-pacing");
+        let transfer_size = if !args.get_str("--transfer-size").is_empty() {
+            Some(args.get_str("--transfer-size").parse::<usize>().unwrap())
+        } else {
+            None
+        };
+        let transfer_time = if !args.get_str("--transfer-time").is_empty() {
+            let seconds = args.get_str("--transfer-time").parse::<u64>().unwrap();
+            Some(Duration::from_secs(seconds))
+        } else {
+            None
+        };
 
         ServerArgs {
             listen,
-            no_retry,
             root,
+            no_retry,
             index,
             cert,
             key,
             disable_gso,
             disable_pacing,
+            transfer_size, 
+            transfer_time
         }
     }
 }
