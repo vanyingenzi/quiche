@@ -14513,7 +14513,9 @@ impl MulticorePath {
                 trace!("{} idle timeout expired", conn.trace_id);
 
                 conn.closed = true;
-                self.reduced_connection.as_mut().unwrap().closed = true;
+                if self.completed_multipath_handshake{
+                    self.reduced_connection.as_mut().unwrap().closed = true;
+                }
                 conn.timed_out = true;
                 return;
             }
